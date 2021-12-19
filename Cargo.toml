@@ -3,4 +3,5 @@ name = "equeue"
 version = "0.1.0"
 edition = "2018"
 
-[dependencies]
+[dev-dependencies]
+rand = "0.8.4"
