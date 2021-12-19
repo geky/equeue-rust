@@ -72,3 +72,30 @@ fn test_alloc_multiple() {
 
     println!("usage: {:?}", q.usage());
 }
+
+#[test]
+fn test_alloc_many() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let mut threads = vec![];
+    for _ in 0..100 {
+        let q = q.clone();
+        threads.push(thread::spawn(move || {
+            for i in 0..1000 {
+                let layout = Layout::from_size_align(10*i, 1).unwrap();
+                let e = unsafe { q.alloc_raw(layout) };
+                assert!(!e.is_null());
+                unsafe { q.dealloc_raw(e, layout) };
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+
+    println!("usage: {:?}", q.usage());
+}

@@ -51,48 +51,91 @@ impl<T> Atomic<T> {
     /// Atomic load
     fn load(&self) -> T {
         unsafe {
-            transmute_copy::<_, T>(&aload(self as *const _ as *const usize))
+            (
+                &aload(self as *const _ as *const usize)
+                    as *const _ as *const T
+            ).read()
         }
     }
 
     /// Atomic compare-and-swap
     fn cas(&self, old: T, new: T) -> Result<T, T> {
         unsafe {
-            transmute_copy::<_, Result<T,  T>>(
+            (
                 &acas(
                     self as *const _ as *const usize,
-                    transmute_copy::<_, usize>(&old),
-                    transmute_copy::<_, usize>(&new),
-                )
-            )
+                    *(&old as *const _ as *const usize),
+                    *(&new as *const _ as *const usize),
+                ) as *const _ as *const Result<T, T>
+            ).read()
         }
     }
 
     /// Non-atomic load iff we have exclusive access
-    unsafe fn load_ex(&self, new: T) -> T {
-        (self as *const _ as *const T).read()
+    fn load_ex(&mut self, new: T) -> T {
+        unsafe { (self as *mut _ as *mut T).read() }
     }
 
     /// Non-atomic store iff we have exclusive access
-    unsafe fn store_ex(&mut self, new: T) {
-        (self as *mut _ as *mut T).write(new);
+    fn store_ex(&mut self, new: T) {
+        unsafe { (self as *mut _ as *mut T).write(new) };
     }
 }
 
-
-/// Internal event struct
+/// Internal event header
 #[derive(Debug)]
-struct Ev {
-    sibling: Atomic<*const Ev>,
+struct Ebuf {
+    sibling: Atomic<Eptr>,
     npw2: u8,
 }
+
+impl Ebuf {
+    unsafe fn from_data(ptr: *mut u8) -> Option<&'static mut Ebuf> {
+        if !ptr.is_null() {
+            Some(&mut *(ptr as *mut Ebuf).sub(1))
+        } else {
+            None
+        }
+    }
+
+    unsafe fn data(&mut self) -> *mut u8 {
+        (self as *mut Ebuf).add(1) as *mut u8
+    }
+}
+
+/// Slab-internal pointer, with internalized generation count
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+struct Eptr(usize);
+
+impl fmt::Debug for Eptr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these really need to be in hex to be readable
+        write!(f, "Eptr(0x{:x})", self.0)
+    }
+}
+
+impl Eptr {
+    // maximum alignment of internal allocations, this must be larger than
+    // Eptr's alignment, and pointer alignment is a common alignment
+    const ALIGN: usize = max(
+        max(align_of::<Eptr>(), align_of::<Ebuf>()),
+        align_of::<*const usize>()
+    );
+
+    const fn null() -> Eptr {
+        Eptr(0)
+    }
+}
+
 
 /// Event queue struct
 #[derive(Debug)]
 pub struct Equeue {
-    slab: Range<*const u8>,
-    slab_front: Atomic<*const u8>,
-    slab_back: Atomic<*const u8>,
+    slab: &'static [u8],
+    npw2: u8,
+    slab_front: Atomic<usize>,
+    slab_back: Atomic<usize>,
 }
 
 unsafe impl Send for Equeue {}
@@ -100,90 +143,114 @@ unsafe impl Sync for Equeue {}
 
 impl Equeue {
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
-        let buffer_range = buffer.as_mut_ptr_range();
-        // align front to nearest bucket
-        let slab_front = alignup(
-            buffer_range.start as usize,
-            align_of::<Option<&'static mut Ev>>()
-        ) as *const u8;
-        let slab_back = buffer_range.end;
-
-        // do we already overlap?
-        if slab_front > slab_back {
-            return Err(Error::NoMem);
-        }
+        // align buffer
+        let align = alignup(buffer.as_ptr() as usize, Eptr::ALIGN)
+            - buffer.as_ptr() as usize;
+        let buffer = match buffer.get_mut(align..) {
+            // already overflow?
+            Some(buffer) => buffer,
+            None => return Err(Error::NoMem),
+        };
 
         // go ahead and zero our buffer, this makes it easier to manage bucket
         // allocation, which needs to be null the moment a bucket is allocated
-        unsafe {
-            slice::from_raw_parts_mut(
-                slab_front as *mut u8,
-                slab_back.offset_from(slab_front) as usize
-            )
-            .fill(0);
-        }
+        buffer.fill(0);
 
         Ok(Equeue {
-            slab: slab_front .. slab_back,
-            slab_front: Atomic::new(slab_front),
-            slab_back: Atomic::new(slab_back),
+            slab: buffer,
+            npw2: npw2(buffer.len()),
+            slab_front: Atomic::new(0),
+            slab_back: Atomic::new(buffer.len()),
         })
     }
 
-    fn load_buckets(&self) -> &[Atomic<*const Ev>] {
-        let slab_start = self.slab.start as *const Atomic<*const Ev>;
-        let slab_front = self.slab_front.load() as *const Atomic<*const Ev>;
+    fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr>] {
+        let slab_front = self.slab_front.load();
         unsafe {
             slice::from_raw_parts(
-                slab_start,
-                slab_front.offset_from(slab_start) as usize
+                self.slab.as_ptr() as *const Atomic<Eptr>,
+                slab_front / size_of::<Eptr>()
             )
         }
     }
 
-    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
-        // TODO handle larger align?
-        assert!(layout.align() <= align_of::<Ev>());
+    fn eptr_from(&self, e: &Ebuf) -> Eptr {
+        unsafe {
+            Eptr(
+                (e as *const Ebuf as *const u8)
+                    .offset_from(self.slab.as_ptr())
+                    as usize
+            )
+        }
+    }
+
+    fn eptr_eq(&self, a: Eptr, b: Eptr) -> bool {
+        let mask = (1 << self.npw2) - 1;
+        a.0 & mask == b.0 & mask
+    }
+
+    fn eptr_ref<'a>(&'a self, eptr: Eptr) -> Option<&'a Ebuf> {
+        let mask = (1 << self.npw2) - 1;
+        if eptr.0 & mask != 0 {
+            Some(unsafe { &*(&self.slab[eptr.0 & mask] as *const u8 as *const Ebuf) }) 
+        } else {
+            None
+        }
+    }
+
+    fn eptr_mut<'a>(&'a self, eptr: Eptr) -> Option<&'a mut Ebuf> {
+        unsafe { self.eptr_ref(eptr).map(|eptr| &mut *(eptr as *const Ebuf as *mut Ebuf)) }
+    }
+
+    fn eptr_generation(&self, eptr: Eptr) -> usize {
+        eptr.0 >> self.npw2
+    }
+
+    fn eptr_inc(&self, old: Eptr, new: Eptr) -> Eptr {
+        let mask = (1 << self.npw2) - 1;
+        Eptr((old.0.wrapping_add(1 << self.npw2) & !mask) | (new.0 & mask))
+    }
+
+    fn ebuf_alloc<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
+        assert!(layout.align() <= Eptr::ALIGN);
 
         // find best bucket
-        let npw2 = util::npw2(layout.size());
-        let bucket = npw2.checked_sub(util::npw2(align_of::<Ev>()))
-            .unwrap_or(0) as usize;
+        let npw2 = npw2((layout.size()+Eptr::ALIGN-1) / Eptr::ALIGN);
 
         'retry: loop {
-            let slab_front = self.slab_front.load();
-            let slab_back = self.slab_back.load();
-
             // first, do we have an allocation in our buckets? we don't look
             // at larger buckets because those are likely to be reused, we don't
             // want to starve larger events with smaller events
-            if let Some(bucket) = self.load_buckets().get(bucket) {
-                let e = bucket.load();
-                if let Some(e) = e.as_ref() {
+            if let Some(bucket) = self.buckets().get(npw2 as usize) {
+                let eptr = bucket.load();
+                if let Some(e) = self.eptr_ref(eptr) {
                     // CAS try to take an event from a bucket
                     let sibling = e.sibling.load();
-                    if let Err(_) = bucket.cas(e, sibling) {
+                    if let Err(_) = bucket.cas(eptr,
+                        self.eptr_inc(eptr, sibling))
+                    {
                         continue 'retry;
                     }
 
-                    // get pointer to trailing data
-                    return (e as *const Ev).add(1) as *const u8 as *mut u8;
+                    return Ok(unsafe { &mut *(e as *const _ as *mut Ebuf) });
                 }
             }
 
             // second, a litmus test, do we even have enough memory to satisfy
             // our request?
+            let slab_front = self.slab_front.load();
+            let slab_back = self.slab_back.load();
             let new_slab_front = max(
-                slab_front,
-                (self.slab.start as *const Atomic<*const Ev>).add(bucket + 1) as *const u8
+                (npw2 as usize + 1)*size_of::<Eptr>(),
+                slab_front
             );
             let new_slab_back = aligndown(
-                slab_back as usize - (size_of::<Ev>() + (1 << npw2)),
-                align_of::<Ev>()
-            ) as *const u8;
+                slab_back.saturating_sub(size_of::<Ebuf>() + (Eptr::ALIGN << npw2)),
+                Eptr::ALIGN
+            );
 
             if new_slab_front > new_slab_back {
-                return ptr::null_mut();
+                return Err(Error::NoMem);
             }
 
             // third, make sure we have enough buckets allocated
@@ -206,43 +273,53 @@ impl Equeue {
                 continue 'retry;
             }
 
-            let e = new_slab_back as *const Ev as *mut Ev;
-            e.write(Ev {
-                sibling: Atomic::new(ptr::null()),
-                npw2: npw2,
-            });
+            unsafe {
+                let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
+                e.write(Ebuf {
+                    sibling: Atomic::new(Eptr::null()),
+                    npw2: npw2,
+                });
 
-            // get pointer to trailing data
-            return (e as *const Ev).add(1) as *const u8 as *mut u8;
+                return Ok(&mut *e);
+            }
         }
     }
 
-    pub unsafe fn dealloc_raw(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
+    fn ebuf_dealloc(&self, e: &mut Ebuf) {
+        debug_assert!(self.slab.as_ptr_range()
+            .contains(&(e as *const _ as *const u8)));
 
-        // get access to the event metadata
-        debug_assert!(self.slab.contains(&(ptr as *const _)));
-        let e = &mut *(ptr as *mut Ev).sub(1);
+        // we only ever need to load buckets once because it can never shrink
+        let bucket = &self.buckets()[e.npw2 as usize];
 
-        // find best bucket
-        let bucket = e.npw2.checked_sub(util::npw2(align_of::<Ev>()))
-            .unwrap_or(0) as usize;
-
-        // we only ever need to load this once because it can never decrease
-        let bucket = &self.load_buckets()[bucket];
         'retry: loop {
+            // try to insert into our bucket
             let sibling = bucket.load();
-            debug_assert_ne!(sibling, e);
+            debug_assert!(!self.eptr_eq(sibling, self.eptr_from(e)));
             e.sibling.store_ex(sibling);
             // CAS try to add our event to a bucket
-            if let Err(_) = bucket.cas(sibling, e) {
+            if let Err(_) = bucket.cas(sibling,
+                self.eptr_inc(sibling, self.eptr_from(e)))
+            {
                 continue 'retry;
             }
 
             return;
         }
+    }
+
+    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
+        match self.ebuf_alloc(layout) {
+            Ok(e) => e.data(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+
+    pub unsafe fn dealloc_raw(&self, ptr: *mut u8, _layout: Layout) {
+        let e = match Ebuf::from_data(ptr) {
+            Some(e) => self.ebuf_dealloc(e),
+            None => return, // do nothing
+        };
     }
 }
 
@@ -257,45 +334,34 @@ pub struct Usage {
 
 impl Equeue {
     pub fn usage(&self) -> Usage {
-        unsafe {
-            let slab_front = self.slab_front.load();
-            let slab_back = self.slab_back.load();
-            let buckets = self.load_buckets();
+        let slab_front = self.slab_front.load();
+        let slab_back = self.slab_back.load();
+        let buckets = self.buckets();
 
-            let slab_total = self.slab.end.offset_from(self.slab.start) as usize;
-            let slab_used = slab_total - (slab_back.offset_from(slab_front) as usize);
-
-            let mut slab_fragmented = 0;
-            for (i, mut e_ptr) in buckets.iter().enumerate() {
-                let npw2 = (i as u8) + util::npw2(align_of::<Ev>());
-                while let Some(e) = e_ptr.load().as_ref() {
-                    slab_fragmented += size_of::<Ev>() + (1 << npw2);
-                    e_ptr = &e.sibling;
-                }
+        let mut slab_fragmented = 0;
+        for (npw2, mut eptr) in buckets.iter().enumerate() {
+            while let Some(e) = self.eptr_ref(eptr.load()) {
+                slab_fragmented += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
+                eptr = &e.sibling;
             }
+        }
 
-            Usage {
-                slab_total: slab_total,
-                slab_used: slab_used - slab_fragmented,
-                slab_fragmented: slab_fragmented,
-                buckets: buckets.len(),
-            }
+        Usage {
+            slab_total: self.slab.len(),
+            slab_used: self.slab.len() - (slab_back - slab_front) - slab_fragmented,
+            slab_fragmented: slab_fragmented,
+            buckets: buckets.len(),
         }
     }
 
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
-        unsafe {
-            for (bucket, mut e_ptr) in
-                buckets.iter_mut()
-                    .zip(self.load_buckets().iter())
-            {
-                let mut count = 0;
-                while let Some(e) = e_ptr.load().as_ref() {
-                    count += 1;
-                    e_ptr = &e.sibling;
-                }
-                *bucket = count;
+        for (bucket, mut eptr) in buckets.iter_mut().zip(self.buckets()) {
+            let mut count = 0;
+            while let Some(e) = self.eptr_ref(eptr.load()) {
+                count += 1;
+                eptr = &e.sibling;
             }
+            *bucket = count;
         }
     }
 }
