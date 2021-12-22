@@ -22,6 +22,7 @@ use core::borrow::Borrow;
 use core::borrow::BorrowMut;
 use core::mem::forget;
 use core::ptr::drop_in_place;
+use core::mem::transmute;
 
 mod util;
 use util::*;
@@ -77,7 +78,7 @@ impl<T> Atomic<T> {
     }
 
     /// Non-atomic load iff we have exclusive access
-    fn load_ex(&mut self, new: T) -> T {
+    fn load_ex(&mut self) -> T {
         unsafe { (self as *mut _ as *mut T).read() }
     }
 
@@ -112,41 +113,76 @@ impl Eptr {
         Eptr(0)
     }
 
-    fn from(q: &Equeue, e: &Ebuf) -> Eptr {
-        unsafe {
-            Eptr(
-                (e as *const Ebuf as *const u8)
-                    .offset_from(q.slab.as_ptr())
-                    as usize
-            )
+    fn from<'a>(q: &'a Equeue, e: Option<&'a Ebuf>) -> Eptr {
+        match e {
+            Some(e) => unsafe {
+                Eptr(
+                    (e as *const Ebuf as *const u8)
+                        .offset_from(q.slab.as_ptr())
+                        as usize
+                )
+            },
+            None => Eptr::null(),
         }
     }
 
-    fn eq(self, q: &Equeue, other: Eptr) -> bool {
+    fn update<'a>(q: &'a Equeue, old: Eptr, new: Option<&'a Ebuf>) -> Eptr {
+        let new = Eptr::from(q, new);
         let mask = (1 << q.npw2) - 1;
-        self.0 & mask == other.0 & mask
+        Eptr((old.0.wrapping_add(1 << q.npw2) & !mask) | (new.0 & mask))
     }
+}
 
-    fn as_ref<'a>(self, q: &'a Equeue) -> Option<&'a Ebuf> {
-        let mask = (1 << q.npw2) - 1;
-        if self.0 & mask != 0 {
-            Some(unsafe { &*(&q.slab[self.0 & mask] as *const u8 as *const Ebuf) }) 
+impl Equeue {
+    // Eptr interactions
+    fn eptr_as_ptr(&self, eptr: Eptr) -> *const Ebuf {
+        let mask = (1 << self.npw2) - 1;
+        if eptr.0 & mask != 0 {
+            &self.slab[eptr.0 & mask] as *const u8 as *const Ebuf
         } else {
-            None
+            ptr::null()
         }
     }
 
-    fn as_mut<'a>(self, q: &'a Equeue) -> Option<&'a mut Ebuf> {
-        unsafe { self.as_ref(q).map(|e| &mut *(e as *const Ebuf as *mut Ebuf)) }
+    unsafe fn eptr_as_mut_ptr(&self, eptr: Eptr) -> *mut Ebuf {
+        self.eptr_as_ptr(eptr) as *mut Ebuf
     }
 
-    fn generation(self, q: &Equeue) -> usize {
-        self.0 >> q.npw2
+    fn eptr_as_ref<'a>(&'a self, eptr: Eptr) -> Option<&'a Ebuf> {
+        unsafe { self.eptr_as_ptr(eptr).as_ref() }
     }
 
-    fn inc(self, q: &Equeue, old: Eptr) -> Eptr {
-        let mask = (1 << q.npw2) - 1;
-        Eptr((self.0 & mask) | (old.0.wrapping_add(1 << q.npw2) & !mask))
+    unsafe fn eptr_as_mut<'a>(&'a self, eptr: Eptr) -> Option<&'a mut Ebuf> {
+        self.eptr_as_mut_ptr(eptr).as_mut()
+    }
+
+    // Atomic<Eptr> interactions
+    fn eptr_load<'a>(&'a self, eptr: &Atomic<Eptr>) -> Option<&'a Ebuf> {
+        self.eptr_as_ref(eptr.load())
+    }
+
+    fn eptr_cas<'a>(
+        &'a self,
+        eptr: &Atomic<Eptr>,
+        old: Eptr,
+        new: Option<&Ebuf>
+    ) -> Result<Eptr, Eptr> {
+        eptr.cas(old, Eptr::update(self, old, new))
+    }
+
+    fn eptr_load_ex<'a>(
+        &'a self,
+        eptr: &mut Atomic<Eptr>
+    ) -> Option<&'a mut Ebuf> {
+        unsafe { self.eptr_as_mut(eptr.load_ex()) }
+    }
+
+    fn eptr_store_ex<'a>(
+        &'a self,
+        eptr: &mut Atomic<Eptr>,
+        new: Option<&'a Ebuf>
+    ) {
+        eptr.store_ex(Eptr::from(self, new));
     }
 }
 
@@ -154,6 +190,7 @@ impl Eptr {
 #[derive(Debug)]
 struct Ebuf {
     npw2: u8,
+    next: Atomic<Eptr>,
     sibling: Atomic<Eptr>,
 
     cb: Option<fn(*mut u8)>,
@@ -161,6 +198,13 @@ struct Ebuf {
 }
 
 impl Ebuf {
+    // we can "claim" an Ebuf once we remove it from shared structures,
+    // the claim is unsafe, but afterwards we can leverage Rust's type
+    // system to know whether or not we have exclusive access to the Ebuf
+    unsafe fn claim<'a>(&'a self) -> &'a mut Self {
+        &mut *(self as *const Ebuf as *mut Ebuf)
+    }
+
     unsafe fn as_ptr<T>(&self) -> *const T {
         (self as *const Ebuf).add(1) as *const T
     }
@@ -255,14 +299,14 @@ impl Equeue {
             // want to starve larger events with smaller events
             if let Some(bucket) = self.buckets().get(npw2 as usize) {
                 let eptr = bucket.load();
-                if let Some(e) = eptr.as_ref(self) {
+                if let Some(e) = self.eptr_as_ref(eptr) {
                     // CAS try to take an event from a bucket
-                    let sibling = e.sibling.load();
-                    if let Err(_) = bucket.cas(eptr, sibling.inc(self, eptr)) {
+                    let sibling = self.eptr_load(&e.sibling);
+                    if let Err(_) = self.eptr_cas(&bucket, eptr, sibling) {
                         continue 'retry;
                     }
 
-                    return Ok(unsafe { &mut *(e as *const _ as *mut Ebuf) });
+                    return Ok(unsafe { e.claim() });
                 }
             }
 
@@ -306,6 +350,7 @@ impl Equeue {
             unsafe {
                 let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
                 e.write(Ebuf {
+                    next: Atomic::new(Eptr::null()),
                     sibling: Atomic::new(Eptr::null()),
                     npw2: npw2,
 
@@ -325,13 +370,12 @@ impl Equeue {
         let bucket = &self.buckets()[e.npw2 as usize];
 
         'retry: loop {
-            // try to insert into our bucket
-            let eptr = Eptr::from(self, e);
-            let sibling = bucket.load();
-            debug_assert!(!eptr.eq(self, sibling));
-            e.sibling.store_ex(sibling);
             // CAS try to add our event to a bucket
-            if let Err(_) = bucket.cas(sibling, eptr.inc(self, sibling)) {
+            let eptr = bucket.load();
+            let sibling = self.eptr_as_ref(eptr);
+            debug_assert_ne!(e as *const _, unsafe { transmute(sibling) });
+            self.eptr_store_ex(&mut e.sibling, sibling);
+            if let Err(_) = self.eptr_cas(&bucket, eptr, Some(e)) {
                 continue 'retry;
             }
 
@@ -342,7 +386,70 @@ impl Equeue {
     // Queue management
     fn enqueue_ebuf(&self, e: &mut Ebuf) {
         debug_assert!(e.cb.is_some());
-        todo!()
+
+        'retry: loop {
+            // CAS try to insert our event into the queue
+            let eptr = self.queue.load();
+            let sibling = self.eptr_as_ref(eptr);
+            debug_assert_ne!(e as *const _, unsafe { transmute(sibling) });
+            self.eptr_store_ex(&mut e.sibling, sibling);
+            self.eptr_store_ex(&mut e.next,
+                sibling.and_then(|sibling| self.eptr_load(&sibling.next)));
+            if let Err(_) = self.eptr_cas(&self.queue, eptr, Some(e)) {
+                continue 'retry;
+            }
+
+            return;
+        }
+    }
+
+    fn dequeue_ebufs<'a>(&'a self) -> Option<&'a mut Ebuf> {
+        let mut head = 'retry: loop {
+            let eptr = self.queue.load();
+            if let Some(head) = self.eptr_as_ref(eptr) {
+                // CAS try to take time slice from queue
+                let next = self.eptr_load(&head.next);
+                if let Err(_) = self.eptr_cas(&self.queue, eptr, next) {
+                    continue 'retry;
+                }
+
+                // we have exclusive access now
+                break unsafe { head.claim() };
+            }
+
+            // nothing to do I guess
+            return None;
+        };
+
+        // Our events are just pushed on the top of the queue, creating a set
+        // of linked-list stacks. We need to reverse and flatten each slice in
+        // order to match insertion order
+        self.eptr_store_ex(&mut head.next, None);
+
+        while let Some(sibling) = self.eptr_load_ex(&mut head.sibling) {
+            self.eptr_store_ex(&mut sibling.next, Some(head));
+            head = sibling;
+        }
+
+        Some(head)
+    }
+
+    // Central dispatch function
+    pub fn dispatch(&self) {
+        let mut slice = self.dequeue_ebufs();
+        while let Some(e) = slice {
+            // dispatch!
+            e.cb.unwrap()(unsafe { e.as_mut_ptr() });
+
+            // move to next event
+            slice = self.eptr_load_ex(&mut e.next);
+
+            // call drop, return event to memory pool
+            if let Some(drop) = e.drop {
+                drop(unsafe { e.as_mut_ptr() });
+            }
+            self.dealloc_ebuf(e);
+        }
     }
 
     // Handling of raw allocations
@@ -359,6 +466,10 @@ impl Equeue {
             None => return, // do nothing
         };
 
+        // make sure we call drop!
+        if let Some(drop) = e.drop {
+            drop(e.as_mut_ptr());
+        }
         self.dealloc_ebuf(e);
     }
 
@@ -389,14 +500,13 @@ pub trait Post {
     fn post(&mut self);
 }
 
-impl<F: FnMut()> Post for F {
+impl<F: FnMut() + Send> Post for F {
     fn post(&mut self) {
         self()
     }
 }
 
 
-// TODO unsized drop?
 /// Event handle
 #[derive(Debug)]
 pub struct Event<'a, T> {
@@ -508,7 +618,7 @@ impl<T> BorrowMut<T> for Event<'_, T> {
 
 impl Equeue {
     // convenience functions
-    fn call<F: Post>(&self, cb: F) -> Result<(), Error>{
+    pub fn call<F: Post>(&self, cb: F) -> Result<(), Error>{
         self.alloc_from(cb)?
             .post();
         Ok(())
@@ -532,7 +642,7 @@ impl Equeue {
 
         let mut slab_fragmented = 0;
         for (npw2, mut eptr) in buckets.iter().enumerate() {
-            while let Some(e) = eptr.load().as_ref(self) {
+            while let Some(e) = self.eptr_load(eptr) {
                 slab_fragmented += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
                 eptr = &e.sibling;
             }
@@ -549,7 +659,7 @@ impl Equeue {
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
         for (bucket, mut eptr) in buckets.iter_mut().zip(self.buckets()) {
             let mut count = 0;
-            while let Some(e) = eptr.load().as_ref(self) {
+            while let Some(e) = self.eptr_load(eptr) {
                 count += 1;
                 eptr = &e.sibling;
             }

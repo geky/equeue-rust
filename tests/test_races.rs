@@ -99,3 +99,104 @@ fn test_alloc_many() {
 
     println!("usage: {:?}", q.usage());
 }
+
+#[test]
+fn test_post() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let count = Arc::new(Mutex::new(0));
+    let done = Arc::new(Mutex::new(false));
+
+    let dispatch_thread = {
+        let q = q.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !*done.lock().unwrap() {
+                q.dispatch();
+            }
+
+            // make sure we catch any lingering events
+            q.dispatch();
+        })
+    };
+
+    let mut threads = vec![];
+    for _ in 0..100 {
+        let q = q.clone();
+        let count = count.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..100 {
+                let count = count.clone();
+                q.call(move || {
+                    *count.lock().unwrap() += 1;
+                }).unwrap();
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+    *done.lock().unwrap() = true;
+    dispatch_thread.join().unwrap();
+
+    assert_eq!(*count.lock().unwrap(), 100*100);
+    println!("usage: {:?}", q.usage());
+}
+
+#[test]
+fn test_post_order() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(Mutex::new(false));
+
+    let dispatch_thread = {
+        let q = q.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !*done.lock().unwrap() {
+                q.dispatch();
+            }
+
+            // make sure we catch any lingering events
+            q.dispatch();
+        })
+    };
+
+    let mut threads = vec![];
+    for j in 0..10 {
+        counts.lock().unwrap().push(vec![]);
+
+        let q = q.clone();
+        let counts = counts.clone();
+        threads.push(thread::spawn(move || {
+            for i in 0..1000 {
+                let counts = counts.clone();
+                q.call(move || {
+                    counts.lock().unwrap()[j].push(i);
+                }).unwrap();
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+    *done.lock().unwrap() = true;
+    dispatch_thread.join().unwrap();
+
+    for j in 0..10 {
+        assert_eq!(
+            &counts.lock().unwrap()[j],
+            &(0..1000).collect::<Vec<_>>()
+        );
+    }
+    println!("usage: {:?}", q.usage());
+}
