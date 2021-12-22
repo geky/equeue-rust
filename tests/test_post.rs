@@ -4,6 +4,8 @@ use equeue::Equeue;
 use std::mem::transmute;
 use std::sync::Mutex;
 use std::ops::Deref;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn test_post() {
@@ -12,13 +14,13 @@ fn test_post() {
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap();
 
-    let count = Mutex::new(0);
+    let count = AtomicU32::new(0);
     q.call(|| {
-        *count.lock().unwrap() += 1
+        count.fetch_add(1, Ordering::SeqCst);
     }).unwrap();
     q.dispatch(0);
 
-    assert_eq!(*count.lock().unwrap(), 1);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
     println!("usage: {:?}", q.usage());
 }
 
@@ -29,15 +31,15 @@ fn test_post_many() {
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap();
 
-    let count = Mutex::new(0);
+    let count = AtomicU32::new(0);
     for _ in 0..1000 {
         q.call(|| {
-            *count.lock().unwrap() += 1
+            count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
     q.dispatch(0);
 
-    assert_eq!(*count.lock().unwrap(), 1000);
+    assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:?}", q.usage());
 }
 

@@ -1,5 +1,6 @@
 
 use equeue::Equeue;
+use equeue::Error;
 
 use std::mem::transmute;
 use std::alloc::Layout;
@@ -7,6 +8,9 @@ use std::thread;
 use std::sync::Mutex;
 use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn test_alloc_unique() {
@@ -107,14 +111,14 @@ fn test_post() {
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
 
-    let count = Arc::new(Mutex::new(0));
-    let done = Arc::new(Mutex::new(false));
+    let count = Arc::new(AtomicU32::new(0));
+    let done = Arc::new(AtomicBool::new(false));
 
     let dispatch_thread = {
         let q = q.clone();
         let done = done.clone();
         thread::spawn(move || {
-            while !*done.lock().unwrap() {
+            while !done.load(Ordering::SeqCst) {
                 q.dispatch(0);
             }
 
@@ -128,11 +132,17 @@ fn test_post() {
         let q = q.clone();
         let count = count.clone();
         threads.push(thread::spawn(move || {
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 let count = count.clone();
-                q.call(move || {
-                    *count.lock().unwrap() += 1;
-                }).unwrap();
+                let cb = move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                };
+                loop {
+                    match q.call(cb.clone()) {
+                        Ok(_) => break,
+                        Err(Error::NoMem) => { thread::yield_now(); continue },
+                    }
+                }
             }
         }));
     }
@@ -140,10 +150,10 @@ fn test_post() {
     for thread in threads.into_iter() {
         thread.join().unwrap();
     }
-    *done.lock().unwrap() = true;
+    done.fetch_or(true, Ordering::SeqCst);
     dispatch_thread.join().unwrap();
 
-    assert_eq!(*count.lock().unwrap(), 100*100);
+    assert_eq!(count.load(Ordering::SeqCst), 100*1000);
     println!("usage: {:?}", q.usage());
 }
 
@@ -155,13 +165,13 @@ fn test_post_order() {
     ).unwrap());
 
     let counts = Arc::new(Mutex::new(Vec::new()));
-    let done = Arc::new(Mutex::new(false));
+    let done = Arc::new(AtomicBool::new(false));
 
     let dispatch_thread = {
         let q = q.clone();
         let done = done.clone();
         thread::spawn(move || {
-            while !*done.lock().unwrap() {
+            while !done.load(Ordering::SeqCst) {
                 q.dispatch(0);
             }
 
@@ -171,7 +181,7 @@ fn test_post_order() {
     };
 
     let mut threads = vec![];
-    for j in 0..10 {
+    for j in 0..100 {
         counts.lock().unwrap().push(vec![]);
 
         let q = q.clone();
@@ -179,9 +189,15 @@ fn test_post_order() {
         threads.push(thread::spawn(move || {
             for i in 0..1000 {
                 let counts = counts.clone();
-                q.call(move || {
+                let cb = move || {
                     counts.lock().unwrap()[j].push(i);
-                }).unwrap();
+                };
+                loop {
+                    match q.call(cb.clone()) {
+                        Ok(_) => break,
+                        Err(Error::NoMem) => { thread::yield_now(); continue },
+                    }
+                }
             }
         }));
     }
@@ -189,10 +205,10 @@ fn test_post_order() {
     for thread in threads.into_iter() {
         thread.join().unwrap();
     }
-    *done.lock().unwrap() = true;
+    done.fetch_or(true, Ordering::SeqCst);
     dispatch_thread.join().unwrap();
 
-    for j in 0..10 {
+    for j in 0..100 {
         assert_eq!(
             &counts.lock().unwrap()[j],
             &(0..1000).collect::<Vec<_>>()

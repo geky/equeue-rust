@@ -17,20 +17,39 @@ fn main() {
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
 
-    // some busywork, n threads, each randomly allocating some random size for
-    // some random about of time
     let mut threads = vec![];
+
+    // one dispatch thread
+    {
+        let q = q.clone();
+        threads.push(thread::spawn(move || {
+            loop {
+                q.dispatch(0);
+                thread::sleep(Duration::from_nanos(1000_000_000));
+            }
+        }));
+    }
+
+    // some busywork, n threads, each a random size
     for _ in 0..100 {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
             loop {
+                // we need to use the raw APIs for dynamic sizes
                 let layout = Layout::from_size_align(rng.gen_range(1..8192), 1).unwrap();
                 let e = unsafe { q.alloc_raw(layout) };
+                if e.is_null() {
+                    thread::sleep(Duration::from_nanos(rng.gen_range(0..2000_000_000)));
+                    continue;
+                }
 
-                thread::sleep(Duration::from_nanos(rng.gen_range(0..1000_000_000)));
+                fn cb(_data: *mut u8) {
+                    // do nothing
+                }
 
-                unsafe { q.dealloc_raw(e, layout) };
+                unsafe { q.post_raw(cb, e); }
+                thread::sleep(Duration::from_nanos(rng.gen_range(0..2000_000_000)));
             }
         }));
     }
@@ -38,10 +57,15 @@ fn main() {
     // and now, in our main thread, lets render something nice looking
     println!();
     let mut bucket_max = 1;
+    let mut pending_max = 1;
     loop {
         let usage = q.usage();
         let mut buckets = vec![0; usage.buckets];
         q.bucket_usage(&mut buckets);
+
+        if usage.pending > pending_max {
+            pending_max = usage.pending;
+        }
 
         let mut used_buckets = 0;
         for &bucket in buckets.iter() {
@@ -54,7 +78,18 @@ fn main() {
             }
         }
 
+        // render this thing
         let width = 48;
+
+        print!("\x1b[K  q ");
+        for _ in 0 .. (width-2)*usage.pending / pending_max {
+            print!("'");
+        }
+        for _ in (width-2)*usage.pending / pending_max .. width-2 {
+            print!(" ");
+        }
+        println!("  pending: {}", usage.pending);
+
         let print_row = |row: f64| {
             for (_npw2, &bucket) in buckets.iter().enumerate() {
                 let bucket_dots = 6.0*((bucket as f64) / (bucket_max as f64));
@@ -74,11 +109,11 @@ fn main() {
             }
         };
 
-        print!("    "); print_row(2.0); println!("  slab_total: {}", usage.slab_total);
-        print!("    "); print_row(1.0); println!("  slab_free: {}", usage.slab_free);
-        print!("  f "); print_row(0.0); println!("  slab_fragmented: {}", usage.slab_fragmented);
+        print!("\x1b[K    "); print_row(2.0); println!("  slab_total: {}", usage.slab_total);
+        print!("\x1b[K    "); print_row(1.0); println!("  slab_free: {}", usage.slab_free);
+        print!("\x1b[K  f "); print_row(0.0); println!("  slab_fragmented: {}", usage.slab_fragmented);
         
-        print!("  [");
+        print!("\x1b[K  [");
         let used_bars = ((((usage.slab_total - usage.slab_free - usage.slab_fragmented) as f64)
             / (usage.slab_total as f64))
             * ((width-2) as f64))
@@ -101,6 +136,6 @@ fn main() {
 
         thread::sleep(Duration::from_millis(10));
 
-        print!("\x1b[4F\x1b[J");
+        print!("\x1b[5F");
     }
 }
