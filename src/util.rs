@@ -1,9 +1,7 @@
 
 // TODO feature gate this?
 use core::sync::atomic::AtomicUsize;
-pub(crate) use core::sync::atomic::Ordering;
-pub(crate) use core::sync::atomic::fence;
-pub(crate) use core::sync::atomic::compiler_fence;
+use core::sync::atomic::Ordering;
 
 
 
