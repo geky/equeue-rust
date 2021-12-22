@@ -43,52 +43,6 @@ impl fmt::Display for Error {
 }
 
 
-/// A type-safe wrapper around usized compare-and-swaps
-#[derive(Debug)]
-#[repr(transparent)]
-struct Atomic<T>(T);
-
-impl<T> Atomic<T> {
-    fn new(t: T) -> Self {
-        debug_assert_eq!(size_of::<T>(), size_of::<usize>());
-        Self(t)
-    }
-
-    /// Atomic load
-    fn load(&self) -> T {
-        unsafe {
-            (
-                &aload(self as *const _ as *const usize)
-                    as *const _ as *const T
-            ).read()
-        }
-    }
-
-    /// Atomic compare-and-swap
-    fn cas(&self, old: T, new: T) -> Result<T, T> {
-        unsafe {
-            (
-                &acas(
-                    self as *const _ as *const usize,
-                    *(&old as *const _ as *const usize),
-                    *(&new as *const _ as *const usize),
-                ) as *const _ as *const Result<T, T>
-            ).read()
-        }
-    }
-
-    /// Non-atomic load iff we have exclusive access
-    fn load_ex(&mut self) -> T {
-        unsafe { (self as *mut _ as *mut T).read() }
-    }
-
-    /// Non-atomic store iff we have exclusive access
-    fn store_ex(&mut self, new: T) {
-        unsafe { (self as *mut _ as *mut T).write(new) };
-    }
-}
-
-
 /// Slab-internal pointer, with internalized generation count
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -156,14 +110,14 @@ impl Equeue {
         self.eptr_as_mut_ptr(eptr).as_mut()
     }
 
-    // Atomic<Eptr> interactions
-    fn eptr_load<'a>(&'a self, eptr: &Atomic<Eptr>) -> Option<&'a Ebuf> {
+    // Cas<Eptr> interactions
+    fn eptr_load<'a>(&'a self, eptr: &Cas<Eptr>) -> Option<&'a Ebuf> {
         self.eptr_as_ref(eptr.load())
     }
 
     fn eptr_cas<'a>(
         &'a self,
-        eptr: &Atomic<Eptr>,
+        eptr: &Cas<Eptr>,
         old: Eptr,
         new: Option<&Ebuf>
     ) -> Result<Eptr, Eptr> {
@@ -172,14 +126,14 @@ impl Equeue {
 
     fn eptr_load_ex<'a>(
         &'a self,
-        eptr: &mut Atomic<Eptr>
+        eptr: &mut Cas<Eptr>
     ) -> Option<&'a mut Ebuf> {
         unsafe { self.eptr_as_mut(eptr.load_ex()) }
     }
 
     fn eptr_store_ex<'a>(
         &'a self,
-        eptr: &mut Atomic<Eptr>,
+        eptr: &mut Cas<Eptr>,
         new: Option<&'a Ebuf>
     ) {
         eptr.store_ex(Eptr::from(self, new));
@@ -190,11 +144,12 @@ impl Equeue {
 #[derive(Debug)]
 struct Ebuf {
     npw2: u8,
-    next: Atomic<Eptr>,
-    sibling: Atomic<Eptr>,
+    next: Cas<Eptr>,
+    sibling: Cas<Eptr>,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
+    delay: utick,
 }
 
 impl Ebuf {
@@ -233,14 +188,18 @@ impl Ebuf {
 /// Event queue struct
 #[derive(Debug)]
 pub struct Equeue {
-    // queue management
-    queue: Atomic<Eptr>,
-
     // memory management
     slab: &'static [u8],
     npw2: u8,
-    slab_front: Atomic<usize>,
-    slab_back: Atomic<usize>,
+    slab_front: Cas<usize>,
+    slab_back: Cas<usize>,
+
+    // queue management
+    queue: Cas<Eptr>,
+
+    // other things
+    clock: Clock,
+    sema: Sema,
 }
 
 unsafe impl Send for Equeue {}
@@ -264,18 +223,25 @@ impl Equeue {
         Ok(Equeue {
             slab: buffer,
             npw2: npw2(buffer.len()),
-            slab_front: Atomic::new(0),
-            slab_back: Atomic::new(buffer.len()),
+            slab_front: Cas::new(0),
+            slab_back: Cas::new(buffer.len()),
 
-            queue: Atomic::new(Eptr::null()),
+            queue: Cas::new(Eptr::null()),
+
+            clock: Clock::new(),
+            sema: Sema::new(),
         })
     }
 
-    fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr>] {
+    pub fn current(&self) -> utick {
+        self.clock.current()
+    }
+
+    fn buckets<'a>(&'a self) -> &'a [Cas<Eptr>] {
         let slab_front = self.slab_front.load();
         unsafe {
             slice::from_raw_parts(
-                self.slab.as_ptr() as *const Atomic<Eptr>,
+                self.slab.as_ptr() as *const Cas<Eptr>,
                 slab_front / size_of::<Eptr>()
             )
         }
@@ -350,12 +316,13 @@ impl Equeue {
             unsafe {
                 let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
                 e.write(Ebuf {
-                    next: Atomic::new(Eptr::null()),
-                    sibling: Atomic::new(Eptr::null()),
+                    next: Cas::new(Eptr::null()),
+                    sibling: Cas::new(Eptr::null()),
                     npw2: npw2,
 
                     cb: None,
                     drop: None,
+                    delay: 0,
                 });
 
                 return Ok(&mut *e);
@@ -424,25 +391,26 @@ impl Equeue {
         // Our events are just pushed on the top of the queue, creating a set
         // of linked-list stacks. We need to reverse and flatten each slice in
         // order to match insertion order
-        self.eptr_store_ex(&mut head.next, None);
-
+        let mut prev = None;
         while let Some(sibling) = self.eptr_load_ex(&mut head.sibling) {
-            self.eptr_store_ex(&mut sibling.next, Some(head));
+            self.eptr_store_ex(&mut head.sibling, prev);
+            prev = Some(head);
             head = sibling;
         }
+        self.eptr_store_ex(&mut head.sibling, prev);
 
         Some(head)
     }
 
     // Central dispatch function
-    pub fn dispatch(&self) {
+    pub fn dispatch(&self, ticks: itick) {
         let mut slice = self.dequeue_ebufs();
         while let Some(e) = slice {
             // dispatch!
             e.cb.unwrap()(unsafe { e.as_mut_ptr() });
 
             // move to next event
-            slice = self.eptr_load_ex(&mut e.next);
+            slice = self.eptr_load_ex(&mut e.sibling);
 
             // call drop, return event to memory pool
             if let Some(drop) = e.drop {
@@ -484,6 +452,12 @@ impl Equeue {
         let mut e = Ebuf::from_mut_ptr(e).unwrap();
         debug_assert!(self.contains_ebuf(e));
         e.drop = Some(drop);
+    }
+
+    pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: utick) {
+        let mut e = Ebuf::from_mut_ptr(e).unwrap();
+        debug_assert!(self.contains_ebuf(e));
+        e.delay = delay;
     }
 
     pub unsafe fn post_raw(&self, e: *mut u8, cb: fn(*mut u8)) {
@@ -566,7 +540,12 @@ impl Equeue {
 }
 
 impl<T: Post> Event<'_, T> {
-    fn post(self) {
+    pub fn delay(self, delay: utick) -> Self {
+        self.e.delay = delay;
+        self
+    }
+
+    pub fn post(self) {
         self.q.post(self);
     }
 }
@@ -629,7 +608,7 @@ impl Equeue {
 #[derive(Debug)]
 pub struct Usage {
     pub slab_total: usize,
-    pub slab_used: usize,
+    pub slab_free: usize,
     pub slab_fragmented: usize,
     pub buckets: usize,
 }
@@ -650,7 +629,7 @@ impl Equeue {
 
         Usage {
             slab_total: self.slab.len(),
-            slab_used: self.slab.len() - (slab_back - slab_front) - slab_fragmented,
+            slab_free: slab_back - slab_front,
             slab_fragmented: slab_fragmented,
             buckets: buckets.len(),
         }

@@ -16,7 +16,7 @@ fn test_post() {
     q.call(|| {
         *count.lock().unwrap() += 1
     }).unwrap();
-    q.dispatch();
+    q.dispatch(0);
 
     assert_eq!(*count.lock().unwrap(), 1);
     println!("usage: {:?}", q.usage());
@@ -35,7 +35,7 @@ fn test_post_many() {
             *count.lock().unwrap() += 1
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch(0);
 
     assert_eq!(*count.lock().unwrap(), 1000);
     println!("usage: {:?}", q.usage());
@@ -55,7 +55,7 @@ fn test_post_order() {
             count.lock().unwrap().push(i)
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch(0);
 
     assert_eq!(
         count.lock().unwrap().deref(),

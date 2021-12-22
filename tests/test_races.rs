@@ -115,11 +115,11 @@ fn test_post() {
         let done = done.clone();
         thread::spawn(move || {
             while !*done.lock().unwrap() {
-                q.dispatch();
+                q.dispatch(0);
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch(0);
         })
     };
 
@@ -162,11 +162,11 @@ fn test_post_order() {
         let done = done.clone();
         thread::spawn(move || {
             while !*done.lock().unwrap() {
-                q.dispatch();
+                q.dispatch(0);
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch(0);
         })
     };
 

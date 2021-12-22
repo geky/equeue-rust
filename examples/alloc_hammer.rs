@@ -68,15 +68,15 @@ fn main() {
         };
 
         print!("  "); print_row(2.0); println!("  slab_total: {}", usage.slab_total);
-        print!("  "); print_row(1.0); println!("  slab_used: {}", usage.slab_used);
+        print!("  "); print_row(1.0); println!("  slab_free: {}", usage.slab_free);
         print!("  "); print_row(0.0); println!("  slab_fragmented: {}", usage.slab_fragmented);
         
         print!("  [");
-        let used_bars = (((usage.slab_used as f64)
+        let used_bars = ((((usage.slab_total - usage.slab_free - usage.slab_fragmented) as f64)
             / (usage.slab_total as f64))
             * ((width-2) as f64))
             as usize;
-        let fragmented_bars = ((((usage.slab_used + usage.slab_fragmented) as f64)
+        let fragmented_bars = ((((usage.slab_total - usage.slab_free) as f64)
             / (usage.slab_total as f64))
             * ((width-2) as f64))
             as usize;
