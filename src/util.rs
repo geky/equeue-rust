@@ -98,7 +98,7 @@ pub(crate) type itick = i64;
 #[derive(Debug)]
 pub(crate) struct Clock(Instant);
 
-fn scmp(a: utick, b: utick) -> itick {
+pub(crate) fn scmp(a: utick, b: utick) -> itick {
     a.wrapping_sub(b) as itick
 }
 
@@ -107,7 +107,7 @@ impl Clock {
         Clock(Instant::now())
     }
 
-    pub fn current(&self) -> utick {
+    pub fn now(&self) -> utick {
         Instant::now()
             .duration_since(self.0)
             .as_millis()

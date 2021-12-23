@@ -140,17 +140,15 @@ impl Equeue {
     }
 
     // Cas<Eptr> interactions
-    fn eptr_load<'a>(&'a self, eptr: &Cas<Eptr>) -> Option<(Eptr, &'a Ebuf)> {
-        let eptr = eptr.load();
-        self.eptr_as_ref(eptr).map(|ref_| (eptr, ref_))
+    fn eptr_load<'a>(&'a self, eptr: &Cas<Eptr>) -> Option<&'a Ebuf> {
+        self.eptr_as_ref(eptr.load())
     }
 
     fn eptr_load_ex<'a>(
         &'a self,
         eptr: &mut Cas<Eptr>
-    ) -> Option<(Eptr, &'a mut Ebuf)> {
-        let eptr = eptr.load_ex();
-        unsafe { self.eptr_as_mut(eptr) }.map(|ref_| (eptr, ref_))
+    ) -> Option<&'a mut Ebuf> {
+        unsafe { self.eptr_as_mut(eptr.load_ex()) }
     }
 }
 
@@ -163,7 +161,7 @@ struct Ebuf {
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
-    delay: utick,
+    target: utick,
 }
 
 impl Ebuf {
@@ -276,8 +274,8 @@ impl Equeue {
         })
     }
 
-    pub fn current(&self) -> utick {
-        self.clock.current()
+    pub fn now(&self) -> utick {
+        self.clock.now()
     }
 
     fn buckets<'a>(&'a self) -> &'a [Cas<Eptr>] {
@@ -302,19 +300,21 @@ impl Equeue {
         // find best bucket
         let npw2 = npw2((layout.size()+Eptr::ALIGN-1) / Eptr::ALIGN);
 
-        'retry: loop {
+        loop {
             // 1. do we have an allocation in our buckets? we don't look
             // at larger buckets because those are likely to be reused, we don't
             // want to starve larger events with smaller events
             if let Some(bucket) = self.buckets().get(npw2 as usize) {
-                if let Some(e) = self.eptr_load(bucket) {
-                    // CAS try to take an event from a bucket
-                    let sibling = e.1.sibling.load();
-                    if let Err(_) = bucket.cas(e.0, sibling) {
-                        continue 'retry;
+                // CAS try to take an event from a bucket
+                let mut eptr = bucket.load();
+                while let Some(e) = self.eptr_as_ref(eptr) {
+                    let siblingptr = e.sibling.load();
+                    if let Err(x) = bucket.cas(eptr, siblingptr) {
+                        eptr = x;
+                        continue;
                     }
 
-                    return Ok(unsafe { self.ebuf_claim(e.1) });
+                    return Ok(unsafe { self.ebuf_claim(e) });
                 }
             }
 
@@ -339,7 +339,7 @@ impl Equeue {
             if new_slab_front > slab_front {
                 // CAS to allocate buckets
                 if let Err(_) = self.slab_front.cas(slab_front, new_slab_front) {
-                    continue 'retry;
+                    continue;
                 }
             }
 
@@ -352,7 +352,7 @@ impl Equeue {
             // CAS to allocate event
             debug_assert!(new_slab_back < slab_back);
             if let Err(_) = self.slab_back.cas(slab_back, new_slab_back) {
-                continue 'retry;
+                continue;
             }
 
             unsafe {
@@ -364,7 +364,7 @@ impl Equeue {
 
                     cb: None,
                     drop: None,
-                    delay: 0,
+                    target: 0,
                 });
 
                 return Ok(&mut *e);
@@ -380,15 +380,16 @@ impl Equeue {
         // we only ever need to load buckets once because it can never shrink
         let bucket = &self.buckets()[e.npw2 as usize];
 
-        'retry: loop {
-            // CAS try to add our event to a bucket
-            let sibling = bucket.load();
-            debug_assert_ne!(e as *const _, self.eptr_as_ptr(sibling));
-            e.sibling.store_ex(sibling);
+        // CAS try to add our event to a bucket
+        let mut siblingptr = bucket.load();
+        loop {
+            debug_assert_ne!(e as *const _, self.eptr_as_ptr(siblingptr));
+            e.sibling.store_ex(siblingptr);
 
             let eptr = self.eptr_from(0, gen, Some(e));
-            if let Err(_) = bucket.cas(sibling, eptr) {
-                continue 'retry;
+            if let Err(x) = bucket.cas(siblingptr, eptr) {
+                siblingptr = x;
+                continue;
             }
 
             return;
@@ -396,8 +397,9 @@ impl Equeue {
     }
 
     // Queue management
-    fn enqueue_ebuf(&self, e: &mut Ebuf) {
+    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) {
         debug_assert!(e.cb.is_some());
+        e.target = target;
 
         // we have exclusive access so generation can't change
         let gen = self.ebuf_gen_load_ex(e);
@@ -409,7 +411,7 @@ impl Equeue {
             if self.eptr_mark(sibling) != 0 {
                 self.help_dequeue_ebufs_1(
                     // we should only find a dirty head if head is non-null
-                    (sibling, self.eptr_as_ref(sibling).unwrap())
+                    sibling, self.eptr_as_ref(sibling).unwrap()
                 );
                 continue 'retry;
             }
@@ -440,28 +442,32 @@ impl Equeue {
     //
     // stop being lazy and help complete the remove
     //
-    fn help_dequeue_ebufs_1<'a>(&'a self, dirty_head: (Eptr, &'a Ebuf)) {
+    fn help_dequeue_ebufs_1<'a>(
+        &'a self,
+        dirty_headptr: Eptr,
+        head: &'a Ebuf
+    ) -> Eptr {
         // CAS 2. increment our generation count, which is embedded in
         // our next-pointer, this prevents any in-flight insertions
         // from update our next pointer
         //
         // note sibling pointers are never updated once an event is
         // shared!
-        let gen = self.eptr_gen(dirty_head.0);
-        let mut next = dirty_head.1.next.load();
-        let mut dirty_next = next;
-        'retry: while self.eptr_mark(next) == gen {
-            dirty_next = self.eptr_inc_mark(next);
-            if let Err(nnext) = dirty_head.1.next.cas(next, dirty_next) {
-                next = nnext;
-                continue 'retry;
+        let gen = self.eptr_gen(dirty_headptr);
+        let mut nextptr = head.next.load();
+        let mut dirty_nextptr = nextptr;
+        while self.eptr_mark(nextptr) == gen {
+            dirty_nextptr = self.eptr_inc_mark(nextptr);
+            if let Err(x) = head.next.cas(nextptr, dirty_nextptr) {
+                nextptr = x;
+                continue;
             }
 
             break;
         }
 
         // go on to finish the remove
-        self.help_dequeue_ebufs_2(dirty_head, dirty_next);
+        self.help_dequeue_ebufs_2(dirty_headptr, dirty_nextptr)
     }
 
     // did we find a dirty next pointer?
@@ -470,54 +476,69 @@ impl Equeue {
     //
     fn help_dequeue_ebufs_2<'a>(
         &'a self,
-        dirty_head: (Eptr, &'a Ebuf),
-        dirty_next: Eptr
-    ) {
+        dirty_headptr: Eptr,
+        dirty_nextptr: Eptr
+    ) -> Eptr {
         // CAS 3. actually remove the slice
         //
         // at this point, we know the queue head must be dirty, so ANY
         // update must be removing the head slice, so if our cas fails
         // we can assume the slice has been removed
-        let next = self.eptr_set_mark(dirty_next, 0);
-        let _ = self.queue.cas(dirty_head.0, next);
+        let nextptr = self.eptr_set_mark(dirty_nextptr, 0);
+        self.queue.cas(dirty_headptr, nextptr)
+            .unwrap_or_else(|x| x)
     }
 
-    fn dequeue_ebufs<'a>(&'a self) -> Option<&'a mut Ebuf> {
-        let dirty_head = 'retry: loop {
-            if let Some(head) = self.eptr_load(&self.queue) {
-                // if someone is trying to remove the head we need to help out
-                if self.eptr_mark(head.0) != 0 {
-                    self.help_dequeue_ebufs_1(head);
-                    continue 'retry;
-                }
+    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a mut Ebuf, itick> {
+        let (dirty_headptr, head) = {
+            let mut headptr = self.queue.load();
+            loop {
+                if let Some(head) = self.eptr_as_ref(headptr) {
+                    // if someone is trying to remove the head we need to help out
+                    if self.eptr_mark(headptr) != 0 {
+                        headptr = self.help_dequeue_ebufs_1(headptr, head);
+                        continue;
+                    }
 
-                // CAS 1. mark our slice for removal, this prevents any new
-                // events from being inserted in front of us
-                let dirty_head = self.eptr_set_mark(head.0, 1);
-                if let Err(_) = self.queue.cas(head.0, dirty_head) {
-                    continue 'retry;
-                }
+                    // is this slice ready to dispatch?
+                    //
+                    // TODO does this prevent us from runnin multiple dispatches
+                    // simultaneously? not that we need to support this, just that
+                    // we should know what's possible
+                    let delta = scmp(head.target, now);
+                    if delta > 0 {
+                        return Err(delta);
+                    }
 
-                break (dirty_head, head.1);
-            } else {
-                // nothing to do I guess
-                return None;
+                    // CAS 1. mark our slice for removal, this prevents any new
+                    // events from being inserted in front of us
+                    let dirty_head = self.eptr_set_mark(headptr, 1);
+                    if let Err(x) = self.queue.cas(headptr, dirty_head) {
+                        headptr = x;
+                        continue;
+                    }
+
+                    break (dirty_head, head);
+                } else {
+                    // nothing to do I guess
+                    return Err(-1);
+                }
             }
         };
 
         // try to finish the remove, note that other threads may actually
         // finish the remove for us, which is why these are separate
         // functions
-        self.help_dequeue_ebufs_1(dirty_head);
+        self.help_dequeue_ebufs_1(dirty_headptr, head);
 
         // at this point we should have exclusive access to the slice!
-        let mut head = unsafe { self.ebuf_claim(dirty_head.1) };
+        let mut head = unsafe { self.ebuf_claim(head) };
 
         // Our events are just pushed on the top of the queue, creating a set
         // of linked-list stacks. We need to reverse and flatten each slice in
         // order to match insertion order
         let mut prev = None;
-        while let Some((_, sibling)) = self.eptr_load_ex(&mut head.sibling) {
+        while let Some(sibling) = self.eptr_load_ex(&mut head.sibling) {
             head.sibling.store_ex(self.eptr_from(0, 0, prev));
             prev = Some(head);
             head = sibling;
@@ -528,18 +549,22 @@ impl Equeue {
         }
         head.sibling.store_ex(self.eptr_from(0, 0, prev));
 
-        Some(head)
+        Ok(head)
     }
 
     // Central dispatch function
     pub fn dispatch(&self, ticks: itick) {
-        let mut slice = self.dequeue_ebufs();
+        // get the current time
+        let now = self.clock.now();
+
+        // get a slice to dispatch
+        let mut slice = self.dequeue_ebufs(now).ok();
         while let Some(e) = slice {
             // dispatch!
             e.cb.unwrap()(unsafe { e.as_mut_ptr() });
 
             // move to next event
-            slice = self.eptr_load_ex(&mut e.sibling).map(|(_, e)| e);
+            slice = self.eptr_load_ex(&mut e.sibling);
 
             // call drop, return event to memory pool
             if let Some(drop) = e.drop {
@@ -552,7 +577,11 @@ impl Equeue {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_ebuf(layout) {
-            Ok(e) => e.as_mut_ptr(),
+            Ok(e) => {
+                e.drop = None;
+                e.target = 0;
+                e.as_mut_ptr()
+            }
             Err(_) => ptr::null_mut(),
         }
     }
@@ -586,17 +615,18 @@ impl Equeue {
         e.drop = Some(drop);
     }
 
-    pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: utick) {
+    pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: itick) {
         let mut e = Ebuf::from_mut_ptr(e).unwrap();
         debug_assert!(self.contains_ebuf(e));
-        e.delay = delay;
+        debug_assert!(delay >= 0);
+        e.target = delay as utick;
     }
 
     pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) {
         let mut e = Ebuf::from_mut_ptr(e).unwrap();
         debug_assert!(self.contains_ebuf(e));
         e.cb = Some(cb);
-        self.enqueue_ebuf(e);
+        self.enqueue_ebuf(e, self.clock.now() + e.target);
     }
 }
 
@@ -641,12 +671,16 @@ impl<'a, T> Event<'a, T> {
 impl Equeue {
     pub fn alloc<'a, T: Default>(&'a self) -> Result<Event<'a, T>, Error> {
         let e = self.alloc_ebuf(Layout::new::<T>())?;
+        e.drop = None;
+        e.target = 0;
         unsafe { e.as_mut_ptr::<T>().write(T::default()); }
         Ok(Event::from_ebuf(self, e))
     }
 
     pub fn alloc_from<'a, T>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
         let e = self.alloc_ebuf(Layout::new::<T>())?;
+        e.drop = None;
+        e.target = 0;
         unsafe { e.as_mut_ptr::<T>().write(t); }
         Ok(Event::from_ebuf(self, e))
     }
@@ -666,14 +700,15 @@ impl Equeue {
 
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        e.q.enqueue_ebuf(e.e);
+        e.q.enqueue_ebuf(e.e, self.clock.now() + e.e.target);
         forget(e);
     }
 }
 
 impl<T: Post> Event<'_, T> {
-    pub fn delay(self, delay: utick) -> Self {
-        self.e.delay = delay;
+    pub fn delay(self, delay: itick) -> Self {
+        debug_assert!(delay >= 0);
+        self.e.target = delay as utick;
         self
     }
 
@@ -737,6 +772,13 @@ impl Equeue {
             .post();
         Ok(())
     }
+
+    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<(), Error> {
+        self.alloc_from(cb)?
+            .delay(delay)
+            .post();
+        Ok(())
+    }
 }
 
 
@@ -789,17 +831,17 @@ impl Equeue {
         let mut pending = 0;
         let mut pending_bytes = 0;
         let mut slices = 0;
-        let mut head = self.eptr_load(&self.queue);
-        while let Some(nhead) = head {
+        let mut nhead = self.eptr_load(&self.queue);
+        while let Some(head) = nhead {
             slices += 1;
-            let mut sibling = Some(nhead);
-            while let Some(nsibling) = sibling {
+            let mut nsibling = Some(head);
+            while let Some(sibling) = nsibling {
                 pending += 1;
-                pending_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << nsibling.1.npw2);
-                sibling = self.eptr_load(&nsibling.1.sibling);
+                pending_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << sibling.npw2);
+                nsibling = self.eptr_load(&sibling.sibling);
             }
             
-            head = self.eptr_load(&nhead.1.next);
+            nhead = self.eptr_load(&head.next);
         }
 
         // find bucket usage
@@ -807,7 +849,7 @@ impl Equeue {
         let mut free = 0;
         let mut free_bytes = 0;
         for (npw2, mut eptr) in buckets.iter().enumerate() {
-            while let Some((_, e)) = self.eptr_load(eptr) {
+            while let Some(e) = self.eptr_load(eptr) {
                 free += 1;
                 free_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
                 eptr = &e.sibling;
@@ -840,7 +882,7 @@ impl Equeue {
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
         for (bucket, mut eptr) in buckets.iter_mut().zip(self.buckets()) {
             let mut count = 0;
-            while let Some((_, e)) = self.eptr_load(eptr) {
+            while let Some(e) = self.eptr_load(eptr) {
                 count += 1;
                 eptr = &e.sibling;
             }
@@ -850,17 +892,17 @@ impl Equeue {
 
     pub fn slice_usage(&self, slices: &mut [usize]) {
         let mut slices_iter = slices.iter_mut();
-        let mut head = self.eptr_load(&self.queue);
-        while let Some((slice, nhead)) = slices_iter.next().zip(head) {
+        let mut nhead = self.eptr_load(&self.queue);
+        while let Some((slice, head)) = slices_iter.next().zip(nhead) {
             let mut count = 0;
-            let mut sibling = Some(nhead);
-            while let Some(nsibling) = sibling {
+            let mut nsibling = Some(head);
+            while let Some(sibling) = nsibling {
                 count += 1;
-                sibling = self.eptr_load(&nsibling.1.sibling);
+                nsibling = self.eptr_load(&sibling.sibling);
             }
 
             *slice = count;
-            head = self.eptr_load(&nhead.1.next);
+            nhead = self.eptr_load(&head.next);
         }
     }
 }
