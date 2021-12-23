@@ -744,45 +744,72 @@ impl Equeue {
 pub struct Usage {
     pub pending: usize,
     pub pending_bytes: usize,
+    pub alloced: usize,
+    pub alloced_bytes: usize,
+    pub free: usize,
+    pub free_bytes: usize,
     pub slices: usize,
 
     pub slab_total: usize,
-    pub slab_free: usize,
     pub slab_fragmented: usize,
+    pub slab_unused: usize,
     pub buckets: usize,
 }
 
 impl Equeue {
     pub fn usage(&self) -> Usage {
+        // find slab usage
+        let slab_total = self.slab.len();
+        let slab_front = self.slab_front.load();
+        let slab_back = self.slab_back.load();
+        let slab_unused = slab_back - slab_front;
+
+        let mut total = 0usize;
+        let mut p = self.slab.get(slab_back)
+            .map(|p| p as *const u8)
+            .unwrap_or(ptr::null());
+        while self.slab.as_ptr_range().contains(&p) {
+            let e = unsafe { &*(p as *const Ebuf) };
+            // the risky thing about this is we can end up with an
+            // uninitialized ebuf here, which can be problematic
+            if e.npw2 > self.enpw2 {
+                break;
+            }
+
+            total += 1;
+            p = unsafe {
+                p.add(alignup(
+                    size_of::<Ebuf>() + (Eptr::ALIGN << e.npw2),
+                    Eptr::ALIGN
+                ))
+            }
+        }
+
         // find pending usage
         let mut pending = 0;
         let mut pending_bytes = 0;
         let mut slices = 0;
-
         let mut head = self.eptr_load(&self.queue);
         while let Some(nhead) = head {
             slices += 1;
             let mut sibling = Some(nhead);
             while let Some(nsibling) = sibling {
                 pending += 1;
-                pending_bytes += 1 << nsibling.1.npw2;
+                pending_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << nsibling.1.npw2);
                 sibling = self.eptr_load(&nsibling.1.sibling);
             }
             
             head = self.eptr_load(&nhead.1.next);
         }
 
-        // find slab usage
-        let slab_total = self.slab.len();
-        let slab_front = self.slab_front.load();
-        let slab_back = self.slab_back.load();
-        let slab_free = slab_back - slab_front;
-
+        // find bucket usage
         let buckets = self.buckets();
-        let mut slab_fragmented = 0;
+        let mut free = 0;
+        let mut free_bytes = 0;
         for (npw2, mut eptr) in buckets.iter().enumerate() {
             while let Some((_, e)) = self.eptr_load(eptr) {
-                slab_fragmented += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
+                free += 1;
+                free_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
                 eptr = &e.sibling;
             }
         }
@@ -792,16 +819,20 @@ impl Equeue {
         //
         // we can at least clamp some of the numbers to reasonable limits
         // to avoid breaking user's code as much as possible
-        slab_fragmented = min(slab_fragmented, slab_total - slab_free);
+        let pending_bytes = min(pending_bytes, slab_total);
 
         Usage {
             pending: pending,
             pending_bytes: pending_bytes,
+            alloced: total.saturating_sub(pending+free),
+            alloced_bytes: slab_total.saturating_sub(pending_bytes+free_bytes+slab_unused+slab_front),
+            free: free,
+            free_bytes: free_bytes+slab_unused,
             slices: slices,
 
             slab_total: slab_total,
-            slab_free: slab_free,
-            slab_fragmented: slab_fragmented,
+            slab_fragmented: slab_total.saturating_sub(slab_unused),
+            slab_unused: slab_unused,
             buckets: buckets.len(),
         }
     }

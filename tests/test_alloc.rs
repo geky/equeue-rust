@@ -17,7 +17,7 @@ fn test_alloc() {
     assert!(!e.is_null());
     unsafe { q.dealloc_raw(e, layout) };
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn test_alloc_multiple() {
         unsafe { q.dealloc_raw(es[i], layout) };
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn test_alloc_many() {
         unsafe { q.dealloc_raw(es[i], layout) };
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn test_alloc_repeatedly() {
         unsafe { q.dealloc_raw(e, layout) };
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn test_alloc_multiple_repeatedly() {
         }
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_alloc_many_repeatedly() {
         }
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -149,5 +149,5 @@ fn test_alloc_exhaustion() {
     assert!(!e.is_null());
     unsafe { q.dealloc_raw(e, layout) };
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }

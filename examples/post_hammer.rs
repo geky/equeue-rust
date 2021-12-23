@@ -9,9 +9,25 @@ use std::time::Duration;
 
 use rand;
 use rand::Rng;
+use structopt;
+use structopt::StructOpt;
 
+
+#[derive(Debug, StructOpt, Clone)]
+#[structopt(rename_all="kebab")]
+struct Opt {
+    /// Width of rendering (excluding fields)
+    #[structopt(short, long, default_value="48")]
+    width: usize,
+
+    /// Amount to scale delays
+    #[structopt(short, long, default_value="1000000")]
+    scale: u64,
+}
 
 fn main() {
+    let opt = Opt::from_args();
+
     let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
@@ -21,26 +37,30 @@ fn main() {
 
     // one dispatch thread
     {
+        let opt = opt.clone();
         let q = q.clone();
         threads.push(thread::spawn(move || {
             loop {
                 q.dispatch(0);
-                thread::sleep(Duration::from_nanos(1000_000_000));
+                thread::sleep(Duration::from_nanos(1000*opt.scale));
             }
         }));
     }
 
     // some busywork, n threads, each a random size
     for _ in 0..100 {
+        let opt = opt.clone();
         let q = q.clone();
         threads.push(thread::spawn(move || {
             let mut rng = rand::thread_rng();
             loop {
+                thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
+
                 // we need to use the raw APIs for dynamic sizes
                 let layout = Layout::from_size_align(rng.gen_range(1..8192), 1).unwrap();
                 let e = unsafe { q.alloc_raw(layout) };
                 if e.is_null() {
-                    thread::sleep(Duration::from_nanos(rng.gen_range(0..2000_000_000)));
+                    thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
                     continue;
                 }
 
@@ -49,13 +69,13 @@ fn main() {
                 }
 
                 unsafe { q.post_raw(cb, e); }
-                thread::sleep(Duration::from_nanos(rng.gen_range(0..2000_000_000)));
             }
         }));
     }
 
     // and now, in our main thread, lets render something nice looking
     println!();
+
     let mut bucket_max = 1;
     let mut pending_max = 1;
     loop {
@@ -79,24 +99,23 @@ fn main() {
         }
 
         // render this thing
-        let width = 48;
-
         print!("\x1b[K  q ");
-        for _ in 0 .. (width-2)*usage.pending / pending_max {
+        for _ in 0 .. (opt.width-2)*usage.pending / pending_max {
             print!("'");
         }
-        for _ in (width-2)*usage.pending / pending_max .. width-2 {
+        for _ in (opt.width-2)*usage.pending / pending_max .. opt.width-2 {
             print!(" ");
         }
-        println!("  pending: {}", usage.pending);
+        println!("  pending: {} ({} B)", usage.pending, usage.pending_bytes);
 
-        let print_row = |row: f64| {
-            for (_npw2, &bucket) in buckets.iter().enumerate() {
-                let bucket_dots = 6.0*((bucket as f64) / (bucket_max as f64));
-                for _ in 0 .. 2 {
-                    if bucket_dots > 2.0*row+1.0 {
+        let print_buckets = |row: usize| {
+            for &bucket in buckets.iter().take((opt.width-2)/2) {
+                let bucket_dots = 2*3*bucket;
+                let bucket_dots = (bucket_dots + bucket_max-1) / bucket_max;
+                for _ in 0..2 {
+                    if bucket_dots > 2*row+1 {
                         print!(":");
-                    } else if bucket_dots > 2.0*row {
+                    } else if bucket_dots > 2*row {
                         print!(".");
                     } else {
                         print!(" ");
@@ -104,31 +123,34 @@ fn main() {
                 }
             }
 
-            for _ in 2*buckets.len() .. width-2 {
+            for _ in 2*buckets.len() .. opt.width-2 {
                 print!(" ");
             }
         };
 
-        print!("\x1b[K    "); print_row(2.0); println!("  slab_total: {}", usage.slab_total);
-        print!("\x1b[K    "); print_row(1.0); println!("  slab_free: {}", usage.slab_free);
-        print!("\x1b[K  f "); print_row(0.0); println!("  slab_fragmented: {}", usage.slab_fragmented);
-        
+        print!("\x1b[K    "); print_buckets(2); println!("  alloced: {} ({} B)", usage.alloced, usage.alloced_bytes);
+        print!("\x1b[K    "); print_buckets(1); println!("  free: {} ({} B)", usage.free, usage.free_bytes);
+        print!("\x1b[K  f "); print_buckets(0); println!("  slab: {}/{}", usage.slab_unused, usage.slab_total);
+
         print!("\x1b[K  [");
-        let used_bars = ((((usage.slab_total - usage.slab_free - usage.slab_fragmented) as f64)
-            / (usage.slab_total as f64))
-            * ((width-2) as f64))
-            as usize;
-        let fragmented_bars = ((((usage.slab_total - usage.slab_free) as f64)
-            / (usage.slab_total as f64))
-            * ((width-2) as f64))
-            as usize;
-        for _ in 0 .. used_bars {
+        for _ in 0
+            .. (opt.width-2)*usage.pending_bytes / usage.slab_total
+        {
             print!("|");
         }
-        for _ in 0 .. fragmented_bars - used_bars {
+        for _ in (opt.width-2)*usage.pending_bytes / usage.slab_total
+            .. (opt.width-2)*(usage.pending_bytes+usage.alloced_bytes) / usage.slab_total
+        {
+            print!("#");
+        }
+        for _ in (opt.width-2)*(usage.alloced_bytes+usage.pending_bytes) / usage.slab_total
+            .. (opt.width-2)*usage.slab_fragmented / usage.slab_total
+        {
             print!(":");
         }
-        for _ in 0 .. width-2 - fragmented_bars {
+        for _ in (opt.width-2)*usage.slab_fragmented / usage.slab_total
+            .. (opt.width-2)
+        {
             print!(" ");
         }
         print!("]");

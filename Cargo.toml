@@ -3,5 +3,11 @@ name = "equeue"
 version = "0.1.0"
 edition = "2018"
 
+[profile.dev]
+opt-level = 3
+debug = true
+debug-assertions = true
+
 [dev-dependencies]
 rand = "0.8.4"
+structopt = "0.3.25"

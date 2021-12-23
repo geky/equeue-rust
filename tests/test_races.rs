@@ -47,7 +47,7 @@ fn test_alloc_unique() {
 
     assert_eq!(set.lock().unwrap().len(), 100*100);
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn test_alloc_multiple() {
         thread.join().unwrap();
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn test_alloc_many() {
         thread.join().unwrap();
     }
 
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn test_post() {
     dispatch_thread.join().unwrap();
 
     assert_eq!(count.load(Ordering::SeqCst), 100*1000);
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -214,5 +214,5 @@ fn test_post_order() {
             &(0..1000).collect::<Vec<_>>()
         );
     }
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }

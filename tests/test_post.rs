@@ -21,7 +21,7 @@ fn test_post() {
     q.dispatch(0);
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn test_post_many() {
     q.dispatch(0);
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
 
 #[test]
@@ -63,5 +63,5 @@ fn test_post_order() {
         count.lock().unwrap().deref(),
         &(0..1000).collect::<Vec<_>>()
     );
-    println!("usage: {:?}", q.usage());
+    println!("usage: {:#?}", q.usage());
 }
