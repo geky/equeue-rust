@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 #[test]
 fn test_race_alloc_unique() {
@@ -107,7 +106,7 @@ fn test_race_alloc_many() {
 
 #[test]
 fn test_race_post() {
-    let mut buffer = vec![0; 1024*1024*1024];
+    let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
@@ -119,7 +118,6 @@ fn test_race_post() {
         let q = q.clone();
         let done = done.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_secs(10));
             while !done.load(Ordering::SeqCst) {
                 q.dispatch(0);
             }
@@ -161,7 +159,7 @@ fn test_race_post() {
 
 #[test]
 fn test_race_post_order() {
-    let mut buffer = vec![0; 1024*1024*1024];
+    let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
@@ -173,7 +171,6 @@ fn test_race_post_order() {
         let q = q.clone();
         let done = done.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_secs(10));
             while !done.load(Ordering::SeqCst) {
                 q.dispatch(0);
             }
@@ -198,7 +195,7 @@ fn test_race_post_order() {
                 loop {
                     match q.call(cb.clone()) {
                         Ok(_) => break,
-                        Err(Error::NoMem) => { panic!(); thread::yield_now(); continue },
+                        Err(Error::NoMem) => { thread::yield_now(); continue },
                     }
                 }
             }

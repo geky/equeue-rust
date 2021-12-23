@@ -118,22 +118,6 @@ impl Equeue {
         (eptr.0 >> self.enpw2) & gmask
     }
 
-    fn eptr_set_gen(&self, eptr: Eptr, gen: usize) -> Eptr {
-        debug_assert!(gen <= (1 << self.gnpw2));
-        let mask = ((1 << self.gnpw2) - 1) << self.enpw2;
-        Eptr((gen << self.enpw2) | (eptr.0 & mask))
-    }
-
-    fn eptr_dec_gen(&self, eptr: Eptr) -> Eptr {
-        let shift = 8*size_of::<Eptr>() as u8 - (self.gnpw2+self.enpw2);
-        Eptr(
-            eptr.0
-                .rotate_left(shift as u32)
-                .wrapping_sub(1 << self.enpw2+shift)
-                .rotate_right(shift as u32)
-        )
-    }
-
     fn eptr_as_ptr(&self, eptr: Eptr) -> *const Ebuf {
         let mask = (1 << self.enpw2) - 1;
         if eptr.0 & mask != 0 {
@@ -425,21 +409,15 @@ impl Equeue {
             let mut headptr = self.queue.load();
             let mut headsrc = &self.queue;
 
-//            // dirty head? someone is trying to remove and we need to help out
-//            if self.eptr_mark(headptr) != 0 {
-//                //println!("hey 1! {:?} {}", headptr, self.eptr_mark(headptr));
-//                // we should only find a dirty head if head is non-null
-//                let head = self.eptr_as_ref(headptr).unwrap();
-//                self.help_dequeue_ebufs_1(headptr, head);
-//                continue 'retry;
-//            }
-
             // find insertion point
             let mut delta = Ordering::Greater;
+            let mut nextptr = Eptr::null();
+            let mut nextsrc = None;
             while let Some(head) = self.eptr_as_ref(headptr) {
                 // generation mismatch? someone is trying to remove and we
                 // need to help out
-                let nextptr = head.next.load();
+                nextptr = head.next.load();
+                nextsrc = Some(&head.next);
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
                     let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
                     if let Err(_) = headsrc.cas(headptr, nextptr) {
@@ -464,32 +442,31 @@ impl Equeue {
             };
 
             // set ourselves up for insertion
-            let nextptr;
             let siblingptr;
+            let eptr;
             match delta {
                 Ordering::Greater => {
                     // inserting a new slice, nothing complicated here
+                    eptr = self.eptr_from(headptr, gen, Some(e));
                     nextptr = self.eptr_set_mark(headptr, gen);
                     siblingptr = Eptr::null();
                 }
                 Ordering::Equal => {
-                    // inserting onto an existing slice, a bit complicated
+                    // inserting onto an existing slice, which is a bit complicated
                     //
-                    // In order to make this work without reading our sibling's 
-                    // next pointer (which could already be out-of-date before we
-                    // insert), we insert with our sibling in both our next and
-                    // sibling fields.
-                    //
-                    // But we also mark the expected next generation as invalid,
-                    // by decrementing. This triggers a collaborative removal
-                    // that eventually leaves the sibling in only our sibling
-                    // field.
-                    //
-                    // One exception, we could be dispatched before we even get
-                    // a chance to fix this, but at least in this case we're in
-                    // an easily detectable state with sibling == next
-                    nextptr = self.eptr_dec_gen(self.eptr_set_mark(headptr, gen));
-                    siblingptr = self.eptr_set_mark(headptr, gen);
+                    // We can't really replace the top event atomically, so instead
+                    // we insert our event _after_ the existing slice, but with the
+                    // existing slice in our sibling list, while also marking the
+                    // existing slice to be removed. This creates duplicate
+                    // entries, but as long as we fix removals before dispatching
+                    // events things work out.
+                    let predptr = headptr;
+                    headptr = nextptr;
+                    headsrc = nextsrc.unwrap();
+
+                    eptr = self.eptr_from(self.eptr_inc_mark(headptr), gen, Some(e));
+                    nextptr = self.eptr_set_mark(headptr, gen);
+                    siblingptr = predptr;
                 }
                 Ordering::Less => unreachable!(),
             };
@@ -499,85 +476,22 @@ impl Equeue {
             e.sibling.store_ex(siblingptr);
 
             // CAS try to insert our event into the queue
-            let eptr = self.eptr_from(headptr, gen, Some(e));
             if let Err(_) = headsrc.cas(headptr, eptr) {
                 // if we fail here any number of things could have happened,
                 // we need to completely restart
                 continue 'retry;
             }
 
-            // now that we're actually in the queue, we can fix the next pointer
+            // In _theory_, if we were pushing onto an existing slice, we should
+            // go back and clean up the duplicate entries we created.
             //
-            // or someone else can, if this cas fails we at least know the
-            // next pointer has been fixed
-            if delta.is_eq() {
-                let dirty_nextptr = nextptr;
-                let nextptr = self.eptr_set_mark(
-                    self.eptr_as_ref(headptr).unwrap()
-                        .next.load(),
-                    gen
-                );
-
-                // CAS to fix our next pointer, if this fails someone else
-                // fixed it for us
-                let _ = e.next.cas(dirty_nextptr, nextptr);
-            }
-
-            return;
+            // But this gets complicated, and in practice, since any access to
+            // the queue must fix pending removes, the duplicate entries will
+            // get fixed before they have any effect on either behavior or
+            // runtime
+            break;
         }
     }
-
-//    // did we find a dirty head?
-//    //
-//    // stop being lazy and help complete the remove
-//    //
-//    fn help_dequeue_ebufs_1<'a>(
-//        &'a self,
-//        dirty_headptr: Eptr,
-//        head: &'a Ebuf
-//    ) -> Eptr {
-//        // CAS 2. increment our generation count, which is embedded in
-//        // our next-pointer, this prevents any in-flight insertions
-//        // from update our next pointer
-//        //
-//        // note sibling pointers are never updated once an event is
-//        // shared!
-//        let gen = self.eptr_gen(dirty_headptr);
-//        let mut nextptr = head.next.load();
-//        let mut dirty_nextptr = nextptr;
-//        while self.eptr_mark(nextptr) == gen {
-//            dirty_nextptr = self.eptr_inc_mark(nextptr);
-//            if let Err(x) = head.next.cas(nextptr, dirty_nextptr) {
-//                nextptr = x;
-//                continue;
-//            }
-//
-//            break;
-//        }
-//
-//        // go on to finish the remove
-//        // TODO this can be flattened
-//        self.help_dequeue_ebufs_2(dirty_headptr, dirty_nextptr)
-//    }
-//
-//    // did we find a dirty next pointer?
-//    //
-//    // stop being lazy and help complete the remove
-//    //
-//    fn help_dequeue_ebufs_2<'a>(
-//        &'a self,
-//        dirty_headptr: Eptr,
-//        dirty_nextptr: Eptr
-//    ) -> Eptr {
-//        // CAS 3. actually remove the slice
-//        //
-//        // at this point, we know the queue head must be dirty, so ANY
-//        // update must be removing the head slice, so if our cas fails
-//        // we can assume the slice has been removed
-//        let nextptr = self.eptr_set_mark(dirty_nextptr, 0);
-//        self.queue.cas(dirty_headptr, nextptr)
-//            .unwrap_or_else(|x| x)
-//    }
 
     fn dequeue_ebufs<'a>(&'a self, target: utick) -> Result<&'a mut Ebuf, itick> {
         let mut dequeuedptr = Cas::new(Eptr::null());
@@ -589,7 +503,6 @@ impl Equeue {
                 // need to help out
                 let nextptr = head.next.load();
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
-                    //println!("remove");
                     let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
                     if let Err(_) = self.queue.cas(headptr, nextptr) {
                         // someone else removed the event for us, but we don't know
@@ -631,15 +544,14 @@ impl Equeue {
                 //
                 // note that we're also inverting our slices, which act sort of
                 // like stacks and are stored in reverse order
-                let mut count = 1;
-                let mut prevptr = Eptr::null();
+                let mut predptr = Eptr::null();
                 let mut headptr = headptr;
                 let mut head = head;
                 let mut siblingptr = head.sibling.load();
                 let ndequeuedtail = &head.sibling;
                 while let Some(sibling) = self.eptr_as_ref(siblingptr) {
-                    head.sibling.cas(siblingptr, prevptr).unwrap();
-                    prevptr = headptr;
+                    head.sibling.cas(siblingptr, predptr).unwrap();
+                    predptr = headptr;
                     headptr = siblingptr;
                     head = sibling;
                     siblingptr = head.sibling.load();
@@ -649,12 +561,8 @@ impl Equeue {
                     let nextptr = head.next.load();
                     let dirty_nextptr = self.eptr_inc_mark(nextptr);
                     head.next.cas(nextptr, dirty_nextptr).unwrap();
-
-                    count += 1;
                 }
-                head.sibling.cas(siblingptr, prevptr).unwrap();
-
-                println!("found {}", count);
+                head.sibling.cas(siblingptr, predptr).unwrap();
 
                 // stick on dequeued list
                 dequeuedtail.cas(Eptr::null(), headptr).unwrap();
