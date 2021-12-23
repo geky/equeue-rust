@@ -63,7 +63,8 @@ impl<T> Cas<T> {
     /// Atomic compare-and-swap
     pub fn cas(&self, old: T, new: T) -> Result<T, T> where T: Copy {
         unsafe { 
-            *(&self.0.compare_exchange_weak(
+            //*(&self.0.compare_exchange_weak(
+            *(&self.0.compare_exchange(
                 *(&old as *const _ as *const usize),
                 *(&new as *const _ as *const usize),
                 Ordering::SeqCst,

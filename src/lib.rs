@@ -23,6 +23,7 @@ use core::borrow::BorrowMut;
 use core::mem::forget;
 use core::ptr::drop_in_place;
 use core::mem::transmute;
+use core::cmp::Ordering;
 
 mod util;
 use util::*;
@@ -76,7 +77,7 @@ impl Equeue {
     // Eptr interactions
     fn eptr_from<'a>(
         &'a self,
-        mark: usize,
+        eptr: Eptr,
         gen: usize,
         e: Option<&'a Ebuf>
     ) -> Eptr {
@@ -90,12 +91,12 @@ impl Equeue {
             None => 0,
         };
 
-        // make sure our mark/gen/off aren't overflowing
-        debug_assert!(mark <= (1 << self.gnpw2));
+        // make sure our gen/off aren't overflowing
         debug_assert!(gen <= (1 << self.gnpw2));
         debug_assert!(off <= (1 << self.enpw2));
 
-        Eptr((mark << self.gnpw2+self.enpw2) | (gen << self.enpw2) | off)
+        let mask = !((1 << self.gnpw2+self.enpw2) - 1);
+        Eptr((eptr.0 & mask) | (gen << self.enpw2) | off)
     }
 
     fn eptr_mark(&self, eptr: Eptr) -> usize {
@@ -115,6 +116,22 @@ impl Equeue {
     fn eptr_gen(&self, eptr: Eptr) -> usize {
         let gmask = (1 << self.gnpw2) - 1;
         (eptr.0 >> self.enpw2) & gmask
+    }
+
+    fn eptr_set_gen(&self, eptr: Eptr, gen: usize) -> Eptr {
+        debug_assert!(gen <= (1 << self.gnpw2));
+        let mask = ((1 << self.gnpw2) - 1) << self.enpw2;
+        Eptr((gen << self.enpw2) | (eptr.0 & mask))
+    }
+
+    fn eptr_dec_gen(&self, eptr: Eptr) -> Eptr {
+        let shift = 8*size_of::<Eptr>() as u8 - (self.gnpw2+self.enpw2);
+        Eptr(
+            eptr.0
+                .rotate_left(shift as u32)
+                .wrapping_sub(1 << self.enpw2+shift)
+                .rotate_right(shift as u32)
+        )
     }
 
     fn eptr_as_ptr(&self, eptr: Eptr) -> *const Ebuf {
@@ -300,7 +317,7 @@ impl Equeue {
         // find best bucket
         let npw2 = npw2((layout.size()+Eptr::ALIGN-1) / Eptr::ALIGN);
 
-        loop {
+        'retry: loop {
             // 1. do we have an allocation in our buckets? we don't look
             // at larger buckets because those are likely to be reused, we don't
             // want to starve larger events with smaller events
@@ -339,7 +356,7 @@ impl Equeue {
             if new_slab_front > slab_front {
                 // CAS to allocate buckets
                 if let Err(_) = self.slab_front.cas(slab_front, new_slab_front) {
-                    continue;
+                    continue 'retry;
                 }
             }
 
@@ -352,7 +369,7 @@ impl Equeue {
             // CAS to allocate event
             debug_assert!(new_slab_back < slab_back);
             if let Err(_) = self.slab_back.cas(slab_back, new_slab_back) {
-                continue;
+                continue 'retry;
             }
 
             unsafe {
@@ -386,7 +403,7 @@ impl Equeue {
             debug_assert_ne!(e as *const _, self.eptr_as_ptr(siblingptr));
             e.sibling.store_ex(siblingptr);
 
-            let eptr = self.eptr_from(0, gen, Some(e));
+            let eptr = self.eptr_from(Eptr::null(), gen, Some(e));
             if let Err(x) = bucket.cas(siblingptr, eptr) {
                 siblingptr = x;
                 continue;
@@ -405,151 +422,257 @@ impl Equeue {
         let gen = self.ebuf_gen_load_ex(e);
 
         'retry: loop {
-            let sibling = self.queue.load();
+            let mut headptr = self.queue.load();
+            let mut headsrc = &self.queue;
 
-            // if someone is trying to remove the head we need to help out
-            if self.eptr_mark(sibling) != 0 {
-                self.help_dequeue_ebufs_1(
-                    // we should only find a dirty head if head is non-null
-                    sibling, self.eptr_as_ref(sibling).unwrap()
-                );
+//            // dirty head? someone is trying to remove and we need to help out
+//            if self.eptr_mark(headptr) != 0 {
+//                //println!("hey 1! {:?} {}", headptr, self.eptr_mark(headptr));
+//                // we should only find a dirty head if head is non-null
+//                let head = self.eptr_as_ref(headptr).unwrap();
+//                self.help_dequeue_ebufs_1(headptr, head);
+//                continue 'retry;
+//            }
+
+            // find insertion point
+            let mut delta = Ordering::Greater;
+            while let Some(head) = self.eptr_as_ref(headptr) {
+                // generation mismatch? someone is trying to remove and we
+                // need to help out
+                let nextptr = head.next.load();
+                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
+                    if let Err(_) = headsrc.cas(headptr, nextptr) {
+                        // someone else removed the event for us, but we don't know
+                        // what else has happened, so we need to retry
+                        continue 'retry;
+                    }
+
+                    // if no one fixed this before us, we can continue
+                    headptr = nextptr;
+                    continue;
+                }
+
+                let ndelta = scmp(head.target, target).cmp(&0);
+                if ndelta.is_ge() {
+                    delta = ndelta;
+                    break;
+                }
+
+                headptr = nextptr;
+                headsrc = &head.next;
+            };
+
+            // set ourselves up for insertion
+            let nextptr;
+            let siblingptr;
+            match delta {
+                Ordering::Greater => {
+                    // inserting a new slice, nothing complicated here
+                    nextptr = self.eptr_set_mark(headptr, gen);
+                    siblingptr = Eptr::null();
+                }
+                Ordering::Equal => {
+                    // inserting onto an existing slice, a bit complicated
+                    //
+                    // In order to make this work without reading our sibling's 
+                    // next pointer (which could already be out-of-date before we
+                    // insert), we insert with our sibling in both our next and
+                    // sibling fields.
+                    //
+                    // But we also mark the expected next generation as invalid,
+                    // by decrementing. This triggers a collaborative removal
+                    // that eventually leaves the sibling in only our sibling
+                    // field.
+                    //
+                    // One exception, we could be dispatched before we even get
+                    // a chance to fix this, but at least in this case we're in
+                    // an easily detectable state with sibling == next
+                    nextptr = self.eptr_dec_gen(self.eptr_set_mark(headptr, gen));
+                    siblingptr = self.eptr_set_mark(headptr, gen);
+                }
+                Ordering::Less => unreachable!(),
+            };
+            debug_assert_ne!(e as *const _, self.eptr_as_ptr(nextptr));
+            debug_assert_ne!(e as *const _, self.eptr_as_ptr(siblingptr));
+            e.next.store_ex(nextptr);
+            e.sibling.store_ex(siblingptr);
+
+            // CAS try to insert our event into the queue
+            let eptr = self.eptr_from(headptr, gen, Some(e));
+            if let Err(_) = headsrc.cas(headptr, eptr) {
+                // if we fail here any number of things could have happened,
+                // we need to completely restart
                 continue 'retry;
             }
 
-            // CAS try to insert our event into the queue
-            debug_assert_ne!(e as *const _, self.eptr_as_ptr(sibling));
-            e.sibling.store_ex(sibling);
-            e.next.store_ex(
-                self.eptr_set_mark(
-                    match self.eptr_as_ref(sibling) {
-                        Some(sibling) => sibling.next.load(),
-                        None => Eptr::null(),
-                    },
+            // now that we're actually in the queue, we can fix the next pointer
+            //
+            // or someone else can, if this cas fails we at least know the
+            // next pointer has been fixed
+            if delta.is_eq() {
+                let dirty_nextptr = nextptr;
+                let nextptr = self.eptr_set_mark(
+                    self.eptr_as_ref(headptr).unwrap()
+                        .next.load(),
                     gen
-                )
-            );
+                );
 
-            let eptr = self.eptr_from(0, gen, Some(e));
-            if let Err(_) = self.queue.cas(sibling, eptr) {
-                continue 'retry;
+                // CAS to fix our next pointer, if this fails someone else
+                // fixed it for us
+                let _ = e.next.cas(dirty_nextptr, nextptr);
             }
 
             return;
         }
     }
 
-    // did we find a dirty head?
-    //
-    // stop being lazy and help complete the remove
-    //
-    fn help_dequeue_ebufs_1<'a>(
-        &'a self,
-        dirty_headptr: Eptr,
-        head: &'a Ebuf
-    ) -> Eptr {
-        // CAS 2. increment our generation count, which is embedded in
-        // our next-pointer, this prevents any in-flight insertions
-        // from update our next pointer
-        //
-        // note sibling pointers are never updated once an event is
-        // shared!
-        let gen = self.eptr_gen(dirty_headptr);
-        let mut nextptr = head.next.load();
-        let mut dirty_nextptr = nextptr;
-        while self.eptr_mark(nextptr) == gen {
-            dirty_nextptr = self.eptr_inc_mark(nextptr);
-            if let Err(x) = head.next.cas(nextptr, dirty_nextptr) {
-                nextptr = x;
-                continue;
-            }
+//    // did we find a dirty head?
+//    //
+//    // stop being lazy and help complete the remove
+//    //
+//    fn help_dequeue_ebufs_1<'a>(
+//        &'a self,
+//        dirty_headptr: Eptr,
+//        head: &'a Ebuf
+//    ) -> Eptr {
+//        // CAS 2. increment our generation count, which is embedded in
+//        // our next-pointer, this prevents any in-flight insertions
+//        // from update our next pointer
+//        //
+//        // note sibling pointers are never updated once an event is
+//        // shared!
+//        let gen = self.eptr_gen(dirty_headptr);
+//        let mut nextptr = head.next.load();
+//        let mut dirty_nextptr = nextptr;
+//        while self.eptr_mark(nextptr) == gen {
+//            dirty_nextptr = self.eptr_inc_mark(nextptr);
+//            if let Err(x) = head.next.cas(nextptr, dirty_nextptr) {
+//                nextptr = x;
+//                continue;
+//            }
+//
+//            break;
+//        }
+//
+//        // go on to finish the remove
+//        // TODO this can be flattened
+//        self.help_dequeue_ebufs_2(dirty_headptr, dirty_nextptr)
+//    }
+//
+//    // did we find a dirty next pointer?
+//    //
+//    // stop being lazy and help complete the remove
+//    //
+//    fn help_dequeue_ebufs_2<'a>(
+//        &'a self,
+//        dirty_headptr: Eptr,
+//        dirty_nextptr: Eptr
+//    ) -> Eptr {
+//        // CAS 3. actually remove the slice
+//        //
+//        // at this point, we know the queue head must be dirty, so ANY
+//        // update must be removing the head slice, so if our cas fails
+//        // we can assume the slice has been removed
+//        let nextptr = self.eptr_set_mark(dirty_nextptr, 0);
+//        self.queue.cas(dirty_headptr, nextptr)
+//            .unwrap_or_else(|x| x)
+//    }
 
-            break;
-        }
-
-        // go on to finish the remove
-        self.help_dequeue_ebufs_2(dirty_headptr, dirty_nextptr)
-    }
-
-    // did we find a dirty next pointer?
-    //
-    // stop being lazy and help complete the remove
-    //
-    fn help_dequeue_ebufs_2<'a>(
-        &'a self,
-        dirty_headptr: Eptr,
-        dirty_nextptr: Eptr
-    ) -> Eptr {
-        // CAS 3. actually remove the slice
-        //
-        // at this point, we know the queue head must be dirty, so ANY
-        // update must be removing the head slice, so if our cas fails
-        // we can assume the slice has been removed
-        let nextptr = self.eptr_set_mark(dirty_nextptr, 0);
-        self.queue.cas(dirty_headptr, nextptr)
-            .unwrap_or_else(|x| x)
-    }
-
-    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a mut Ebuf, itick> {
-        let (dirty_headptr, head) = {
+    fn dequeue_ebufs<'a>(&'a self, target: utick) -> Result<&'a mut Ebuf, itick> {
+        let mut dequeuedptr = Cas::new(Eptr::null());
+        let mut dequeuedtail = &dequeuedptr;
+        let delta = 'retry: loop {
             let mut headptr = self.queue.load();
-            loop {
-                if let Some(head) = self.eptr_as_ref(headptr) {
-                    // if someone is trying to remove the head we need to help out
-                    if self.eptr_mark(headptr) != 0 {
-                        headptr = self.help_dequeue_ebufs_1(headptr, head);
-                        continue;
+            while let Some(head) = self.eptr_as_ref(headptr) {
+                // generation mismatch? someone is trying to remove and we
+                // need to help out
+                let nextptr = head.next.load();
+                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+                    //println!("remove");
+                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
+                    if let Err(_) = self.queue.cas(headptr, nextptr) {
+                        // someone else removed the event for us, but we don't know
+                        // what else has happened, so we need to retry
+                        continue 'retry;
                     }
 
-                    // is this slice ready to dispatch?
-                    //
-                    // TODO does this prevent us from runnin multiple dispatches
-                    // simultaneously? not that we need to support this, just that
-                    // we should know what's possible
-                    let delta = scmp(head.target, now);
-                    if delta > 0 {
-                        return Err(delta);
-                    }
-
-                    // CAS 1. mark our slice for removal, this prevents any new
-                    // events from being inserted in front of us
-                    let dirty_head = self.eptr_set_mark(headptr, 1);
-                    if let Err(x) = self.queue.cas(headptr, dirty_head) {
-                        headptr = x;
-                        continue;
-                    }
-
-                    break (dirty_head, head);
-                } else {
-                    // nothing to do I guess
-                    return Err(-1);
+                    // if no one fixed this before us, we can continue
+                    headptr = nextptr;
+                    continue;
                 }
+
+                // is this slice ready to dispatch?
+                let head_target = head.target;
+                let delta = scmp(head_target, target);
+                if delta > 0 {
+                    // no? return how long until the next event
+                    break 'retry delta;
+                }
+
+                // ok, the slice is ready to dispatch
+                //
+                // CAS 1. mark the slice for removal
+                let dirty_nextptr = self.eptr_inc_mark(nextptr);
+                if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+                    continue 'retry;
+                }
+
+                // we've effectively removed the slice, but can't claim the
+                // memory yet
+                //
+                // but, if we continue around this loop until all events sooner
+                // then our target have been processed, we can be sure that the
+                // event will actually be removed
+                
+                // to actually keep track of all these events, stick them on
+                // an ad-hoc queue, keep in mind that the sibling pointers never
+                // change once an event is enqueued
+                //
+                // note that we're also inverting our slices, which act sort of
+                // like stacks and are stored in reverse order
+                let mut count = 1;
+                let mut prevptr = Eptr::null();
+                let mut headptr = headptr;
+                let mut head = head;
+                let mut siblingptr = head.sibling.load();
+                let ndequeuedtail = &head.sibling;
+                while let Some(sibling) = self.eptr_as_ref(siblingptr) {
+                    head.sibling.cas(siblingptr, prevptr).unwrap();
+                    prevptr = headptr;
+                    headptr = siblingptr;
+                    head = sibling;
+                    siblingptr = head.sibling.load();
+
+                    // we also need to update the generation for every
+                    // non-head event as a part of pool bookeeping
+                    let nextptr = head.next.load();
+                    let dirty_nextptr = self.eptr_inc_mark(nextptr);
+                    head.next.cas(nextptr, dirty_nextptr).unwrap();
+
+                    count += 1;
+                }
+                head.sibling.cas(siblingptr, prevptr).unwrap();
+
+                println!("found {}", count);
+
+                // stick on dequeued list
+                dequeuedtail.cas(Eptr::null(), headptr).unwrap();
+                dequeuedtail = ndequeuedtail;
+
+                // continue to fix remove/find more slices
+                continue 'retry;
             }
+
+            // nothing to do I guess
+            break 'retry -1;
         };
 
-        // try to finish the remove, note that other threads may actually
-        // finish the remove for us, which is why these are separate
-        // functions
-        self.help_dequeue_ebufs_1(dirty_headptr, head);
-
-        // at this point we should have exclusive access to the slice!
-        let mut head = unsafe { self.ebuf_claim(head) };
-
-        // Our events are just pushed on the top of the queue, creating a set
-        // of linked-list stacks. We need to reverse and flatten each slice in
-        // order to match insertion order
-        let mut prev = None;
-        while let Some(sibling) = self.eptr_load_ex(&mut head.sibling) {
-            head.sibling.store_ex(self.eptr_from(0, 0, prev));
-            prev = Some(head);
-            head = sibling;
-
-            // for every non-head event we need to update the generation,
-            // fortunately we don't have to worry about shared access
-            self.ebuf_gen_inc_ex(head);
+        // did we find any slices to dequeue?
+        match self.eptr_as_ref(dequeuedptr.load_ex()) {
+            Some(dequeued) => Ok(unsafe { self.ebuf_claim(dequeued) }),
+            None => Err(delta),
         }
-        head.sibling.store_ex(self.eptr_from(0, 0, prev));
-
-        Ok(head)
     }
 
     // Central dispatch function
@@ -557,20 +680,26 @@ impl Equeue {
         // get the current time
         let now = self.clock.now();
 
-        // get a slice to dispatch
-        let mut slice = self.dequeue_ebufs(now).ok();
-        while let Some(e) = slice {
-            // dispatch!
-            e.cb.unwrap()(unsafe { e.as_mut_ptr() });
+        loop {
+            // get a slice to dispatch
+            let mut slice = match self.dequeue_ebufs(now) {
+                Ok(slice) => Some(slice),
+                Err(delta) => return,
+            };
 
-            // move to next event
-            slice = self.eptr_load_ex(&mut e.sibling);
+            while let Some(e) = slice {
+                // dispatch!
+                e.cb.unwrap()(unsafe { e.as_mut_ptr() });
 
-            // call drop, return event to memory pool
-            if let Some(drop) = e.drop {
-                drop(unsafe { e.as_mut_ptr() });
+                // move to next event
+                slice = self.eptr_load_ex(&mut e.sibling);
+
+                // call drop, return event to memory pool
+                if let Some(drop) = e.drop {
+                    drop(unsafe { e.as_mut_ptr() });
+                }
+                self.dealloc_ebuf(e);
             }
-            self.dealloc_ebuf(e);
         }
     }
 
@@ -814,7 +943,7 @@ impl Equeue {
             let e = unsafe { &*(p as *const Ebuf) };
             // the risky thing about this is we can end up with an
             // uninitialized ebuf here, which can be problematic
-            if e.npw2 > self.enpw2 {
+            if e.npw2 > npw2(self.slab.len()) {
                 break;
             }
 
@@ -861,7 +990,8 @@ impl Equeue {
         //
         // we can at least clamp some of the numbers to reasonable limits
         // to avoid breaking user's code as much as possible
-        let pending_bytes = min(pending_bytes, slab_total);
+        let pending = min(pending, total);
+        let pending_bytes = min(pending_bytes, slab_total.saturating_sub(slab_unused+slab_front));
 
         Usage {
             pending: pending,
