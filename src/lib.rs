@@ -24,6 +24,7 @@ use core::mem::forget;
 use core::ptr::drop_in_place;
 use core::mem::transmute;
 use core::cmp::Ordering;
+use core::cmp;
 
 mod util;
 use util::*;
@@ -493,7 +494,7 @@ impl Equeue {
         }
     }
 
-    fn dequeue_ebufs<'a>(&'a self, target: utick) -> Result<&'a mut Ebuf, itick> {
+    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a mut Ebuf, itick> {
         let mut dequeuedptr = Cas::new(Eptr::null());
         let mut dequeuedtail = &dequeuedptr;
         let delta = 'retry: loop {
@@ -516,8 +517,7 @@ impl Equeue {
                 }
 
                 // is this slice ready to dispatch?
-                let head_target = head.target;
-                let delta = scmp(head_target, target);
+                let delta = scmp(head.target, now);
                 if delta > 0 {
                     // no? return how long until the next event
                     break 'retry delta;
@@ -586,14 +586,12 @@ impl Equeue {
     // Central dispatch function
     pub fn dispatch(&self, ticks: itick) {
         // get the current time
-        let now = self.clock.now();
+        let mut now = self.clock.now();
+        let timeout = now.wrapping_add(ticks as u64);
 
         loop {
             // get a slice to dispatch
-            let mut slice = match self.dequeue_ebufs(now) {
-                Ok(slice) => Some(slice),
-                Err(delta) => return,
-            };
+            let mut slice = self.dequeue_ebufs(now).ok();
 
             while let Some(e) = slice {
                 // dispatch!
@@ -608,6 +606,35 @@ impl Equeue {
                 }
                 self.dealloc_ebuf(e);
             }
+
+            // should we stop dispatching?
+            //
+            // note that time could have changed _significantly_
+            now = self.clock.now();
+            let timeout_left = scmp(timeout, now);
+            if ticks >= 0 && timeout_left <= 0 {
+                return;
+            }
+
+            // ok how long should we sleep for
+            //
+            // Note that we always try to sleep between slices, this is
+            // just to behave nicely in case the system's semaphore implementation
+            // does something "clever". Note we also never enter here if
+            // ticks is 0 for similar reasons.
+            let mut delay = match self.eptr_as_ref(self.queue.load()) {
+                Some(head) => cmp::max(scmp(head.target, now), 0),
+                None => -1,
+            };
+
+            if (delay as utick) > (timeout_left as utick) {
+                delay = timeout_left;
+            }
+
+            self.sema.wait(delay);
+
+            // update current time
+            now = self.clock.now();
         }
     }
 

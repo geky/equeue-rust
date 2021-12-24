@@ -5,7 +5,7 @@ all build:
 
 .PHONY: test
 test:
-	cargo test --tests -- --test-threads 1
+	cargo test --tests
 
 .PHONY: clean
 clean:

@@ -216,3 +216,58 @@ fn test_race_post_order() {
     }
     println!("usage: {:#?}", q.usage());
 }
+
+#[test]
+fn test_race_delay() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let count = Arc::new(AtomicU32::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let dispatch_thread = {
+        let q = q.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                q.dispatch(0);
+            }
+
+            // make sure we catch any lingering events
+            q.dispatch(1100);
+        })
+    };
+
+    let mut threads = vec![];
+    for _ in 0..100 {
+        let q = q.clone();
+        let count = count.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..100 {
+                for i in 0..10 {
+                    let count = count.clone();
+                    let cb = move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    };
+                    loop {
+                        match q.call_in(i*100, cb.clone()) {
+                            Ok(_) => break,
+                            Err(Error::NoMem) => { thread::yield_now(); continue },
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+    done.fetch_or(true, Ordering::SeqCst);
+    dispatch_thread.join().unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 100*1000);
+    println!("usage: {:#?}", q.usage());
+}
