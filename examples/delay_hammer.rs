@@ -6,6 +6,7 @@ use std::alloc::Layout;
 use std::mem::transmute;
 use std::sync::Arc;
 use std::time::Duration;
+use std::cmp::max;
 
 use rand;
 use rand::Rng;
@@ -37,17 +38,14 @@ fn main() {
 
     // one dispatch thread
     {
-        let opt = opt.clone();
         let q = q.clone();
         threads.push(thread::spawn(move || {
-            loop {
-                q.dispatch(0);
-                thread::sleep(Duration::from_nanos(1000*opt.scale));
-            }
+            q.dispatch(-1);
+            unreachable!();
         }));
     }
 
-    // some busywork, n threads, each a random size
+    // some busywork, n threads, each a random size, and a random delay
     for _ in 0..100 {
         let opt = opt.clone();
         let q = q.clone();
@@ -56,7 +54,7 @@ fn main() {
             loop {
                 thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
 
-                // we need to use the raw APIs for dynamic sizes
+                // choose a random size, we need to use the raw APIs for dynamic sizes
                 let layout = Layout::from_size_align(rng.gen_range(1..8192), 1).unwrap();
                 let e = unsafe { q.alloc_raw(layout) };
                 if e.is_null() {
@@ -68,6 +66,15 @@ fn main() {
                     // do nothing
                 }
 
+                // choose a random delay, but here we artificially lower the granularity
+                // so it showcases the grouping a bit nicer, when scaled, grouping is lost,
+                // because events rarely share a timeslice
+                let delay = rng.gen_range(0..max(2000*opt.scale/1000_000, 10));
+                let now = q.now();
+                let gran = max((2000*opt.scale/1000_000) / opt.width as u64, 1);
+                let delay = (((delay+now+gran-1)/gran)*gran) - now;
+                unsafe { q.set_raw_delay(e, delay as i64); }
+
                 unsafe { q.post_raw(cb, e); }
             }
         }));
@@ -76,15 +83,19 @@ fn main() {
     // and now, in our main thread, lets render something nice looking
     println!();
 
+    let mut slice_max = 1;
     let mut bucket_max = 1;
-    let mut pending_max = 1;
     loop {
         let usage = q.usage();
+        let mut slices = vec![0; usage.slices];
         let mut buckets = vec![0; usage.buckets];
+        q.slice_usage(&mut slices);
         q.bucket_usage(&mut buckets);
 
-        if usage.pending > pending_max {
-            pending_max = usage.pending;
+        for &slice in slices.iter() {
+            if slice > slice_max {
+                slice_max = slice;
+            }
         }
 
         let mut used_buckets = 0;
@@ -99,14 +110,27 @@ fn main() {
         }
 
         // render this thing
-        print!("\x1b[K  q ");
-        for _ in 0 .. (opt.width-2)*usage.pending / pending_max {
-            print!(":");
-        }
-        for _ in (opt.width-2)*usage.pending / pending_max .. opt.width-2 {
-            print!(" ");
-        }
-        println!("  pending: {} ({} B)", usage.pending, usage.pending_bytes);
+        let print_slices = |row: usize| {
+            for &slice in slices.iter().take(opt.width-2) {
+                let slice_dots = 2*3*slice;
+                let slice_dots = (slice_dots + slice_max-1) / slice_max;
+                if slice_dots > 2*row+1 {
+                    print!(":");
+                } else if slice_dots > 2*row {
+                    print!("'");
+                } else {
+                    print!(" ");
+                }
+            }
+
+            for _ in slices.len() .. opt.width-2 {
+                print!(" ");
+            }
+        };
+
+        print!("\x1b[K  q "); print_slices(0); println!("  pending: {} ({} B)", usage.pending, usage.pending_bytes);
+        print!("\x1b[K    "); print_slices(1); println!("  alloced: {} ({} B)", usage.alloced, usage.alloced_bytes);
+        print!("\x1b[K    "); print_slices(2); println!("  free: {} ({} B)", usage.free, usage.free_bytes);
 
         let print_buckets = |row: usize| {
             for &bucket in buckets.iter().take((opt.width-2)/2) {
@@ -128,8 +152,8 @@ fn main() {
             }
         };
 
-        print!("\x1b[K    "); print_buckets(2); println!("  alloced: {} ({} B)", usage.alloced, usage.alloced_bytes);
-        print!("\x1b[K    "); print_buckets(1); println!("  free: {} ({} B)", usage.free, usage.free_bytes);
+        print!("\x1b[K    "); print_buckets(2); println!("  slices: {}", usage.slices);
+        print!("\x1b[K    "); print_buckets(1); println!();
         print!("\x1b[K  f "); print_buckets(0); println!("  slab: {}/{}", usage.slab_unused, usage.slab_total);
 
         print!("\x1b[K  [");
@@ -158,6 +182,6 @@ fn main() {
 
         thread::sleep(Duration::from_millis(10));
 
-        print!("\x1b[5F");
+        print!("\x1b[7F");
     }
 }

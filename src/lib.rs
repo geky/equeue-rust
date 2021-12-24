@@ -691,6 +691,9 @@ impl Equeue {
         debug_assert!(self.contains_ebuf(e));
         e.cb = Some(cb);
         self.enqueue_ebuf(e, self.clock.now() + e.target);
+
+        // signal queue has changed
+        self.sema.signal();
     }
 }
 
@@ -766,6 +769,9 @@ impl Equeue {
         // drop the event later
         e.q.enqueue_ebuf(e.e, self.clock.now() + e.e.target);
         forget(e);
+
+        // signal queue has changed
+        self.sema.signal();
     }
 }
 
