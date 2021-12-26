@@ -135,3 +135,29 @@ fn test_delay_reversed() {
     );
     println!("usage: {:#?}", q.usage());
 }
+
+#[test]
+fn test_period() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap();
+
+    let count = AtomicU32::new(0);
+    for i in 0..10 {
+        q.alloc_from(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap()
+            .delay(i*100)
+            .period(1000)
+            .post();
+    }
+
+    q.dispatch(50);
+    for i in 0..30 {
+        assert_eq!(count.load(Ordering::SeqCst), i+1);
+        q.dispatch(100);
+    }
+
+    println!("usage: {:#?}", q.usage());
+}

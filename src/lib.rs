@@ -25,6 +25,8 @@ use core::ptr::drop_in_place;
 use core::mem::transmute;
 use core::cmp::Ordering;
 use core::cmp;
+use core::num::NonZeroUsize;
+use core::num::TryFromIntError;
 
 mod util;
 use util::*;
@@ -164,6 +166,7 @@ struct Ebuf {
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
     target: utick,
+    period: itick,
 }
 
 impl Ebuf {
@@ -316,7 +319,14 @@ impl Equeue {
                         continue;
                     }
 
-                    return Ok(unsafe { self.ebuf_claim(e) });
+                    let e = unsafe { self.ebuf_claim(e) };
+
+                    // zero certain fields
+                    e.cb = None;
+                    e.drop = None;
+                    e.target = 0;
+                    e.period = -1;
+                    return Ok(e);
                 }
             }
 
@@ -367,6 +377,7 @@ impl Equeue {
                     cb: None,
                     drop: None,
                     target: 0,
+                    period: -1,
                 });
 
                 return Ok(&mut *e);
@@ -399,7 +410,7 @@ impl Equeue {
     }
 
     // Queue management
-    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) {
+    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) -> Eptr {
         debug_assert!(e.cb.is_some());
         e.target = target;
 
@@ -490,8 +501,12 @@ impl Equeue {
             // the queue must fix pending removes, the duplicate entries will
             // get fixed before they have any effect on either behavior or
             // runtime
-            break;
+            break eptr;
         }
+    }
+
+    fn unqueue_ebuf<'a>(&'a self, eptr: Eptr) -> Option<&'a mut Ebuf> {
+        todo!()
     }
 
     fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a mut Ebuf, itick> {
@@ -583,6 +598,16 @@ impl Equeue {
         }
     }
 
+    // Central post function
+    fn post_ebuf(&self, e: &mut Ebuf, target: utick) -> Eptr {
+        let eptr = self.enqueue_ebuf(e, target);
+
+        // signal queue has changed
+        self.sema.signal();
+
+        eptr
+    }
+
     // Central dispatch function
     pub fn dispatch(&self, ticks: itick) {
         // get the current time
@@ -600,11 +625,19 @@ impl Equeue {
                 // move to next event
                 slice = self.eptr_load_ex(&mut e.sibling);
 
-                // call drop, return event to memory pool
-                if let Some(drop) = e.drop {
-                    drop(unsafe { e.as_mut_ptr() });
+                if e.period >= 0 {
+                    // reenqueue?
+                    self.enqueue_ebuf(
+                        e,
+                        self.clock.now().wrapping_add(e.period as u64)
+                    );
+                } else {
+                    // call drop, return event to memory pool
+                    if let Some(drop) = e.drop {
+                        drop(unsafe { e.as_mut_ptr() });
+                    }
+                    self.dealloc_ebuf(e);
                 }
-                self.dealloc_ebuf(e);
             }
 
             // should we stop dispatching?
@@ -638,14 +671,28 @@ impl Equeue {
         }
     }
 
+    // Central cancel function
+    pub fn cancel(&self, id: Id) -> bool {
+        match self.unqueue_ebuf(Eptr::from(id)) {
+            Some(e) => {
+                // make sure we clean up the event
+                if let Some(drop) = e.drop {
+                    drop(unsafe { e.as_mut_ptr() });
+                }
+                self.dealloc_ebuf(e);
+
+                true
+            }
+            None => {
+                false
+            }
+        }
+    }
+
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_ebuf(layout) {
-            Ok(e) => {
-                e.drop = None;
-                e.target = 0;
-                e.as_mut_ptr()
-            }
+            Ok(e) => e.as_mut_ptr(),
             Err(_) => ptr::null_mut(),
         }
     }
@@ -686,14 +733,20 @@ impl Equeue {
         e.target = delay as utick;
     }
 
-    pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) {
+    pub unsafe fn set_raw_period(&self, e: *mut u8, period: itick) {
+        let mut e = Ebuf::from_mut_ptr(e).unwrap();
+        debug_assert!(self.contains_ebuf(e));
+        e.period = period;
+    }
+
+    pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
         let mut e = Ebuf::from_mut_ptr(e).unwrap();
         debug_assert!(self.contains_ebuf(e));
         e.cb = Some(cb);
-        self.enqueue_ebuf(e, self.clock.now() + e.target);
-
-        // signal queue has changed
-        self.sema.signal();
+        let eptr = self.post_ebuf(e,
+            self.clock.now().wrapping_add(e.target)
+        );
+        Id::try_from(eptr).unwrap()
     }
 }
 
@@ -706,6 +759,29 @@ pub trait Post {
 impl<F: FnMut() + Send> Post for F {
     fn post(&mut self) {
         self()
+    }
+}
+
+/// An id we can use to try to cancel an event
+pub struct Id(NonZeroUsize);
+
+impl fmt::Debug for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these really need to be in hex to be readable
+        write!(f, "Id(0x{:x})", self.0)
+    }
+}
+
+impl TryFrom<Eptr> for Id {
+    type Error = TryFromIntError;
+    fn try_from(eptr: Eptr) -> Result<Id, Self::Error> {
+        NonZeroUsize::try_from(eptr.0).map(Id)
+    }
+}
+
+impl From<Id> for Eptr {
+    fn from(id: Id) -> Eptr {
+        Eptr(usize::from(id.0))
     }
 }
 
@@ -738,21 +814,17 @@ impl<'a, T> Event<'a, T> {
 impl Equeue {
     pub fn alloc<'a, T: Default>(&'a self) -> Result<Event<'a, T>, Error> {
         let e = self.alloc_ebuf(Layout::new::<T>())?;
-        e.drop = None;
-        e.target = 0;
         unsafe { e.as_mut_ptr::<T>().write(T::default()); }
         Ok(Event::from_ebuf(self, e))
     }
 
     pub fn alloc_from<'a, T>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
         let e = self.alloc_ebuf(Layout::new::<T>())?;
-        e.drop = None;
-        e.target = 0;
         unsafe { e.as_mut_ptr::<T>().write(t); }
         Ok(Event::from_ebuf(self, e))
     }
 
-    pub fn post<T: Post>(&self, e: Event<'_, T>) {
+    pub fn post<T: Post>(&self, e: Event<'_, T>) -> Id {
         // cb/drop thunks
         fn cb_thunk<T: Post>(e: *mut u8) {
             unsafe { &mut *(e as *mut T) }.post();
@@ -767,11 +839,12 @@ impl Equeue {
 
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        e.q.enqueue_ebuf(e.e, self.clock.now() + e.e.target);
+        let eptr = e.q.post_ebuf(e.e,
+            self.clock.now().wrapping_add(e.e.target)
+        );
         forget(e);
 
-        // signal queue has changed
-        self.sema.signal();
+        Id::try_from(eptr).unwrap()
     }
 }
 
@@ -782,8 +855,13 @@ impl<T: Post> Event<'_, T> {
         self
     }
 
-    pub fn post(self) {
-        self.q.post(self);
+    pub fn period(self, period: itick) -> Self {
+        self.e.period = period;
+        self
+    }
+
+    pub fn post(self) -> Id {
+        self.q.post(self)
     }
 }
 
@@ -837,17 +915,28 @@ impl<T> BorrowMut<T> for Event<'_, T> {
 
 impl Equeue {
     // convenience functions
-    pub fn call<F: Post>(&self, cb: F) -> Result<(), Error>{
-        self.alloc_from(cb)?
-            .post();
-        Ok(())
+    pub fn call<F: Post>(&self, cb: F) -> Result<Id, Error>{
+        Ok(
+            self.alloc_from(cb)?
+                .post()
+        )
     }
 
-    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<(), Error> {
-        self.alloc_from(cb)?
-            .delay(delay)
-            .post();
-        Ok(())
+    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<Id, Error> {
+        Ok(
+            self.alloc_from(cb)?
+                .delay(delay)
+                .post()
+        )
+    }
+
+    pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
+        Ok(
+            self.alloc_from(cb)?
+                .delay(period)
+                .period(period)
+                .post()
+        )
     }
 }
 
