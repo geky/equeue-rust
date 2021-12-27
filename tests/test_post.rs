@@ -65,3 +65,26 @@ fn test_post_order() {
     );
     println!("usage: {:#?}", q.usage());
 }
+
+#[test]
+fn test_post_recursive() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap();
+
+    let count = AtomicU32::new(0);
+    fn inc(q: &Equeue, count: &AtomicU32) {
+        if count.fetch_add(1, Ordering::SeqCst) <= 1000 {
+            q.call(|| inc(q, count)).unwrap();
+        }
+    }
+    q.call(|| inc(&q, &count)).unwrap();
+
+    for i in 0..1000 {
+        q.dispatch(0);
+        assert_eq!(count.load(Ordering::SeqCst), i+1);
+    }
+
+    println!("usage: {:#?}", q.usage());
+}
