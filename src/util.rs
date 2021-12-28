@@ -1,9 +1,10 @@
 
 // TODO feature gate this?
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering;
+use core::sync::atomic;
 use core::marker::PhantomData;
 use core::mem::size_of;
+use core::cmp::Ordering;
 
 use std::time::Instant;
 use std::time::Duration;
@@ -88,7 +89,7 @@ pub(crate) fn npw2<T: Npw2>(a: T) -> u8 {
 pub(crate) trait Scmp {
     type Output;
     fn sdiff(self, b: Self) -> Self::Output;
-    fn scmp(self, b: Self) -> core::cmp::Ordering;
+    fn scmp(self, b: Self) -> Ordering;
 }
 
 impl Scmp for utick {
@@ -100,7 +101,7 @@ impl Scmp for utick {
     }
 
     #[inline]
-    fn scmp(self, b: utick) -> core::cmp::Ordering {
+    fn scmp(self, b: utick) -> Ordering {
         self.sdiff(b).cmp(&0)
     }
 }
@@ -114,7 +115,7 @@ impl Scmp for usize {
     }
 
     #[inline]
-    fn scmp(self, b: usize) -> core::cmp::Ordering {
+    fn scmp(self, b: usize) -> Ordering {
         self.sdiff(b).cmp(&0)
     }
 }
@@ -125,7 +126,7 @@ pub(crate) fn sdiff<T: Scmp>(a: T, b: T) -> <T as Scmp>::Output {
 }
 
 #[inline]
-pub(crate) fn scmp<T: Scmp>(a: T, b: T) -> core::cmp::Ordering {
+pub(crate) fn scmp<T: Scmp>(a: T, b: T) -> Ordering {
     a.scmp(b)
 }
 
@@ -151,7 +152,7 @@ impl<T> Cas<T> {
 
     /// Atomic load
     pub fn load(&self) -> T where T: Copy {
-        unsafe { *(&self.0.load(Ordering::SeqCst) as *const _ as *const T) }
+        unsafe { *(&self.0.load(atomic::Ordering::SeqCst) as *const _ as *const T) }
     }
 
     /// Atomic compare-and-swap
@@ -161,8 +162,8 @@ impl<T> Cas<T> {
             *(&self.0.compare_exchange(
                 *(&old as *const _ as *const usize),
                 *(&new as *const _ as *const usize),
-                Ordering::SeqCst,
-                Ordering::SeqCst
+                atomic::Ordering::SeqCst,
+                atomic::Ordering::SeqCst
             ) as *const _ as *const Result<T, T>)
         }
     }
@@ -170,7 +171,7 @@ impl<T> Cas<T> {
     /// Non-atomic load iff we have exclusive access, we can
     /// leverage Rust's mut for this
     pub fn load_ex(&mut self) -> T where T: Copy {
-        unsafe { *(&self.0.load(Ordering::Relaxed) as *const _ as *const T) }
+        unsafe { *(&self.0.load(atomic::Ordering::Relaxed) as *const _ as *const T) }
     }
 
     /// Non-atomic store iff we have exclusive access, we can
@@ -178,7 +179,7 @@ impl<T> Cas<T> {
     pub fn store_ex(&mut self, new: T) {
         self.0.store(
             unsafe { *(&new as *const _ as *const usize) },
-            Ordering::Relaxed
+            atomic::Ordering::Relaxed
         )
     }
 }

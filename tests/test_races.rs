@@ -273,7 +273,7 @@ fn test_race_delay() {
 }
 
 #[test]
-fn test_race_cancel() {
+fn test_race_cancel__() {
     let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }

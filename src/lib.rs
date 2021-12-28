@@ -132,7 +132,7 @@ impl Equeue {
         Eptr(
             eptr.0
                 .rotate_left(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
-                .wrapping_add(1 << self.gnpw2+self.enpw2)
+                .wrapping_add(1 << 8*size_of::<Eptr>() as u32 - self.gnpw2 as u32)
                 .rotate_right(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
         )
     }
@@ -169,6 +169,16 @@ impl Equeue {
         eptr: &mut Cas<Eptr>
     ) -> Option<&'a mut Ebuf> {
         unsafe { self.eptr_as_mut(eptr.load_ex()) }
+    }
+
+    // Sequential generation comparisons
+    fn gen_sdiff(&self, a: usize, b: usize) -> isize {
+        sdiff(a << self.gnpw2+self.enpw2, b << self.gnpw2+self.enpw2)
+            >> self.gnpw2+self.enpw2
+    }
+
+    fn gen_scmp(&self, a: usize, b: usize) -> Ordering {
+        scmp(a << self.gnpw2+self.enpw2, b << self.gnpw2+self.enpw2)
     }
 }
 
@@ -247,7 +257,13 @@ impl Equeue {
         e.status.store_ex(status);
         let nextptr = self.eptr_inc_mark(e.next.load_ex());
         e.next.store_ex(nextptr);
-        let siblingptr = self.eptr_inc_mark(e.sibling.load_ex());
+        // siblingptr may lag behind due to cancels
+        let siblingptr = e.sibling.load_ex();
+        debug_assert!(self.gen_scmp(
+            self.eptr_mark(siblingptr),
+            self.eptr_mark(nextptr)
+        ).is_lt());
+        self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr));
         e.sibling.store_ex(siblingptr);
     }
 }
@@ -553,7 +569,7 @@ impl Equeue {
             // runtime
 
             // TODO this is a bit of a mess
-            break self.eptr_set_mark(eptr, self.eptr_mark(Eptr(status)));
+            break self.eptr_set_gen(eptr, self.eptr_mark(Eptr(status)));
         }
     }
 
@@ -572,7 +588,9 @@ impl Equeue {
         let mut status = e.status.load();
         let canceled = loop {
             if self.eptr_mark(Eptr(status)) != gen {
+                println!("was {:#x} is {:#x} ({:#x})", gen, self.eptr_mark(Eptr(status)), status);
                 break false;
+                //break true;  // TODO what the heck
             }
 
             let dirty_status = status & !Ebuf::ACTIVE;
@@ -587,16 +605,19 @@ impl Equeue {
         // now try to find our event and reclaim the memory
         let target = e.target;
         let mut found = false;
+        let mut defered_clean = None;
         'retry: loop {
             let mut headptr = self.queue.load();
             let mut headsrc = &self.queue;
 
             // find insertion point
             let mut delta = Ordering::Greater;
+            let mut headnextptr = None;
             while let Some(head) = self.eptr_as_ref(headptr) {
                 // generation mismatch? someone is trying to remove and we
                 // need to help out
                 let nextptr = head.next.load();
+                headnextptr = Some(nextptr);
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
 //                    // make sure sibling is in sync with next
 //                    let siblingptr = head.sibling.load();
@@ -629,33 +650,201 @@ impl Equeue {
                 headsrc = &head.next;
             };
 
+            // TODO wow this needs to be restructured
+            if let Some(cleanme) = defered_clean {
+                unreachable!();
+                let e = unsafe { self.ebuf_claim(cleanme) };
+    //            // depending on which path we took for removal, sibling may be out of date
+    //            let nextptr = e.next.load_ex();
+    //            let siblingptr = e.sibling.load_ex();
+    //            if self.gen_scmp(self.eptr_mark(siblingptr), self.eptr_mark(nextptr)).is_lt() {
+    //                e.sibling.store_ex(self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr)));
+    //            }
+
+                // TODO should this be common?
+//                let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
+//                e.status.store_ex(status);
+                self.ebuf_gen_inc_ex(e);
+                if let Some(drop) = e.drop {
+                    drop(unsafe { e.as_mut_ptr() });
+                }
+                self.dealloc_ebuf(e);
+
+                defered_clean = None
+            }
+
             // found the timeslice, try to find the actual event
             let mut first = true;
             if delta.is_eq() {
                 while let Some(head) = self.eptr_as_ref(headptr) {
-                    // generation mismatch? someone is trying to remove and we
-                    // need to help out
+                    // generation mismatch?
                     let siblingptr = head.sibling.load();
-                    if self.eptr_mark(siblingptr) != self.eptr_gen(headptr) {
-    //                    // make sure sibling is in sync with sibling
-    //                    let siblingptr = head.sibling.load();
-    //                    if self.eptr_mark(siblingptr) != self.eptr_mark(siblingptr) {
-    //                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(siblingptr));
-    //                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
-    //                            continue 'retry;
-    //                        }
-    //                    }
+                    match (
+                        self.gen_scmp(self.eptr_mark(siblingptr), self.eptr_gen(headptr)),
+                        first,
+                        self.eptr_as_ref(siblingptr)
+                    ) {
+                        (Ordering::Equal, _, _) => {}
+                        (Ordering::Greater, true, Some(sibling)) => {
+//                            break 'retry;
+//                            unreachable!();
 
-                        let siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(headptr));
-                        if let Err(_) = headsrc.cas(headptr, siblingptr) {
-                            // someone else removed the event for us, but we don't know
-                            // what else has happened, so we need to retry
+                            // head of slice? this gets a bit tricky, but we can
+                            // move our sibling up next to us, modifying the sibling's
+                            // next pointer which shouldn't be used, and atomically
+                            // marking ourself for removal
+                            let nextptr = headnextptr.unwrap();
+
+        // TODO how do we resolve this
+        //
+        // 1. if we insert before we can remove this, we end up with a
+        // sibling node marked for removal, that's not good!
+        //
+        // 2. say we either increment siblingptr when we mark this, or
+        // do the whole atomic swap thing, we end up with a siblingptr that,
+        // if incremented, is not actually available to be freed... that's
+        // a problem!
+        //
+        // if we were trying to free the sibling's sibling, we would think
+        // we marked it to be free but we wouldn't actually!
+         
+//                            // setup siblingsiblingptr
+//                            let siblingsiblingptr = sibling.sibling.load();
+//                            if self.eptr_mark(siblingsiblingptr)
+//                                == self.eptr_gen(siblingptr)
+//                            {
+//                                let nsiblingsiblingptr = self.eptr_inc_mark(siblingsiblingptr);
+//                                if let Err(_) = sibling.sibling.cas(siblingsiblingptr, nsiblingsiblingptr) {
+//                                    continue 'retry;
+//                                }
+//                            } else if self.eptr_mark(siblingsiblingptr)
+//                                    != self.eptr_gen(self.eptr_inc_gen(siblingptr)) {
+//                                // we may have already been dispatched
+//                                continue 'retry;
+//                            }
+
+                            // setup siblingnextptr
+                            let siblingnextptr = sibling.next.load();
+                            if self.eptr_mark(siblingnextptr)
+                                != self.eptr_gen(self.eptr_inc_gen(siblingptr))
+                            {
+                                //println!("hmm");
+                                // we may have already been dispatched
+                                continue 'retry;
+                            }
+//                            let nsiblingnextptr = self.eptr_inc_mark(self.eptr_set_mark(
+//                                nextptr,
+//                                self.eptr_mark(siblingnextptr),
+//                            ));
+                            let nsiblingnextptr = self.eptr_set_mark(
+                                nextptr,
+                                self.eptr_mark(siblingnextptr),
+                            );
+                            if let Err(_) = sibling.next.cas(siblingnextptr, nsiblingnextptr) {
+                                continue 'retry;
+                            }
+
+                            // try to actually remove the event
+                            let dirty_nextptr = self.eptr_from(
+                                self.eptr_inc_mark(nextptr),
+                                self.eptr_mark(nsiblingnextptr),
+                                Some(sibling)
+                            );
+                            if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+                                continue 'retry;
+                            }
+
+// TODO
+//                            // managed to claim the removal!
+//                            defered_clean = Some(head);
+//
+                            // TODO are large backwards jumps the only way to do this?
+                            // we don't necessarily need to restart completely...
+                            continue 'retry;
+
+//                            break 'retry;
+                        }
+                        (Ordering::Greater, true, None) => { 
+                            //unreachable!();
+
+                            // head of slice but no sibling? we can just mark
+                            // ourself for removal then
+                            //
+                            // remember that adding new siblings works by
+                            // updating our next pointer first, which we would
+                            // clobber
+                            let nextptr = headnextptr.unwrap();
+                            let dirty_nextptr = self.eptr_inc_mark(nextptr);
+                            if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+                                continue 'retry;
+                            }
+
+// TODO
+//                            // managed to claim the removal!
+//                            defered_clean = Some(head);
+
+                            // TODO are large backwards jumps the only way to do this?
+                            // we don't necessarily need to restart completely...
                             continue 'retry;
                         }
+                        (Ordering::Greater, false, _) => {
+                            //unreachable!();
 
-                        // if no one fixed this before us, we can continue
-                        headptr = siblingptr;
-                        continue;
+        //                    // make sure sibling is in sync with sibling
+        //                    let siblingptr = head.sibling.load();
+        //                    if self.eptr_mark(siblingptr) != self.eptr_mark(siblingptr) {
+        //                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(siblingptr));
+        //                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+        //                            continue 'retry;
+        //                        }
+        //                    }
+
+                            // someone was trying to remove this sibling, we
+                            // need to help out
+                            let siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(headptr));
+                            if let Err(_) = headsrc.cas(headptr, siblingptr) {
+                                // someone else removed the event for us, but we don't know
+                                // what else has happened, so we need to retry
+                                continue 'retry;
+                            }
+
+                            // managed to remove the event
+                            //
+                            // ownership of siblings is a bit different than next pointers,
+                            // we now own the memory and need to clean it up
+//                            {
+//                                let e = unsafe { self.ebuf_claim(head) };
+//                    //            // depending on which path we took for removal, sibling may be out of date
+//                    //            let nextptr = e.next.load_ex();
+//                    //            let siblingptr = e.sibling.load_ex();
+//                    //            if self.gen_scmp(self.eptr_mark(siblingptr), self.eptr_mark(nextptr)).is_lt() {
+//                    //                e.sibling.store_ex(self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr)));
+//                    //            }
+//
+//                                // TODO should this be common?
+////                                let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
+////                                e.status.store_ex(status);
+//                                self.ebuf_gen_inc_ex(e);
+//                                if let Some(drop) = e.drop {
+//                                    drop(unsafe { e.as_mut_ptr() });
+//                                }
+//                                self.dealloc_ebuf(e);
+//                            }
+
+                            // if no one fixed this before us, we can continue
+                            headptr = siblingptr;
+                            continue;
+                        }
+                        (Ordering::Less, _, _) => {
+                            //unreachable!()
+
+                            // transient state when disentangling during cancel,
+                            // fix and continue
+                            let fixed_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_gen(headptr));
+                            if let Err(_) = head.sibling.cas(siblingptr, fixed_siblingptr) {
+                                continue;
+                            }
+                        }
                     }
 
                     // TODO check for match?
@@ -665,17 +854,97 @@ impl Equeue {
 //                        break;
 //                    }
 
-                    // found our event? try to mark it for removal
-                    if !first && head as *const _ == e as *const _ {
-                        let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
-                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
-                            continue 'retry;
-                        }
+                    // found our event? try to remove it
+                    // TODO what if we mark it here, but it's been freed, and
+                    // recycled since we checked the generation count??? do we need
+                    // to load the sibling mark before canceling this event? or
+                    // remove from queue first?
+                    if head as *const _ == e as *const _
+                        && self.eptr_mark(Eptr(e.status.load())) == gen
+                    {
+                        match (first, self.eptr_as_ref(siblingptr)) {
+                            (true, Some(sibling)) => {
+                                // head of slice? this gets a bit tricky, but we can
+                                // move our sibling up next to us, modifying the sibling's
+                                // next pointer which shouldn't be used, and atomically
+                                // marking ourself for removal
+//                                let nextptr = headnextptr.unwrap();
+//                                let siblingnextptr = sibling.next.load();
+//                                debug_assert_eq!(
+//                                    self.eptr_mark(siblingnextptr),
+//                                    self.eptr_gen(self.eptr_inc_gen(siblingptr)),
+//                                );
+//                                let nsiblingnextptr = self.eptr_set_mark(
+//                                    nextptr,
+//                                    self.eptr_mark(siblingnextptr),
+//                                );
+//                                if let Err(_) = sibling.next.cas(siblingnextptr, nsiblingnextptr) {
+//                                    continue 'retry;
+//                                }
 
-                        // managed to claim the removal! let's continue to
-                        // remove the event from the queue
-                        found = true;
-                        continue;
+//                                let dirty_nextptr = self.eptr_from(
+//                                    self.eptr_inc_mark(nextptr),
+//                                    self.eptr_mark(nsiblingnextptr),
+//                                    Some(sibling)
+//                                );
+//                                if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+//                                    continue 'retry;
+//                                }
+//
+//                                // managed to claim the removal!
+//                                found = true;
+//                                // TODO if we move the found in head position
+//                                // up, can we avoid these big backwards jumps?
+//                                continue 'retry;
+
+                                // head of slice? mark it for removal and let the
+                                // loop clean it up
+                                let dirty_siblingptr = self.eptr_inc_mark(self.eptr_set_mark(siblingptr, self.eptr_gen(headptr)));
+                                if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+                                    continue 'retry;
+                                }
+
+                                // managed to claim the removal!
+                                found = true;
+                                continue;
+                            }
+                            (true, None) => {
+//                                // head of slice but no sibling? we can just mark
+//                                // ourself for removal then
+//                                //
+//                                // remember that adding new siblings works by
+//                                // updating our next pointer first, which we would
+//                                // clobber
+//                                let nextptr = headnextptr.unwrap();
+//                                let dirty_nextptr = self.eptr_inc_mark(nextptr);
+//                                if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+//                                    continue 'retry;
+//                                }
+
+                                // head of slice but no siblings? mark it for
+                                // removal and let the loop clean it up
+                                let dirty_siblingptr = self.eptr_inc_mark(self.eptr_set_mark(siblingptr, self.eptr_gen(headptr)));
+                                if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+                                    continue 'retry;
+                                }
+
+                                // managed to claim the removal!
+                                found = true;
+                                continue;
+                            }
+                            (false, _) => {
+                                // not head of slice? just mark it for removal and
+                                // let the loop clean it up
+                                let dirty_siblingptr = self.eptr_inc_mark(self.eptr_set_mark(siblingptr, self.eptr_gen(headptr)));
+                                if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+                                    continue 'retry;
+                                }
+
+                                // managed to claim the removal!
+                                found = true;
+                                continue;
+                            }
+                        }
                     }
 
                     headptr = siblingptr;
@@ -688,18 +957,28 @@ impl Equeue {
         }
 
         // make sure we clean up the memory
-        if found {
-            let e = unsafe { self.ebuf_claim(e) };
-            // TODO should this be common?
-            let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
-            e.status.store_ex(status);
-            if let Some(drop) = e.drop {
-                drop(unsafe { e.as_mut_ptr() });
-            }
-            self.dealloc_ebuf(e);
-        }
+//        if found {
+//            let e = unsafe { self.ebuf_claim(e) };
+////            // depending on which path we took for removal, sibling may be out of date
+////            let nextptr = e.next.load_ex();
+////            let siblingptr = e.sibling.load_ex();
+////            if self.gen_scmp(self.eptr_mark(siblingptr), self.eptr_mark(nextptr)).is_lt() {
+////                e.sibling.store_ex(self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr)));
+////            }
+//
+//            // TODO should this be common?
+//            let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
+//            e.status.store_ex(status);
+//            if let Some(drop) = e.drop {
+//                drop(unsafe { e.as_mut_ptr() });
+//            }
+//            self.dealloc_ebuf(e);
+//        }
 
         canceled
+
+
+
 
 
 //        todo!()
@@ -923,32 +1202,72 @@ impl Equeue {
                 let mut tail = None;
                 let mut siblingptr = head.sibling.load();
                 loop {
-//                    println!("headptr {:?} {:?}", headptr, siblingptr);
-                    // generation mismatch? someone was trying to remove this,
-                    // so we can skip it
-                    if self.eptr_mark(siblingptr) != self.eptr_gen(headptr) {
-                        match self.eptr_as_ref(siblingptr) {
-                            Some(sibling) => {
-                                headptr = siblingptr;
-                                head = sibling;
-                            }
-                            None => break,
-                        };
-                        siblingptr = head.sibling.load();
-                        continue;
-                    }
+                    // TODO if we don't need this, can this whole loop be simplified?
+//                    // generation mismatch?
+//                    match self.gen_scmp(self.eptr_mark(siblingptr), self.eptr_gen(headptr)) {
+//                        Ordering::Equal => {}
+//                        Ordering::Greater => {
+//                            // someone was trying to remove this sibling,
+//                            // we can skip this
+//                            match self.eptr_as_ref(siblingptr) {
+//                                Some(sibling) => {
+//                                    headptr = siblingptr;
+//                                    head = sibling;
+//                                }
+//                                None => break,
+//                            };
+//                            siblingptr = head.sibling.load();
+//                            continue;
+//                        }
+//                        Ordering::Less => {
+//                            // transient state when disentangling during cancel,
+//                            // continue, and we'll fix this when we replace the
+//                            // sibling pointer
+//                        }
+//                    }
+
+                    // TODO do we actually need double increments?
 
                     // CAS try to update with our predptr, effectively marking
                     // the event as removed
-                    predptr = self.eptr_set_mark(
-                        predptr,
-                        self.eptr_mark(self.eptr_inc_mark(siblingptr))
+//                    let npredptr = self.eptr_inc_mark(self.eptr_inc_mark(
+//                        self.eptr_set_mark(
+//                            predptr,
+//                            self.eptr_gen(headptr)
+//                        )
+//                    ));
+                    let npredptr = self.eptr_inc_mark(
+                        self.eptr_set_mark(
+                            predptr,
+                            self.eptr_gen(headptr)
+                        )
                     );
                     //predptr = self.eptr_set_mark(predptr, self.eptr_mark(siblingptr));
-                    if let Err(x) = head.sibling.cas(siblingptr, predptr) {
+                    if let Err(x) = head.sibling.cas(siblingptr, npredptr) {
                         siblingptr = x;
+                        //println!("oh noooooooooooooooooooooooooooooooooooo");
                         continue;
                     }
+//
+//                    // TODO this needed?
+//                    // CAS to keep next pointer in sync
+//                    let nextptr = head.next.load();
+//                    let dirty_nextptr = self.eptr_inc_mark(self.eptr_inc_mark(
+//                        self.eptr_set_mark(
+//                            nextptr,
+//                            self.eptr_gen(headptr)
+//                        )
+//                    ));
+//                    if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
+//                        continue;
+//                    }
+
+//                    // TODO is this a hack
+//                    // depending on which path we took for removal, sibling may be out of date
+//                    let nextptr = head.next.load();
+//                    if self.gen_scmp(self.eptr_mark(nextptr), self.eptr_mark(siblingptr)).is_lt() {
+//                        head.next.cas(nextptr, self.eptr_set_mark(nextptr, self.eptr_mark(siblingptr))).unwrap();
+//                    }
 
 //                    // note that the generation count in the next pointer should
 //                    // already be incremented due to either our removal above,
@@ -957,6 +1276,9 @@ impl Equeue {
 //                        self.eptr_mark(predptr),
 //                        self.eptr_mark(head.next.load())
 //                    );
+
+
+                    predptr = npredptr;
 
                     // head is valid, make sure to track it
                     tail = Some((
@@ -1023,6 +1345,9 @@ impl Equeue {
             // get a slice to dispatch
             let mut slice = self.dequeue_ebufs(now).ok();
 
+            let mut found = 0;
+            let mut count = 0;
+
             while let Some(e) = slice {
                 // first, increment the event's generation count,
                 // this is the last chance for the even to be canceled
@@ -1036,7 +1361,11 @@ impl Equeue {
                     break;
                 }
 
+                found += 1;
+
                 if status & Ebuf::ACTIVE != 0 {
+                    count += 1;
+
                     // dispatch!
                     e.cb.unwrap()(unsafe { e.as_mut_ptr() });
                 }
@@ -1052,12 +1381,14 @@ impl Equeue {
                     );
                 } else {
                     // call drop, return event to memory pool
-                    if let Some(drop) = e.drop {
-                        drop(unsafe { e.as_mut_ptr() });
-                    }
-                    self.dealloc_ebuf(e);
+//                    if let Some(drop) = e.drop {
+//                        drop(unsafe { e.as_mut_ptr() });
+//                    }
+//                    self.dealloc_ebuf(e);
                 }
             }
+
+            println!("found {}/{}", count, found);
 
             // should we stop dispatching?
             //
