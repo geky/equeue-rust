@@ -121,6 +121,21 @@ impl Equeue {
         (eptr.0 >> self.enpw2) & gmask
     }
 
+    fn eptr_set_gen(&self, eptr: Eptr, gen: usize) -> Eptr {
+        debug_assert!(gen <= (1 << self.gnpw2));
+        let mask = !(((1 << self.gnpw2) - 1) << self.enpw2);
+        Eptr((gen << self.enpw2) | (eptr.0 & mask))
+    }
+
+    fn eptr_inc_gen(&self, eptr: Eptr) -> Eptr {
+        Eptr(
+            eptr.0
+                .rotate_left(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
+                .wrapping_add(1 << self.gnpw2+self.enpw2)
+                .rotate_right(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
+        )
+    }
+
     fn eptr_as_ptr(&self, eptr: Eptr) -> *const Ebuf {
         let mask = (1 << self.enpw2) - 1;
         if eptr.0 & mask != 0 {
@@ -159,7 +174,7 @@ impl Equeue {
 /// Internal event header
 #[derive(Debug)]
 struct Ebuf {
-    npw2: u8,
+    status: Cas<usize>,
     next: Cas<Eptr>,
     sibling: Cas<Eptr>,
 
@@ -170,6 +185,8 @@ struct Ebuf {
 }
 
 impl Ebuf {
+    const ACTIVE: usize = 0x100;
+
     // access to the trailing buffer
     unsafe fn as_ptr<T>(&self) -> *const T {
         (self as *const Ebuf).add(1) as *const T
@@ -205,19 +222,28 @@ impl Equeue {
     }
 
     // access the generation count embedded in our event's mark
-    fn ebuf_gen_load<'a>(&'a self, e: &'a Ebuf) -> usize {
-        // next can change before sibling, so sibling contains the "true"
-        // generation count
-        self.eptr_mark(e.sibling.load())
-    }
+//    fn ebuf_gen_load<'a>(&'a self, e: &'a Ebuf) -> usize {
+//        self.eptr_mark(e.next.load())
+////        // next can change before sibling, so sibling contains the "true"
+////        // generation count
+////        self.eptr_mark(e.sibling.load())
+//    }
+//
+//    fn ebuf_gen_load_ex<'a>(&'a self, e: &'a mut Ebuf) -> usize {
+//        self.eptr_mark(e.next.load_ex())
+////        // next can change before sibling, so sibling contains the "true"
+////        // generation count
+////        self.eptr_mark(e.sibling.load_ex())
+//    }
 
-    fn ebuf_gen_load_ex<'a>(&'a self, e: &'a mut Ebuf) -> usize {
-        // next can change before sibling, so sibling contains the "true"
-        // generation count
-        self.eptr_mark(e.sibling.load_ex())
+    fn ebuf_npw2(&self, e: &Ebuf) -> u8 {
+        // npw2 doesn't actually change
+        (unsafe { self.ebuf_claim(e) }.status.load_ex() & 0xff) as u8
     }
 
     fn ebuf_gen_inc_ex<'a>(&'a self, e: &'a mut Ebuf) {
+        let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
+        e.status.store_ex(status);
         let nextptr = self.eptr_inc_mark(e.next.load_ex());
         e.next.store_ex(nextptr);
         let siblingptr = self.eptr_inc_mark(e.sibling.load_ex());
@@ -376,9 +402,9 @@ impl Equeue {
             unsafe {
                 let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
                 e.write(Ebuf {
+                    status: Cas::new(0 | npw2 as usize),
                     next: Cas::new(Eptr::null()),
                     sibling: Cas::new(Eptr::null()),
-                    npw2: npw2,
 
                     cb: None,
                     drop: None,
@@ -395,20 +421,16 @@ impl Equeue {
         debug_assert!(self.contains_ebuf(e));
         // generation count are incremented during removal from the queue, but
         // they should be consistent, otherwise our algorithm has a bug
-// TODO what
         debug_assert_eq!(
             self.eptr_mark(e.next.load_ex()),
             self.eptr_mark(e.sibling.load_ex())
         );
-//        let nextptr = self.eptr_set_mark(e.next.load_ex(), self.eptr_mark(e.sibling.load_ex()));
-//        e.next.store_ex(nextptr);
 
-        // we have exclusive access so generation can't change
-        let gen = self.ebuf_gen_load_ex(e);
         // we only ever need to load buckets once because it can never shrink
-        let bucket = &self.buckets()[e.npw2 as usize];
+        let bucket = &self.buckets()[self.ebuf_npw2(e) as usize];
 
         // CAS try to add our event to a bucket
+        let gen = self.eptr_mark(e.next.load_ex());
         let mut siblingptr = bucket.load();
         loop {
             debug_assert_ne!(e as *const _, self.eptr_as_ptr(siblingptr));
@@ -427,11 +449,13 @@ impl Equeue {
     // Queue management
     fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) -> Eptr {
         debug_assert!(e.cb.is_some());
+        // mark the event as executing
+        // TODO here?
+        let status = e.status.load_ex() | Ebuf::ACTIVE;
+        e.status.store_ex(status);
         e.target = target;
 
-        // we have exclusive access so generation can't change
-        let gen = self.ebuf_gen_load_ex(e);
-
+        let gen = self.eptr_mark(e.next.load_ex());
         'retry: loop {
             let mut headptr = self.queue.load();
             let mut headsrc = &self.queue;
@@ -446,6 +470,15 @@ impl Equeue {
                 nextptr = head.next.load();
                 nextsrc = Some(&head.next);
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+//                    // make sure sibling is in sync with next
+//                    let siblingptr = head.sibling.load();
+//                    if self.eptr_mark(siblingptr) != self.eptr_mark(nextptr) {
+//                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr));
+//                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+//                            continue 'retry;
+//                        }
+//                    }
+
                     let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
                     if let Err(_) = headsrc.cas(headptr, nextptr) {
                         // someone else removed the event for us, but we don't know
@@ -494,6 +527,7 @@ impl Equeue {
                     eptr = self.eptr_from(self.eptr_inc_mark(headptr), gen, Some(e));
                     nextptr = self.eptr_set_mark(headptr, gen);
                     siblingptr = self.eptr_set_mark(predptr, gen);
+                    //siblingptr = self.eptr_set_mark(self.eptr_inc_gen(predptr), gen);
                 }
                 Ordering::Less => unreachable!(),
             };
@@ -516,11 +550,13 @@ impl Equeue {
             // the queue must fix pending removes, the duplicate entries will
             // get fixed before they have any effect on either behavior or
             // runtime
-            break eptr;
+
+            // TODO this is a bit of a mess
+            break self.eptr_set_mark(eptr, self.eptr_mark(Eptr(status)));
         }
     }
 
-    fn unqueue_ebuf<'a>(&'a self, eptr: Eptr) -> Option<&'a mut Ebuf> {
+    fn unqueue_ebuf<'a>(&'a self, eptr: Eptr) -> bool { //Option<&'a mut Ebuf> {
         let gen = self.eptr_gen(eptr);
         let e = match self.eptr_as_ref(eptr)
             // I supposed eptrs could be passed between equeues, it's probably
@@ -528,45 +564,48 @@ impl Equeue {
             .filter(|e| self.contains_ebuf(e))
         {
             Some(e) => e,
-            None => return None,
+            None => return false,
         };
 
-        // 1. is our event even in-flight anymore?
-        let mut siblingptr = e.sibling.load();
-        loop {
-            if self.eptr_mark(siblingptr) != gen {
-                return None;
+        // first, update the status to indicate we're canceled
+        let mut status = e.status.load();
+        let canceled = loop {
+            if self.eptr_mark(Eptr(status)) != gen {
+                break false;
             }
 
-            // 2. atomically mark ourselves for removal, if we succeed here,
-            // we now own the memory
-            let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
-            if let Err(x) = e.sibling.cas(siblingptr, dirty_siblingptr) {
-                siblingptr = x;
+            let dirty_status = status & !Ebuf::ACTIVE;
+            if let Err(x) = e.status.cas(status, dirty_status) {
+                status = x;
                 continue;
             }
 
-            break;
-        }
+            break true;
+        };
 
-        // 3. now for the expensive part, before we can actually reuse the
-        // memory, we need to make sure the event is no longer in the queue
-        //
-        // we actually don't need to find our specific event, if we go through
-        // the queue and clean up any in-flight removals for our time slice,
-        // then we can be sure our event has been removed
+        // now try to find our event and reclaim the memory
         let target = e.target;
+        let mut found = false;
         'retry: loop {
             let mut headptr = self.queue.load();
             let mut headsrc = &self.queue;
 
-            // find time-slice
+            // find insertion point
             let mut delta = Ordering::Greater;
             while let Some(head) = self.eptr_as_ref(headptr) {
                 // generation mismatch? someone is trying to remove and we
                 // need to help out
                 let nextptr = head.next.load();
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+//                    // make sure sibling is in sync with next
+//                    let siblingptr = head.sibling.load();
+//                    if self.eptr_mark(siblingptr) != self.eptr_mark(nextptr) {
+//                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr));
+//                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+//                            continue 'retry;
+//                        }
+//                    }
+
                     let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
                     if let Err(_) = headsrc.cas(headptr, nextptr) {
                         // someone else removed the event for us, but we don't know
@@ -589,44 +628,23 @@ impl Equeue {
                 headsrc = &head.next;
             };
 
+            // found the timeslice, try to find the actual event
+            let mut first = true;
             if delta.is_eq() {
-                // found our time-slice, let's find our event
                 while let Some(head) = self.eptr_as_ref(headptr) {
                     // generation mismatch? someone is trying to remove and we
                     // need to help out
-                    let mut siblingptr = head.sibling.load();
+                    let siblingptr = head.sibling.load();
                     if self.eptr_mark(siblingptr) != self.eptr_gen(headptr) {
-                        // first we need to make sure our event isn't in the next list, or
-                        // it has no siblings, we can do this by replacing our next pointer
-                        // with our sibling pointer while marking ourselves for deletion, a
-                        // sort of reverse slice squish
-                        //
-                        // note if we're already removed from the next list, either through
-                        // another cancel or slice squish, our mark/gen should mismatch
-                        let nextptr = head.next.load();
-                        if self.eptr_mark(nextptr) == self.eptr_gen(headptr) {
-                            match self.eptr_as_ref(siblingptr) {
-                                Some(sibling) => {
-                                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_gen(siblingptr));
-                                    if let Err(_) = sibling.next.cas(sibling.next.load(), nextptr) {
-                                        // yes this can fail! thanks to cancel, very complicated
-                                        // interactions here are possible
-                                        continue 'retry;
-                                    }
-                                }
-                                None => {
-                                    siblingptr = self.eptr_inc_mark(nextptr);
-                                }
-                            };
-                            if let Err(_) = e.next.cas(nextptr, siblingptr) {
-                                continue 'retry;
-                            }
+    //                    // make sure sibling is in sync with sibling
+    //                    let siblingptr = head.sibling.load();
+    //                    if self.eptr_mark(siblingptr) != self.eptr_mark(siblingptr) {
+    //                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(siblingptr));
+    //                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+    //                            continue 'retry;
+    //                        }
+    //                    }
 
-                            // TODO hm
-                            continue 'retry;
-                        }
-
-                        // now we can remove ourself from the siblings/next (headsrc can be either!)
                         let siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(headptr));
                         if let Err(_) = headsrc.cas(headptr, siblingptr) {
                             // someone else removed the event for us, but we don't know
@@ -639,27 +657,181 @@ impl Equeue {
                         continue;
                     }
 
-                    // found our event? we're done
-                    if head as *const _ == e as *const _ {
-                        break;
+                    // TODO check for match?
+//                    let ndelta = scmp(head.target, target).cmp(&0);
+//                    if ndelta.is_ge() {
+//                        delta = ndelta;
+//                        break;
+//                    }
+
+                    // found our event? try to mark it for removal
+                    if !first && head as *const _ == e as *const _ {
+                        let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
+                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+                            continue 'retry;
+                        }
+
+                        // managed to claim the removal! let's continue to
+                        // remove the event from the queue
+                        found = true;
+                        continue;
                     }
 
                     headptr = siblingptr;
                     headsrc = &head.sibling;
-                }
+                    first = false;
+                };
             }
 
             break;
         }
 
-        // and now we are free to do whatever we want with this ebuf
-        Some(unsafe { self.ebuf_claim(e) })
+        // make sure we clean up the memory
+        if found {
+            let e = unsafe { self.ebuf_claim(e) };
+            // TODO should this be common?
+            let status = e.status.load_ex().wrapping_add(1 << self.gnpw2+self.enpw2);
+            e.status.store_ex(status);
+            if let Some(drop) = e.drop {
+                drop(unsafe { e.as_mut_ptr() });
+            }
+            self.dealloc_ebuf(e);
+        }
+
+        canceled
+
+
+//        todo!()
 //
-//        // let's just make our generation counts consistent first
-//        let nextptr = self.eptr_set_mark(e.next.load_ex(), self.eptr_mark(siblingptr));
-//        e.next.store_ex(nextptr);
+//        // 1. is our event even in-flight anymore?
+//        let mut siblingptr = e.sibling.load();
+//        loop {
+//            if self.eptr_mark(siblingptr) != gen {
+//                return None;
+//            }
 //
-//        Some(e)
+//            // 2. atomically mark ourselves for removal, if we succeed here,
+//            // we now own the memory
+//            let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
+//            if let Err(x) = e.sibling.cas(siblingptr, dirty_siblingptr) {
+//                siblingptr = x;
+//                continue;
+//            }
+//
+//            break;
+//        }
+//
+//        // 3. now for the expensive part, before we can actually reuse the
+//        // memory, we need to make sure the event is no longer in the queue
+//        //
+//        // we actually don't need to find our specific event, if we go through
+//        // the queue and clean up any in-flight removals for our time slice,
+//        // then we can be sure our event has been removed
+//        let target = e.target;
+//        'retry: loop {
+//            let mut headptr = self.queue.load();
+//            let mut headsrc = &self.queue;
+//
+//            // find time-slice
+//            let mut delta = Ordering::Greater;
+//            while let Some(head) = self.eptr_as_ref(headptr) {
+//                // generation mismatch? someone is trying to remove and we
+//                // need to help out
+//                let nextptr = head.next.load();
+//                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+//                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
+//                    if let Err(_) = headsrc.cas(headptr, nextptr) {
+//                        // someone else removed the event for us, but we don't know
+//                        // what else has happened, so we need to retry
+//                        continue 'retry;
+//                    }
+//
+//                    // if no one fixed this before us, we can continue
+//                    headptr = nextptr;
+//                    continue;
+//                }
+//
+//                let ndelta = scmp(head.target, target).cmp(&0);
+//                if ndelta.is_ge() {
+//                    delta = ndelta;
+//                    break;
+//                }
+//
+//                headptr = nextptr;
+//                headsrc = &head.next;
+//            };
+//
+//            if delta.is_eq() {
+//                // found our time-slice, let's find our event
+//                while let Some(head) = self.eptr_as_ref(headptr) {
+//                    // generation mismatch? someone is trying to remove and we
+//                    // need to help out
+//                    let mut siblingptr = head.sibling.load();
+//                    if self.eptr_mark(siblingptr) != self.eptr_gen(headptr) {
+//                        // first we need to make sure our event isn't in the next list, or
+//                        // it has no siblings, we can do this by replacing our next pointer
+//                        // with our sibling pointer while marking ourselves for deletion, a
+//                        // sort of reverse slice squish
+//                        //
+//                        // note if we're already removed from the next list, either through
+//                        // another cancel or slice squish, our mark/gen should mismatch
+//                        let nextptr = head.next.load();
+//                        if self.eptr_mark(nextptr) == self.eptr_gen(headptr) {
+//                            match self.eptr_as_ref(siblingptr) {
+//                                Some(sibling) => {
+//                                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_gen(siblingptr));
+//                                    if let Err(_) = sibling.next.cas(sibling.next.load(), nextptr) {
+//                                        // yes this can fail! thanks to cancel, very complicated
+//                                        // interactions here are possible
+//                                        continue 'retry;
+//                                    }
+//                                }
+//                                None => {
+//                                    siblingptr = self.eptr_inc_mark(nextptr);
+//                                }
+//                            };
+//                            if let Err(_) = e.next.cas(nextptr, siblingptr) {
+//                                continue 'retry;
+//                            }
+//
+//                            // TODO hm
+//                            continue 'retry;
+//                        }
+//
+//                        // now we can remove ourself from the siblings/next (headsrc can be either!)
+//                        let siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(headptr));
+//                        if let Err(_) = headsrc.cas(headptr, siblingptr) {
+//                            // someone else removed the event for us, but we don't know
+//                            // what else has happened, so we need to retry
+//                            continue 'retry;
+//                        }
+//
+//                        // if no one fixed this before us, we can continue
+//                        headptr = siblingptr;
+//                        continue;
+//                    }
+//
+//                    // found our event? we're done
+//                    if head as *const _ == e as *const _ {
+//                        break;
+//                    }
+//
+//                    headptr = siblingptr;
+//                    headsrc = &head.sibling;
+//                }
+//            }
+//
+//            break;
+//        }
+//
+//        // and now we are free to do whatever we want with this ebuf
+//        Some(unsafe { self.ebuf_claim(e) })
+////
+////        // let's just make our generation counts consistent first
+////        let nextptr = self.eptr_set_mark(e.next.load_ex(), self.eptr_mark(siblingptr));
+////        e.next.store_ex(nextptr);
+////
+////        Some(e)
     }
 
     fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a mut Ebuf, itick> {
@@ -673,6 +845,15 @@ impl Equeue {
                 // need to help out
                 let nextptr = head.next.load();
                 if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
+//                    // make sure sibling is in sync with next
+//                    let siblingptr = head.sibling.load();
+//                    if self.eptr_mark(siblingptr) != self.eptr_mark(nextptr) {
+//                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr));
+//                        if let Err(_) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+//                            continue 'retry;
+//                        }
+//                    }
+
                     let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
                     if let Err(_) = self.queue.cas(headptr, nextptr) {
                         // someone else removed the event for us, but we don't know
@@ -699,6 +880,27 @@ impl Equeue {
                 if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
                     continue 'retry;
                 }
+//                let nextptr = dirty_nextptr;
+
+//                // CAS 2. keep the next/sibling pointers in sync
+//                let mut siblingptr = head.sibling.load();
+//                loop {
+//                    if self.eptr_mark(siblingptr) != self.eptr_mark(nextptr) {
+//                        let dirty_siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(nextptr));
+//                        if let Err(x) = head.sibling.cas(siblingptr, dirty_siblingptr) {
+//                            siblingptr = x;
+//                            continue;
+//                        }
+//                        siblingptr = dirty_siblingptr;
+//                    }
+//                    break;
+//                }
+//
+//                // TODO is there a better way to structure this?
+//
+//                // since we've updated siblingptr, we need to keep headptr in sync
+//                // TODO what's going on...
+//                let headptr = self.eptr_set_gen(headptr, self.eptr_mark(siblingptr));
 
                 // we've effectively removed the slice, but can't claim the
                 // memory yet
@@ -720,6 +922,7 @@ impl Equeue {
                 let mut tail = None;
                 let mut siblingptr = head.sibling.load();
                 loop {
+//                    println!("headptr {:?} {:?}", headptr, siblingptr);
                     // generation mismatch? someone was trying to remove this,
                     // so we can skip it
                     if self.eptr_mark(siblingptr) != self.eptr_gen(headptr) {
@@ -734,12 +937,13 @@ impl Equeue {
                         continue;
                     }
 
-                    // CAS try to update with our predptr, atomically marking
+                    // CAS try to update with our predptr, effectively marking
                     // the event as removed
                     predptr = self.eptr_set_mark(
                         predptr,
                         self.eptr_mark(self.eptr_inc_mark(siblingptr))
                     );
+                    //predptr = self.eptr_set_mark(predptr, self.eptr_mark(siblingptr));
                     if let Err(x) = head.sibling.cas(siblingptr, predptr) {
                         siblingptr = x;
                         continue;
@@ -762,6 +966,7 @@ impl Equeue {
 
                     match self.eptr_as_ref(siblingptr) {
                         Some(sibling) => {
+//                            println!("up? {:?} {:?}", headptr, siblingptr);
                             predptr = headptr;
                             headptr = siblingptr;
                             head = sibling;
@@ -818,13 +1023,27 @@ impl Equeue {
             let mut slice = self.dequeue_ebufs(now).ok();
 
             while let Some(e) = slice {
-                // dispatch!
-                e.cb.unwrap()(unsafe { e.as_mut_ptr() });
+                // first, increment the event's generation count,
+                // this is the last chance for the even to be canceled
+                let mut status = e.status.load();
+                loop {
+                    let dirty_status = status.wrapping_add(1 << self.gnpw2+self.enpw2);
+                    if let Err(x) = e.status.cas(status, dirty_status) {
+                        status = x;
+                        continue;
+                    }
+                    break;
+                }
+
+                if status & Ebuf::ACTIVE != 0 {
+                    // dispatch!
+                    e.cb.unwrap()(unsafe { e.as_mut_ptr() });
+                }
 
                 // move to next event
                 slice = self.eptr_load_ex(&mut e.sibling);
 
-                if e.period >= 0 {
+                if status & Ebuf::ACTIVE != 0 && e.period >= 0 {
                     // reenqueue?
                     self.enqueue_ebuf(
                         e,
@@ -872,20 +1091,21 @@ impl Equeue {
 
     // Central cancel function
     pub fn cancel(&self, id: Id) -> bool {
-        match self.unqueue_ebuf(Eptr::from(id)) {
-            Some(e) => {
-                // make sure we clean up the event
-                if let Some(drop) = e.drop {
-                    drop(unsafe { e.as_mut_ptr() });
-                }
-                self.dealloc_ebuf(e);
-
-                true
-            }
-            None => {
-                false
-            }
-        }
+        self.unqueue_ebuf(Eptr::from(id))
+//        match self.unqueue_ebuf(Eptr::from(id)) {
+//            Some(e) => {
+//                // make sure we clean up the event
+//                if let Some(drop) = e.drop {
+//                    drop(unsafe { e.as_mut_ptr() });
+//                }
+//                self.dealloc_ebuf(e);
+//
+//                true
+//            }
+//            None => {
+//                false
+//            }
+//        }
     }
 
     // Handling of raw allocations
@@ -1176,14 +1396,14 @@ impl Equeue {
             let e = unsafe { &*(p as *const Ebuf) };
             // the risky thing about this is we can end up with an
             // uninitialized ebuf here, which can be problematic
-            if e.npw2 > npw2(self.slab.len()) {
+            if self.ebuf_npw2(e) > npw2(self.slab.len()) {
                 break;
             }
 
             total += 1;
             p = unsafe {
                 p.add(alignup(
-                    size_of::<Ebuf>() + (Eptr::ALIGN << e.npw2),
+                    size_of::<Ebuf>() + (Eptr::ALIGN << self.ebuf_npw2(e)),
                     Eptr::ALIGN
                 ))
             }
@@ -1199,7 +1419,7 @@ impl Equeue {
             let mut nsibling = Some(head);
             while let Some(sibling) = nsibling {
                 pending += 1;
-                pending_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << sibling.npw2);
+                pending_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << self.ebuf_npw2(sibling));
                 nsibling = self.eptr_load(&sibling.sibling);
             }
             
