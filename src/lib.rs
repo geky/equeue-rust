@@ -24,7 +24,6 @@ use core::mem::forget;
 use core::ptr::drop_in_place;
 use core::mem::transmute;
 use core::cmp::Ordering;
-use core::cmp;
 use core::num::NonZeroUsize;
 use core::num::TryFromIntError;
 
@@ -66,10 +65,12 @@ impl Eptr {
     // TODO should these take advantage of the npw2(event size) to be compressed
     // even further?
     //
-    const ALIGN: usize = max(
-        max(align_of::<Eptr>(), align_of::<Ebuf>()),
-        align_of::<*const usize>()
-    );
+    const ALIGN: usize = {
+        let mut align = align_of::<Ebuf>();
+        if align_of::<Eptr>() > align { align = align_of::<Eptr>() }
+        if align_of::<*const usize>() > align { align = align_of::<*const usize>() }
+        align
+    };
 
     const fn null() -> Eptr {
         Eptr(0)
@@ -491,7 +492,7 @@ impl Equeue {
                     continue;
                 }
 
-                let ndelta = scmp(head.target, target).cmp(&0);
+                let ndelta = scmp(head.target, target);
                 if ndelta.is_ge() {
                     delta = ndelta;
                     break;
@@ -618,7 +619,7 @@ impl Equeue {
                     continue;
                 }
 
-                let ndelta = scmp(head.target, target).cmp(&0);
+                let ndelta = scmp(head.target, target);
                 if ndelta.is_ge() {
                     delta = ndelta;
                     break;
@@ -867,7 +868,7 @@ impl Equeue {
                 }
 
                 // is this slice ready to dispatch?
-                let delta = scmp(head.target, now);
+                let delta = sdiff(head.target, now);
                 if delta > 0 {
                     // no? return how long until the next event
                     break 'retry delta;
@@ -1062,7 +1063,7 @@ impl Equeue {
             //
             // note that time could have changed _significantly_
             now = self.clock.now();
-            let timeout_left = scmp(timeout, now);
+            let timeout_left = sdiff(timeout, now);
             if ticks >= 0 && timeout_left <= 0 {
                 return;
             }
@@ -1074,7 +1075,7 @@ impl Equeue {
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
             let mut delay = match self.eptr_as_ref(self.queue.load()) {
-                Some(head) => cmp::max(scmp(head.target, now), 0),
+                Some(head) => max(sdiff(head.target, now), 0),
                 None => -1,
             };
 

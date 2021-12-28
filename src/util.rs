@@ -11,30 +11,124 @@ use std::sync::Mutex;
 use std::sync::Condvar;
 
 
-#[inline]
-pub(crate) const fn max(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
+// min/max
+pub(crate) use core::cmp::min;
+pub(crate) use core::cmp::max;
+
+// alignup/aligndown
+pub(crate) trait Align {
+    fn alignup(self, align: usize) -> Self;
+    fn aligndown(self, align: usize) -> Self;
+}
+
+impl Align for usize {
+    #[inline]
+    fn aligndown(self, align: usize) -> usize {
+        self - (self % align)
+    }
+
+    #[inline]
+    fn alignup(self, align: usize) -> usize {
+        (self + align-1).aligndown(align)
+    }
+}
+
+impl Align for *const u8 {
+    #[inline]
+    fn aligndown(self, align: usize) -> *const u8 {
+        (self as usize).aligndown(align) as *const u8
+    }
+
+    #[inline]
+    fn alignup(self, align: usize) -> *const u8 {
+        (self as usize).alignup(align) as *const u8
+    }
+}
+
+impl Align for *mut u8 {
+    #[inline]
+    fn aligndown(self, align: usize) -> *mut u8 {
+        (self as usize).aligndown(align) as *mut u8
+    }
+
+    #[inline]
+    fn alignup(self, align: usize) -> *mut u8 {
+        (self as usize).alignup(align) as *mut u8
+    }
 }
 
 #[inline]
-pub(crate) const fn min(a: usize, b: usize) -> usize {
-    if a < b { a } else { b }
+pub(crate) fn aligndown<T: Align>(a: T, align: usize) -> T {
+    a.aligndown(align)
 }
 
 #[inline]
-pub(crate) const fn aligndown(a: usize, align: usize) -> usize {
-    a - (a % align)
+pub(crate) fn alignup<T: Align>(a: T, align: usize) -> T {
+    a.alignup(align)
+}
+
+// npw2
+pub(crate) trait Npw2 {
+    fn npw2(self) -> u8;
+}
+
+impl Npw2 for usize {
+    #[inline]
+    fn npw2(self) -> u8 {
+        self.next_power_of_two().trailing_zeros() as u8
+    }
 }
 
 #[inline]
-pub(crate) const fn alignup(a: usize, align: usize) -> usize {
-    aligndown(a + align-1, align)
+pub(crate) fn npw2<T: Npw2>(a: T) -> u8 {
+    a.npw2()
+}
+
+// scmp/sdiff
+pub(crate) trait Scmp {
+    type Output;
+    fn sdiff(self, b: Self) -> Self::Output;
+    fn scmp(self, b: Self) -> core::cmp::Ordering;
+}
+
+impl Scmp for utick {
+    type Output = itick;
+
+    #[inline]
+    fn sdiff(self, b: utick) -> itick {
+        self.wrapping_sub(b) as itick
+    }
+
+    #[inline]
+    fn scmp(self, b: utick) -> core::cmp::Ordering {
+        self.sdiff(b).cmp(&0)
+    }
+}
+
+impl Scmp for usize {
+    type Output = isize;
+
+    #[inline]
+    fn sdiff(self, b: usize) -> isize {
+        self.wrapping_sub(b) as isize
+    }
+
+    #[inline]
+    fn scmp(self, b: usize) -> core::cmp::Ordering {
+        self.sdiff(b).cmp(&0)
+    }
 }
 
 #[inline]
-pub(crate) const fn npw2(a: usize) -> u8 {
-    a.next_power_of_two().trailing_zeros() as u8
+pub(crate) fn sdiff<T: Scmp>(a: T, b: T) -> <T as Scmp>::Output {
+    a.sdiff(b)
 }
+
+#[inline]
+pub(crate) fn scmp<T: Scmp>(a: T, b: T) -> core::cmp::Ordering {
+    a.scmp(b)
+}
+
 
 // TODO these should be wrapped more flexbily
 // - allow overriding
@@ -98,10 +192,6 @@ pub(crate) type itick = i64;
 
 #[derive(Debug)]
 pub(crate) struct Clock(Instant);
-
-pub(crate) fn scmp(a: utick, b: utick) -> itick {
-    a.wrapping_sub(b) as itick
-}
 
 impl Clock {
     pub fn new() -> Clock {
