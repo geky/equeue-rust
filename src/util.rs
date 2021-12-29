@@ -179,7 +179,8 @@ impl<T> Cas<T> {
     pub fn store_ex(&mut self, new: T) {
         self.0.store(
             unsafe { *(&new as *const _ as *const usize) },
-            atomic::Ordering::Relaxed
+            // atomic::Ordering::Relaxed TODO
+            atomic::Ordering::SeqCst
         )
     }
 }

@@ -137,7 +137,7 @@ fn test_delay_reversed() {
 }
 
 #[test]
-fn test_period() {
+fn test_periodic() {
     let mut buffer = vec![0; 1024*1024];
     let q = Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }

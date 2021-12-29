@@ -401,3 +401,59 @@ fn test_race_cancel_dispatch() {
 
     println!("usage: {:#?}", q.usage());
 }
+
+#[test]
+fn test_race_cancel_periodic() {
+    let mut buffer = vec![0; 1024*1024*1024]; // TODO reduce mem
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let count = Arc::new(AtomicU32::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let dispatch_thread = {
+        let q = q.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                q.dispatch(0);
+            }
+
+            // make sure we catch any lingering events
+            q.dispatch(0);
+        })
+    };
+
+    let mut threads = vec![];
+    for _ in 0..100 {
+        let q = q.clone();
+        let count = count.clone();
+        threads.push(thread::spawn(move || {
+            let mut ids = vec![];
+            for _ in 0..100 {
+                let count = count.clone();
+                let id = q.call_every(0, move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }).unwrap();
+                ids.push(id);
+            }
+
+            for id in ids {
+                q.cancel(id);
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+
+    done.fetch_or(true, Ordering::SeqCst);
+    dispatch_thread.join().unwrap();
+
+    // we can't really check any output here, events may or may not
+    // be dispatched, instead we just test that nothing explodes
+
+    println!("usage: {:#?}", q.usage());
+}
