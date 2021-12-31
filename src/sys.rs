@@ -8,6 +8,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use core::cmp::Ordering;
 use core::fmt::Debug;
+use core::num::NonZeroUsize;
 
 use std::time::Instant;
 use std::time::Duration;
@@ -53,6 +54,8 @@ impl Clock for DefaultClock {
 pub(crate) type ueptr = usize;
 #[allow(non_camel_case_types)]
 pub(crate) type ieptr = isize;
+
+pub(crate) type NonZeroUeptr = NonZeroUsize;
 
 // we really only need loads, stores must always
 // occur in critical sections

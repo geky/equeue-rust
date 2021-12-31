@@ -27,6 +27,7 @@ use core::cmp::Ordering;
 use core::num::NonZeroUsize;
 use core::num::TryFromIntError;
 use core::fmt::Debug;
+use core::iter;
 
 mod util;
 mod sys;
@@ -128,15 +129,15 @@ impl Eptr {
             as usize
             / Eptr::ALIGN;
 
-        Eptr((gen << q.npw2) | eptr)
+        Eptr((gen << q.id_off) | eptr)
     }
 
-    fn from(q: &Equeue, e: &Ebuf) -> Eptr {
+    fn from_ebuf(q: &Equeue, e: &Ebuf) -> Eptr {
         unsafe { Eptr::from_parts(q, e.gen(q), e) }
     }
 
     fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
-        let mask = (1 << q.npw2) - 1;
+        let mask = (1 << q.id_off) - 1;
         match self.0 & mask {
             0 => None,
             _ => Some(
@@ -149,11 +150,12 @@ impl Eptr {
     }
 
     fn gen(&self, q: &Equeue) -> ueptr {
-        self.0 >> q.npw2
+        self.0 >> q.id_off
     }
 
-    fn inc(&self, q: &Equeue) -> Eptr {
-        Eptr(self.0.wrapping_add(1 << q.npw2))
+    fn id(&self, q: &Equeue) -> ueptr {
+        let mask = (1 << q.gen_off) - 1;
+        (self.0 & mask) >> q.id_off
     }
 }
 
@@ -172,10 +174,8 @@ impl Debug for Einfo {
 }
 
 impl Einfo {
-    fn new(q: &Equeue, gen: ueptr, id: ueptr, npw2: u8) -> Einfo {
-        debug_assert!(gen < (1 << 8*size_of::<ueptr>()-q.npw2 as ueptr));
-        debug_assert!(id  < (1 << q.npw2-8));
-        Einfo((gen << q.npw2) | (id << 8) | (npw2 as ueptr))
+    fn new(q: &Equeue, gen: ueptr, npw2: u8) -> Einfo {
+        Einfo((gen << q.id_off) | (npw2 as ueptr))
     }
 
     fn npw2(&self) -> u8 {
@@ -188,27 +188,22 @@ impl Einfo {
     }
 
     fn gen(&self, q: &Equeue) -> ueptr {
-        self.0 >> q.npw2
+        self.0 >> q.id_off
     }
 
     fn id(&self, q: &Equeue) -> ueptr {
-        let mask = (1 << q.npw2) - 1;
-        (self.0 & mask) >> 8
+        let mask = (1 << q.gen_off) - 1;
+        (self.0 & mask) >> q.id_off
     }
 
     fn inc_gen(&self, q: &Equeue) -> Einfo {
-        Einfo(self.0.wrapping_add(1 << q.npw2))
+        Einfo(self.0.wrapping_add(1 << q.gen_off))
     }
 
     fn inc_id(&self, q: &Equeue) -> Einfo {
-        let mask = (1 << q.npw2) - 1;
-        Einfo((self.0 & !mask) | (self.0.wrapping_add(1 << 8) & mask))
-    }
-
-    fn inc_both(&self, q: &Equeue) -> Einfo {
-        // we don't really care about the extra inc from overflowing the id here
-        let mask = (1 << q.npw2) - 1;
-        Einfo(self.0.wrapping_add((1 << q.npw2) + (1 << 8)))
+        // note we don't care if overflow increments gen here,
+        // any increment to id should have also incremented gen
+        Einfo(self.0.wrapping_add(1 << q.id_off))
     }
 }
 
@@ -220,6 +215,8 @@ struct Ebuf {
     info: Atomic<Einfo>,
     next: Atomic<Eptr>,
     sibling: Atomic<Eptr>,
+    // TODO make this not static
+    back: Atomic<Option<&'static Atomic<Eptr>>>,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -247,16 +244,16 @@ impl Ebuf {
         self.info.load().id(q)
     }
 
-    fn inc_gen(&self, q: &Equeue) {
-        self.info.store(self.info.load().inc_gen(q))
+    fn inc_gen(&self, q: &Equeue) -> ueptr {
+        let info = self.info.load().inc_gen(q);
+        self.info.store(info);
+        info.gen(q)
     }
 
-    fn inc_id(&self, q: &Equeue) {
-        self.info.store(self.info.load().inc_id(q))
-    }
-
-    fn inc_both(&self, q: &Equeue) {
-        self.info.store(self.info.load().inc_both(q))
+    fn inc_id(&self, q: &Equeue) -> ueptr {
+        let info = self.info.load().inc_id(q);
+        self.info.store(info);
+        info.gen(q)
     }
 
     // access to the trailing buffer
@@ -322,7 +319,7 @@ impl<'a> Eref<'a> {
     fn from_ebuf(q: &'a Equeue, e: &'a Ebuf) -> Eref<'a> {
         Eref {
             q: q,
-            eptr: Eptr::from(q, e),
+            eptr: Eptr::from_ebuf(q, e),
             e: e,
         }
     }
@@ -368,22 +365,32 @@ impl<'a> Eref<'a> {
     }
 
     fn inc_gen(&mut self) {
-        self.e.inc_gen(self.q);
-        self.eptr = self.eptr.inc(self.q);
+        let gen = self.e.inc_gen(self.q);
+        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
     }
 
-    fn inc_id(&mut self) {
-        self.e.inc_id(self.q);
+    fn gen_mismatch(&self) -> bool {
+        let mask = !((1 << self.q.id_off) - 1);
+        (self.eptr.0 & mask) != (self.info.load().0 & mask)
     }
 
-    fn inc_both(&mut self) {
-        self.e.inc_both(self.q);
-        self.eptr = self.eptr.inc(self.q);
+    fn id_mismatch(&self) -> bool {
+        let mask = !((1 << self.q.id_off) - 1) & ((1 << self.q.gen_off) - 1);
+        (self.eptr.0 & mask) != (self.info.load().0 & mask)
     }
 
-    fn is_removing(&self) -> bool {
-        self.eptr_gen() != self.gen()
-    }
+//    // linked-list traversals
+//    fn nexts(self) -> impl Iterator<Item=Eref<'a>> + 'a {
+//        iter::successors(self.next.load_eref(self.q), |head| {
+//            head.next.load_eref(head.q)
+//        })
+//    }
+//
+//    fn siblings(self) -> impl Iterator<Item=Eref<'a>> + 'a {
+//        iter::successors(self.sibling.load_eref(self.q), |head| {
+//            head.sibling.load_eref(head.q)
+//        })
+//    }
 }
 
 impl<'a> Deref for Eref<'a> {
@@ -393,17 +400,34 @@ impl<'a> Deref for Eref<'a> {
     }
 }
 
-trait OptionEref {
+trait OptionEref<'a> {
     fn as_ptr(&self) -> *const Ebuf;
+
+//    fn nexts(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>>;
+//    fn siblings(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>>;
 }
 
-impl OptionEref for Option<Eref<'_>> {
+impl<'a> OptionEref<'a> for Option<Eref<'a>> {
     fn as_ptr(&self) -> *const Ebuf {
         match self.as_ref() {
             Some(e) => e.as_ptr(),
             None => ptr::null(),
         }
     }
+
+//    fn nexts(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>> {
+//        fn next<'a>(head: &Eref<'a>) -> Option<Eref<'a>> {
+//            head.next.load_eref(head.q)
+//        }
+//        iter::successors(*self, next)
+//    }
+//
+//    fn siblings(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>> {
+//        fn next<'a>(head: &Eref<'a>) -> Option<Eref<'a>> {
+//            head.sibling.load_eref(head.q)
+//        }
+//        iter::successors(*self, next)
+//    }
 }
 
 /// Slab-internal pointer + the queue it's on, but _mutable_
@@ -438,7 +462,7 @@ impl<'a> Emut<'a> {
     fn from_ebuf(q: &'a Equeue, e: &'a mut Ebuf) -> Emut<'a> {
         Emut {
             q: q,
-            eptr: Eptr::from(q, e),
+            eptr: Eptr::from_ebuf(q, e),
             e: e,
         }
     }
@@ -480,21 +504,23 @@ impl<'a> Emut<'a> {
     }
 
     fn inc_gen(&mut self) {
-        self.e.inc_gen(self.q);
-        self.eptr = self.eptr.inc(self.q);
+        let gen = self.e.inc_gen(self.q);
+        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
     }
 
     fn inc_id(&mut self) {
-        self.e.inc_id(self.q);
+        let gen = self.e.inc_id(self.q);
+        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
     }
 
-    fn inc_both(&mut self) {
-        self.e.inc_both(self.q);
-        self.eptr = self.eptr.inc(self.q);
+    fn gen_mismatch(&self) -> bool {
+        let mask = !((1 << self.q.id_off) - 1);
+        (self.eptr.0 & mask) != (self.info.load().0 & mask)
     }
 
-    fn is_removing(&self) -> bool {
-        self.eptr_gen() != self.gen()
+    fn id_mismatch(&self) -> bool {
+        let mask = !((1 << self.q.id_off) - 1) & ((1 << self.q.gen_off) - 1);
+        (self.eptr.0 & mask) != (self.info.load().0 & mask)
     }
 }
 
@@ -511,11 +537,11 @@ impl<'a> DerefMut for Emut<'a> {
     }
 }
 
-trait OptionEmut {
+trait OptionEmut<'a> {
     fn as_ptr(&self) -> *const Ebuf;
 }
 
-impl OptionEmut for Option<Emut<'_>> {
+impl<'a> OptionEmut<'a> for Option<Emut<'a>> {
     fn as_ptr(&self) -> *const Ebuf {
         match self.as_ref() {
             Some(e) => e.as_ptr(),
@@ -533,6 +559,19 @@ impl Atomic<Eptr> {
         self.store(match e {
             Some(e) => e.as_eptr(),
             None => Eptr::null(),
+        })
+    }
+
+    // linked-list traversal
+    fn load_nexts<'a>(&self, q: &'a Equeue) -> impl Iterator<Item=Eref<'a>> + 'a {
+        iter::successors(self.load_eref(q), |head| {
+            head.next.load_eref(q)
+        })
+    }
+
+    fn load_siblings<'a>(&self, q: &'a Equeue) -> impl Iterator<Item=Eref<'a>> + 'a {
+        iter::successors(self.load_eref(q), |head| {
+            head.sibling.load_eref(q)
         })
     }
 }
@@ -716,7 +755,8 @@ pub struct Equeue {
     slab: &'static [u8],
     slab_front: Atomic<ueptr>,
     slab_back: Atomic<ueptr>,
-    npw2: u8,
+    gen_off: u8,
+    id_off: u8,
 
     // queue management
     queue: Atomic<Eptr>,
@@ -748,24 +788,26 @@ impl Equeue {
         // allocation, which needs to be null the moment a bucket is allocated
         buffer.fill(0);
 
-        // find the maximum mark/gen field size in our eptrs, these are crammed
+        // find the maximum gen/id field size in our eptrs, these are crammed
         // next to the offset, which we make as small as possible by leveraging
         // alignment and limiting references to our memory region
         //
-        // but we also have to make sure we can fit event ids+npw2 fields in
-        // this, it's somewhat arbitrary but we make this at least 8-bits each
-        let npw2 = max(npw2(buffer.len().saturating_sub(Eptr::ALIGN)), 2*8);
+        // we also make the offset 8-bits at minimum, since we cram npw2 here
+        // in ebuf info, and having a known minimum-size simplifies some things
+        let id_off = max(npw2(buffer.len() / Eptr::ALIGN), 8);
+        let gen_off = id_off + (8*size_of::<ueptr>() as u8 - id_off) / 2;
 
-        // make sure there is some minimum generation width, but it's hard to
-        // know what this needs to be...
-        assert!(8*size_of::<ueptr>() - npw2 as usize >= 8);
-        assert!(npw2-8 >= 8);
+        // make sure there is some minimum generation width, though this is
+        // pretty arbitrary...
+        assert!(8*size_of::<ueptr>() as u8 - gen_off >= 4);
+        assert!(gen_off - id_off >= 4);
 
         Ok(Equeue {
             slab: buffer,
             slab_front: Atomic::new(front),
             slab_back: Atomic::new(back),
-            npw2: npw2,
+            gen_off: gen_off,
+            id_off: id_off,
 
             queue: Atomic::new(Eptr::null()),
 
@@ -852,8 +894,6 @@ impl Equeue {
             // try to actually commit our allocation, if slab_front/slab_back
             // changed already, we just try again, someone should be making
             // progress if that happens
-            //
-            // TODO just use a guard
             if self.lock.lock(|| {
                 if self.slab_front.load() == slab_front
                     && self.slab_back.load() == slab_back
@@ -877,9 +917,10 @@ impl Equeue {
         unsafe {
             let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
             e.write(Ebuf {
-                info: Atomic::new(Einfo::new(self, 0, 0, npw2)),
+                info: Atomic::new(Einfo::new(self, 0, npw2)),
                 next: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
+                back: Atomic::new(None),
 
                 cb: None,
                 drop: None,
@@ -892,14 +933,14 @@ impl Equeue {
     }
 
     fn dealloc_ebuf(&self, e: Emut) {
-        debug_assert!(self.contains_ebuf(&e));
         let mut e = e;
+        debug_assert!(self.contains_ebuf(&e));
 
         // we can load buckets here because it can never shrink
         let bucket = &self.buckets()[e.npw2() as usize];
 
-        // give our event a new id/generation count
-        e.inc_both();
+        // give our event a new id
+        e.inc_id();
 
         // add our event to a bucket, while also incrementing our
         // generation count
@@ -914,10 +955,64 @@ impl Equeue {
     }
 
 //    // Queue management
-//    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) -> Eptr {
-//        debug_assert!(e.cb.is_some());
+//    fn enqueue_ebuf(&self, e: Emut, target: utick) -> Id {
+//        let mut e = e;
 //        e.target = target;
-//        let eptr = self.eptr_from(self.ebuf_id(e), Some(e));
+//        debug_assert!(e.cb.is_some());
+//
+//        let id = Id::from_emut(&e);
+//
+//        loop {
+//            // find insertion point
+//            let mut delta = Ordering::Greater;
+//            let mut next = None;
+//            let mut back = &self.queue;
+//            for head in self.queue.load_nexts(self) {
+//                
+//
+//                let ndelta = scmp(head.target, target);
+//                if ndelta.is_ge() {
+//                    delta = ndelta;
+//                    next = Some(head);
+//                    break;
+//                }
+//
+//                back = &head.next;
+//            }
+//
+//            // try to insert
+//            match delta {
+//                Ordering::Greater => {
+//                    // insert a new slice
+//                    e.next.store_eref(next);
+//                    e.sibling.store_eref(None);
+//                    e.back.store(Some(back));
+//
+//                    if self.lock.lock(|| {
+//                        todo!()
+//                    })
+//                }
+//                Ordering::Equal => {
+//                    // push onto existing slice
+//                    let next = next.unwrap();
+//                    e.next.store_eref(next.next.load_eref(self));
+//                    e.sibling.store_eref(Some(next));
+//                    e.back.store(Some(back));
+//
+//                    if self.lock.lock(|| {
+//                        todo!()
+//                    })
+//                }
+//                Ordering::Less => unreachable!(),
+//            }
+//
+//            break;
+//        }
+//
+//        id
+//              
+//
+//        //let eptr = self.eptr_from(self.ebuf_id(e), Some(e));
 //
 //        'retry: loop {
 //            let mut headptr = self.queue.load();
@@ -1473,44 +1568,43 @@ impl Equeue {
 //        Id::try_from(eptr).unwrap()
 //    }
 }
-//
-//
-///// Post trait
-//pub trait Post {
-//    fn post(&mut self);
-//}
-//
-//// TODO wait, should we also accept FnOnce for non-periodic events?
-//impl<F: FnMut() + Send> Post for F {
-//    fn post(&mut self) {
-//        self()
-//    }
-//}
-//
-///// An id we can use to try to cancel an event
-//#[derive(Copy, Clone)]
-//pub struct Id(NonZeroUsize);
-//
-//impl Debug for Id {
-//    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//        // these really need to be in hex to be readable
-//        write!(f, "Id(0x{:x})", self.0)
-//    }
-//}
-//
-//impl TryFrom<Eptr> for Id {
-//    type Error = TryFromIntError;
-//    fn try_from(eptr: Eptr) -> Result<Id, Self::Error> {
-//        NonZeroUsize::try_from(eptr.0).map(Id)
-//    }
-//}
-//
-//impl From<Id> for Eptr {
-//    fn from(id: Id) -> Eptr {
-//        Eptr(usize::from(id.0))
-//    }
-//}
 
+
+/// Post trait
+pub trait Post {
+    fn post(&mut self);
+}
+
+// TODO wait, should we also accept FnOnce for non-periodic events?
+impl<F: FnMut() + Send> Post for F {
+    fn post(&mut self) {
+        self()
+    }
+}
+
+/// An id we can use to try to cancel an event
+#[derive(Copy, Clone)]
+pub struct Id(NonZeroUeptr);
+
+impl Debug for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these really need to be in hex to be readable
+        f.debug_tuple("Id")
+            .field(&format_args!("{:#x}", self.0))
+            .finish()
+    }
+}
+
+impl Id {
+    fn from_emut(e: &Emut) -> Id {
+        let mask = (1 << e.q.gen_off) - 1;
+        Id(unsafe { NonZeroUeptr::new_unchecked(e.eptr.0 & mask) })
+    }
+
+    fn as_eref<'a>(&self, q: &'a Equeue) -> Eref<'a> {
+        Eref::from_eptr(q, Eptr(self.0.get())).unwrap()
+    }
+}
 
 /// Event handle
 pub struct Event<'a, T>(Emut<'a>, PhantomData<T>);
@@ -1712,32 +1806,28 @@ impl Equeue {
             }
         }
 
-//        // find pending usage
-//        let mut pending = 0;
-//        let mut pending_bytes = 0;
-//        let mut slices = 0;
-//        let mut nhead = self.eptr_load(&self.queue);
-//        while let Some(head) = nhead {
-//            slices += 1;
-//            let mut nsibling = Some(head);
-//            while let Some(sibling) = nsibling {
-//                pending += 1;
-//                pending_bytes += size_of::<Ebuf>() + sibling.size();
-//                nsibling = self.eptr_load(&sibling.sibling);
-//            }
-//            
-//            nhead = self.eptr_load(&head.next);
-//        }
+        // find pending usage
+        let mut pending = 0;
+        let mut pending_bytes = 0;
+        let mut slices = 0;
+        for head in self.queue.load_nexts(self) {
+            slices += 1;
+            for sibling in iter::once(head)
+                .chain(head.sibling.load_siblings(self))
+            {
+                pending += 1;
+                pending_bytes += size_of::<Ebuf>() + sibling.size();
+            }
+        }
 
         // find bucket usage
         let buckets = self.buckets();
         let mut free = 0;
         let mut free_bytes = 0;
-        for (npw2, mut head) in buckets.iter().enumerate() {
-            while let Some(e) = head.load_eref(self) {
+        for (npw2, head) in buckets.iter().enumerate() {
+            for _ in head.load_siblings(self) {
                 free += 1;
                 free_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
-                head = &e.sibling;
             }
         }
 
@@ -1746,25 +1836,17 @@ impl Equeue {
         //
         // we can at least clamp some of the numbers to reasonable limits
         // to avoid breaking user's code as much as possible
-//        let pending = min(pending, total);
-//        let pending_bytes = min(pending_bytes, slab_total.saturating_sub(slab_unused+slab_front));
+        let pending = min(pending, total);
+        let pending_bytes = min(pending_bytes, slab_total.saturating_sub(slab_unused+slab_front));
 
         Usage {
-            pending: 0,
-            pending_bytes: 0,
-            alloced: total.saturating_sub(free),
-            alloced_bytes: slab_total.saturating_sub(free_bytes+slab_unused+slab_front),
+            pending: pending,
+            pending_bytes: pending_bytes,
+            alloced: total.saturating_sub(pending+free),
+            alloced_bytes: slab_total.saturating_sub(pending_bytes+free_bytes+slab_unused+slab_front),
             free: free,
             free_bytes: free_bytes+slab_unused,
-            slices: 0,
-
-//            pending: pending,
-//            pending_bytes: pending_bytes,
-//            alloced: total.saturating_sub(pending+free),
-//            alloced_bytes: slab_total.saturating_sub(pending_bytes+free_bytes+slab_unused+slab_front),
-//            free: free,
-//            free_bytes: free_bytes+slab_unused,
-//            slices: slices,
+            slices: slices,
 
             slab_total: slab_total,
             slab_fragmented: slab_total.saturating_sub(slab_unused),
@@ -1774,31 +1856,30 @@ impl Equeue {
     }
 
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
-        for (bucket, mut head) in buckets.iter_mut().zip(self.buckets()) {
+        for (bucket, head) in buckets.iter_mut()
+            .zip(self.buckets())
+        {
             let mut count = 0;
-            while let Some(e) = head.load_eref(self) {
+            for _ in head.load_siblings(self) {
                 count += 1;
-                head = &e.sibling;
             }
             *bucket = count;
         }
     }
 
-//    pub fn slice_usage(&self, slices: &mut [usize]) {
-//        let mut slices_iter = slices.iter_mut();
-//        let mut nhead = self.eptr_load(&self.queue);
-//        while let Some((slice, head)) = slices_iter.next().zip(nhead) {
-//            let mut count = 0;
-//            let mut nsibling = Some(head);
-//            while let Some(sibling) = nsibling {
-//                count += 1;
-//                nsibling = self.eptr_load(&sibling.sibling);
-//            }
-//
-//            *slice = count;
-//            nhead = self.eptr_load(&head.next);
-//        }
-//    }
+    pub fn slice_usage(&self, slices: &mut [usize]) {
+        for (slice, head) in slices.iter_mut()
+            .zip(self.queue.load_siblings(self))
+        {
+            let mut count = 0;
+            for sibling in iter::once(head)
+                .chain(head.sibling.load_siblings(self))
+            {
+                count += 1;
+            }
+            *slice = count;
+        }
+    }
 }
 
 
