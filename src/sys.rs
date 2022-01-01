@@ -1,14 +1,16 @@
 
 // TODO feature gate this?
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicU16;
 use core::sync::atomic::AtomicBool;
+use core::num::NonZeroU32;
 use core::sync::atomic::fence;
 use core::sync::atomic;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::cmp::Ordering;
 use core::fmt::Debug;
-use core::num::NonZeroUsize;
 
 use std::time::Instant;
 use std::time::Duration;
@@ -50,51 +52,133 @@ impl Clock for DefaultClock {
 
 // Atomic primitives
 
+// TODO actually adjust these based on target_width + feature flags
+/// The atomic unit used in equeue
 #[allow(non_camel_case_types)]
-pub(crate) type ueptr = usize;
+pub(crate) type uatom = u64;
 #[allow(non_camel_case_types)]
-pub(crate) type ieptr = isize;
+pub(crate) type iatom = i64;
 
-pub(crate) type NonZeroUeptr = NonZeroUsize;
+/// Integer that fits an in-slab equeue pointer, should be 1/2 of a uatom
+#[allow(non_camel_case_types)]
+pub(crate) type ueptr = u32;
+#[allow(non_camel_case_types)]
+pub(crate) type ieptr = i32;
 
-// we really only need loads, stores must always
-// occur in critical sections
-//pub(crate) type AtomicUeptr = AtomicUsize;
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct AtomicUeptr(AtomicUsize);
+pub(crate) type NonZeroUeptr = NonZeroU32;
 
-impl AtomicUeptr {
+/// Integer that fits a pointer generation count, should be 1/4 of a uatom
+#[allow(non_camel_case_types)]
+pub(crate) type ugen = u16;
+#[allow(non_camel_case_types)]
+pub(crate) type igen = i32;
+
+
+// we really only need loads and stores, and modifications to any
+// shared variables always occur in critical sections (via Lock)
+pub(crate) trait AtomicU {
+    type U: Copy;
+    fn new(v: Self::U) -> Self;
+    fn load(&self) -> Self::U;
+    fn store(&self, v: Self::U);
+}
+
+pub(crate) use core::sync::atomic::AtomicUsize;
+
+impl AtomicU for AtomicUsize {
+    type U = usize;
+
     #[inline]
-    pub(crate) fn new(v: ueptr) -> Self {
-        Self(AtomicUsize::new(v))
+    fn new(v: usize) -> Self {
+        AtomicUsize::new(v)
     }
 
     /// Atomic load
     #[inline]
-    pub(crate) fn load(&self) -> ueptr {
+    fn load(&self) -> usize {
+        self.load(atomic::Ordering::SeqCst)
+    }
+
+    /// Atomic store, must always be inside a critical section
+    #[inline]
+    fn store(&self, v: usize) {
+        self.store(v, atomic::Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct AtomicUatom(AtomicU64);
+
+impl AtomicU for AtomicUatom {
+    type U = uatom;
+
+    #[inline]
+    fn new(v: uatom) -> Self {
+        Self(AtomicU64::new(v))
+    }
+
+    /// Atomic load
+    #[inline]
+    fn load(&self) -> uatom {
         self.0.load(atomic::Ordering::SeqCst)
     }
 
     /// Atomic store, must always be inside a critical section
     #[inline]
-    pub(crate) fn store(&self, v: ueptr) {
+    fn store(&self, v: uatom) {
         self.0.store(v, atomic::Ordering::SeqCst)
     }
+}
 
-//    /// Non-atomic load iff we have exclusive access, we can
-//    /// leverage Rust's mut for this
-//    #[inline]
-//    pub(crate) fn load_ex(&mut self) -> ueptr {
-//        self.0.load(atomic::Ordering::Relaxed)
-//    }
-//
-//    /// Non-atomic store iff we have exclusive access, we can
-//    /// leverage Rust's mut for this
-//    #[inline]
-//    pub(crate) fn store_ex(&mut self, v: ueptr) {
-//        self.0.store(v, atomic::Ordering::Relaxed)
-//    }
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct AtomicUeptr(AtomicU32);
+
+impl AtomicU for AtomicUeptr {
+    type U = ueptr;
+
+    #[inline]
+    fn new(v: ueptr) -> Self {
+        Self(AtomicU32::new(v))
+    }
+
+    /// Atomic load
+    #[inline]
+    fn load(&self) -> ueptr {
+        self.0.load(atomic::Ordering::SeqCst)
+    }
+
+    /// Atomic store, must always be inside a critical section
+    #[inline]
+    fn store(&self, v: ueptr) {
+        self.0.store(v, atomic::Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct AtomicUgen(AtomicU16);
+
+impl AtomicU for AtomicUgen {
+    type U = ugen;
+
+    #[inline]
+    fn new(v: ugen) -> Self {
+        Self(AtomicU16::new(v))
+    }
+
+    /// Atomic load
+    #[inline]
+    fn load(&self) -> ugen {
+        self.0.load(atomic::Ordering::SeqCst)
+    }
+
+    /// Atomic store, must always be inside a critical section
+    #[inline]
+    fn store(&self, v: ugen) {
+        self.0.store(v, atomic::Ordering::SeqCst)
+    }
 }
 
 //#[derive(Debug)]

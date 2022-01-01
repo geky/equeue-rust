@@ -141,6 +141,7 @@ fn test_race_post() {
                     match q.call(cb.clone()) {
                         Ok(_) => break,
                         Err(Error::NoMem) => { thread::yield_now(); continue },
+                        Err(err) => panic!("{:?}", err),
                     }
                 }
             }
@@ -196,6 +197,7 @@ fn test_race_post_order() {
                     match q.call(cb.clone()) {
                         Ok(_) => break,
                         Err(Error::NoMem) => { thread::yield_now(); continue },
+                        Err(err) => panic!("{:?}", err),
                     }
                 }
             }
@@ -255,6 +257,7 @@ fn test_race_delay() {
                         match q.call_in(i*100, cb.clone()) {
                             Ok(_) => break,
                             Err(Error::NoMem) => { thread::yield_now(); continue },
+                            Err(err) => panic!("{:?}", err),
                         }
                     }
                 }

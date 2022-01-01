@@ -52,11 +52,12 @@ impl fmt::Display for Error {
     }
 }
 
-/// Small wrapper to generalize atomics to any ueptr sized type
-#[repr(transparent)]
-struct Atomic<T>(AtomicUeptr, PhantomData<T>);
 
-impl<T: Copy + Debug> Debug for Atomic<T> {
+/// Small wrapper to generalize atomics to any <= uatom sized type
+#[repr(transparent)]
+struct Atomic<T, S: AtomicU>(S, PhantomData<T>);
+
+impl<T: Copy + Debug, S: AtomicU> Debug for Atomic<T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Atomic")
             .field(&self.load())
@@ -64,11 +65,11 @@ impl<T: Copy + Debug> Debug for Atomic<T> {
     }
 }
 
-impl<T> Atomic<T> {
+impl<T, S: AtomicU> Atomic<T, S> {
     fn new(t: T) -> Self {
-        debug_assert_eq!(size_of::<T>(), size_of::<ueptr>());
+        debug_assert!(size_of::<T>() <= size_of::<S::U>());
         Self(
-            AtomicUeptr::new(unsafe { *(&t as *const _ as *const usize) }),
+            S::new(unsafe { *(&t as *const _ as *const S::U) }),
             PhantomData
         )
     }
@@ -78,17 +79,10 @@ impl<T> Atomic<T> {
     }
 
     fn store(&self, v: T) {
-        self.0.store(unsafe { *(&v as *const _ as *const usize) })
+        self.0.store(unsafe { *(&v as *const _ as *const S::U) })
     }
-
-//    fn load_ex(&mut self) -> T where T: Copy {
-//        unsafe { *(&self.0.load_ex() as *const _ as *const T) }
-//    }
-//
-//    fn store_ex(&mut self, v: T) {
-//        self.0.store_ex(unsafe { *(&v as *const _ as *const usize) })
-//    }
 }
+
 
 /// Slab-internal pointer, with internalized generation count
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -105,6 +99,155 @@ impl Debug for Eptr {
 }
 
 impl Eptr {
+    const fn null() -> Eptr {
+        Eptr(0)
+    }
+
+    fn from_ebuf(q: &Equeue, e: &Ebuf) -> Eptr {
+        Eptr(unsafe {
+            ((e as *const Ebuf as *const u8)
+                .offset_from(q.slab.as_ptr())
+                as usize
+                / Ebuf::ALIGN)
+                as ueptr
+        })
+    }
+
+    fn as_ptr(&self, q: &Equeue) -> *const Ebuf {
+        match self.0 {
+            0 => ptr::null(),
+            _ => (
+                &q.slab[self.0 as usize * Ebuf::ALIGN]
+                    as *const _ as *const Ebuf
+            )
+        }
+    }
+
+    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+        unsafe { self.as_ptr(q).as_ref() }
+    }
+}
+
+/// A marked eptr, used to double-check non-locking parts
+/// of the data structures
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct MarkedEptr {
+    mark: ugen,
+    gen: ugen,
+    eptr: Eptr,
+}
+
+impl Debug for MarkedEptr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these really need to be in hex to be readable
+        f.debug_tuple("MarkedEptr")
+            .field(&self.mark)
+            .field(&self.gen)
+            .field(&format_args!("{:#x}", self.eptr.0))
+            .finish()
+    }
+}
+
+impl MarkedEptr {
+    const fn null() -> MarkedEptr {
+        MarkedEptr {
+            mark: 0,
+            gen: 0,
+            eptr: Eptr::null(),
+        }
+    }
+
+    // avoids loading the generation count from the ebuf
+    fn from_parts(q: &Equeue, mark: ugen, gen: ugen, e: &Ebuf) -> MarkedEptr {
+        MarkedEptr {
+            mark: mark,
+            gen: gen,
+            eptr: Eptr::from_ebuf(q, e),
+        }
+    }
+
+    // loads gen from the ebuf, the resulting MarkedEptr will always be in sync
+    //
+    // we take a mutable ebuf to avoid races, otherwise we probably don't have
+    // exclusive access, so the code would probably be broken anyways
+    fn from_ebuf(q: &Equeue, mark: ugen, e: &mut Ebuf) -> MarkedEptr {
+        MarkedEptr {
+            mark: mark,
+            gen: e.next.load().mark,
+            eptr: Eptr::from_ebuf(q, e),
+        }
+    }
+
+    fn as_ptr(&self, q: &Equeue) -> *const Ebuf {
+        self.eptr.as_ptr(q)
+    }
+
+    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+        self.eptr.as_ref(q)
+    }
+
+    // test if mark matches expected gen from src MarkedEptr
+    fn check_mark(self, src: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        if src.gen == self.mark {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
+    fn cp_mark(self, src: MarkedEptr) -> MarkedEptr {
+        MarkedEptr {
+            mark: src.mark,
+            gen: self.gen,
+            eptr: self.eptr,
+        }
+    }
+
+    fn inc_mark(self) -> MarkedEptr {
+        MarkedEptr {
+            mark: self.mark.wrapping_add(1),
+            gen: self.gen,
+            eptr: self.eptr,
+        }
+    }
+}
+
+// interactions with atomics
+impl<S: AtomicU> Atomic<MarkedEptr, S> {
+    fn load_marked(&self, src: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        self.load().check_mark(src)
+    }
+
+    fn store_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let eptr = new.cp_mark(src);
+        self.store(eptr);
+        eptr
+    }
+
+    fn store_inc_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let eptr = new.cp_mark(src).inc_mark();
+        self.store(eptr);
+        eptr
+    }
+}
+
+/// Internal event header
+#[derive(Debug)]
+struct Ebuf {
+    next: Atomic<MarkedEptr, AtomicUatom>,
+    next_back: Atomic<Eptr, AtomicUeptr>,
+    sibling: Atomic<Eptr, AtomicUeptr>,
+    sibling_back: Atomic<Eptr, AtomicUeptr>,
+    id: Atomic<ugen, AtomicUgen>,
+    npw2: u8,
+
+    cb: Option<fn(*mut u8)>,
+    drop: Option<fn(*mut u8)>,
+    target: utick,
+    period: itick,
+}
+
+impl Ebuf {
     // maximum alignment of internal allocations, this must be larger than
     // Eptr's alignment, and pointer alignment is a common alignment
     //
@@ -114,146 +257,25 @@ impl Eptr {
     const ALIGN: usize = {
         let mut align = align_of::<Ebuf>();
         if align_of::<Eptr>() > align { align = align_of::<Eptr>() }
-        if align_of::<*const usize>() > align { align = align_of::<*const usize>() }
+        if align_of::<*const ()>() > align { align = align_of::<*const ()>() }
         align
     };
 
-    const fn null() -> Eptr {
-        Eptr(0)
+    fn as_eptr(&self, q: &Equeue) -> Eptr {
+        Eptr::from_ebuf(q, self)
     }
 
-    // this is unsafe because a generation mismatch risks access issues
-    unsafe fn from_parts(q: &Equeue, gen: ueptr, e: &Ebuf) -> Eptr {
-        let eptr = (e as *const Ebuf as *const u8)
-            .offset_from(q.slab.as_ptr())
-            as usize
-            / Eptr::ALIGN;
-
-        Eptr((gen << q.id_off) | eptr)
-    }
-
-    fn from_ebuf(q: &Equeue, e: &Ebuf) -> Eptr {
-        unsafe { Eptr::from_parts(q, e.gen(q), e) }
-    }
-
-    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
-        let mask = (1 << q.id_off) - 1;
-        match self.0 & mask {
-            0 => None,
-            _ => Some(
-                unsafe {
-                    &*(&q.slab[(self.0 & mask) * Eptr::ALIGN]
-                        as *const u8 as *const Ebuf)
-                }
-            )
-        }
-    }
-
-    fn gen(&self, q: &Equeue) -> ueptr {
-        self.0 >> q.id_off
-    }
-
-    fn id(&self, q: &Equeue) -> ueptr {
-        let mask = (1 << q.gen_off) - 1;
-        (self.0 & mask) >> q.id_off
-    }
-}
-
-/// Some event bookkeeping info crammed into a ueptr
-#[derive(Copy, Clone)]
-#[repr(transparent)]
-struct Einfo(ueptr);
-
-impl Debug for Einfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // these really need to be in hex to be readable
-        f.debug_tuple("Einfo")
-            .field(&format_args!("{:#x}", self.0))
-            .finish()
-    }
-}
-
-impl Einfo {
-    fn new(q: &Equeue, gen: ueptr, npw2: u8) -> Einfo {
-        Einfo((gen << q.id_off) | (npw2 as ueptr))
-    }
-
-    fn npw2(&self) -> u8 {
-        (self.0 & 0xff) as u8
+    fn as_marked_eptr(&mut self, q: &Equeue) -> MarkedEptr {
+        MarkedEptr::from_ebuf(q, 0, self)
     }
 
     fn size(&self) -> usize {
-        // note this does not include metadata overhead
-        (Eptr::ALIGN << self.npw2()) as usize
+        Ebuf::ALIGN << self.npw2
     }
 
-    fn gen(&self, q: &Equeue) -> ueptr {
-        self.0 >> q.id_off
-    }
-
-    fn id(&self, q: &Equeue) -> ueptr {
-        let mask = (1 << q.gen_off) - 1;
-        (self.0 & mask) >> q.id_off
-    }
-
-    fn inc_gen(&self, q: &Equeue) -> Einfo {
-        Einfo(self.0.wrapping_add(1 << q.gen_off))
-    }
-
-    fn inc_id(&self, q: &Equeue) -> Einfo {
-        // note we don't care if overflow increments gen here,
-        // any increment to id should have also incremented gen
-        Einfo(self.0.wrapping_add(1 << q.id_off))
-    }
-}
-
-/// Internal event header
-#[derive(Debug)]
-struct Ebuf {
-    // info contains mark + npw2 + bits, and since mark <= width/2,
-    // we know this at least gives us 2 bytes, even when usize == u32
-    info: Atomic<Einfo>,
-    next: Atomic<Eptr>,
-    sibling: Atomic<Eptr>,
-    // TODO make this not static
-    back: Atomic<Option<&'static Atomic<Eptr>>>,
-
-    cb: Option<fn(*mut u8)>,
-    drop: Option<fn(*mut u8)>,
-    target: utick,
-    period: itick,
-}
-
-impl Ebuf {
-    // info access
-    fn npw2(&self) -> u8 {
-        // the npw2 field never actually changes
-        unsafe { &*(&self.info as *const _ as *const Einfo) }.npw2()
-    }
-
-    fn size(&self) -> usize {
-        // the npw2 field never actually changes
-        unsafe { &*(&self.info as *const _ as *const Einfo) }.size()
-    }
-
-    fn gen(&self, q: &Equeue) -> ueptr {
-        self.info.load().gen(q)
-    }
-
-    fn id(&self, q: &Equeue) -> ueptr {
-        self.info.load().id(q)
-    }
-
-    fn inc_gen(&self, q: &Equeue) -> ueptr {
-        let info = self.info.load().inc_gen(q);
-        self.info.store(info);
-        info.gen(q)
-    }
-
-    fn inc_id(&self, q: &Equeue) -> ueptr {
-        let info = self.info.load().inc_id(q);
-        self.info.store(info);
-        info.gen(q)
+    fn inc_id(&self) {
+        let id = self.id.load();
+        self.id.store(id.wrapping_add(1));
     }
 
     // access to the trailing buffer
@@ -280,486 +302,40 @@ impl Ebuf {
             None
         }
     }
-}
-
-/// Slab-internal pointer + the queue it's on
-///
-/// Since we need the queue to decode the generation count, it's convenient
-/// to have a type that combines these. This is pretty large for just a pointer,
-/// but should only exist on stacks (and get optimized away?)
-#[derive(Copy, Clone)]
-struct Eref<'a>{
-    q: &'a Equeue,
-    eptr: Eptr,
-    e: &'a Ebuf,
-}
-
-impl Debug for Eref<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Eref")
-            .field(&format_args!("gen {}", self.eptr_gen()))
-            .field(self.e)
-            .finish()
-    }
-}
-
-impl<'a> Eref<'a> {
-    unsafe fn from_parts(
-        q: &'a Equeue,
-        gen: ueptr,
-        e: &'a Ebuf
-    ) -> Eref<'a> {
-        Eref {
-            q: q,
-            eptr: Eptr::from_parts(q, gen, e),
-            e: e
-        }
-    }
-
-    fn from_ebuf(q: &'a Equeue, e: &'a Ebuf) -> Eref<'a> {
-        Eref {
-            q: q,
-            eptr: Eptr::from_ebuf(q, e),
-            e: e,
-        }
-    }
-
-    fn from_eptr(q: &'a Equeue, eptr: Eptr) -> Option<Eref<'a>> {
-        eptr.as_ref(q)
-            .map(|e| Eref {
-                q: q,
-                eptr: eptr,
-                e: e,
-            })
-    }
 
     // we can "claim" an Ebuf once we remove it from shared structures,
     // the claim is unsafe, but afterwards we can leverage Rust's type
     // system to know whether or not we have exclusive access to the Ebuf
-    unsafe fn claim(&self) -> Emut<'a> {
-        Emut {
-            q: self.q,
-            eptr: self.eptr,
-            e: &mut *(self.e as *const Ebuf as *mut Ebuf)
-        }
-    }
-
-    fn as_ptr(&self) -> *const Ebuf {
-        self.e as *const Ebuf
-    }
-
-    fn as_eptr(&self) -> Eptr {
-        self.eptr
-    }
-
-    fn eptr_gen(&self) -> ueptr {
-        self.eptr.gen(self.q)
-    }
-
-    fn gen(&self) -> ueptr {
-        self.e.gen(self.q)
-    }
-
-    fn id(&self) -> ueptr {
-        self.e.id(self.q)
-    }
-
-    fn inc_gen(&mut self) {
-        let gen = self.e.inc_gen(self.q);
-        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
-    }
-
-    fn gen_mismatch(&self) -> bool {
-        let mask = !((1 << self.q.id_off) - 1);
-        (self.eptr.0 & mask) != (self.info.load().0 & mask)
-    }
-
-    fn id_mismatch(&self) -> bool {
-        let mask = !((1 << self.q.id_off) - 1) & ((1 << self.q.gen_off) - 1);
-        (self.eptr.0 & mask) != (self.info.load().0 & mask)
-    }
-
-//    // linked-list traversals
-//    fn nexts(self) -> impl Iterator<Item=Eref<'a>> + 'a {
-//        iter::successors(self.next.load_eref(self.q), |head| {
-//            head.next.load_eref(head.q)
-//        })
-//    }
-//
-//    fn siblings(self) -> impl Iterator<Item=Eref<'a>> + 'a {
-//        iter::successors(self.sibling.load_eref(self.q), |head| {
-//            head.sibling.load_eref(head.q)
-//        })
-//    }
-}
-
-impl<'a> Deref for Eref<'a> {
-    type Target = &'a Ebuf;
-    fn deref<'b>(&'b self) -> &'b &'a Ebuf {
-        &self.e
+    unsafe fn claim<'a>(&'a self) -> &'a mut Ebuf {
+        &mut *(self as *const Ebuf as *mut Ebuf)
     }
 }
 
-trait OptionEref<'a> {
-    fn as_ptr(&self) -> *const Ebuf;
-
-//    fn nexts(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>>;
-//    fn siblings(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>>;
+// some convenience extensions to Option<&Ebuf>
+trait OptionEbuf<'a> {
+    fn as_eptr(&self, q: &Equeue) -> Eptr;
 }
 
-impl<'a> OptionEref<'a> for Option<Eref<'a>> {
-    fn as_ptr(&self) -> *const Ebuf {
-        match self.as_ref() {
-            Some(e) => e.as_ptr(),
-            None => ptr::null(),
-        }
-    }
-
-//    fn nexts(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>> {
-//        fn next<'a>(head: &Eref<'a>) -> Option<Eref<'a>> {
-//            head.next.load_eref(head.q)
-//        }
-//        iter::successors(*self, next)
-//    }
-//
-//    fn siblings(&self) -> iter::Successors<Eref<'a>, fn(&Eref<'a>) -> Option<Eref<'a>>> {
-//        fn next<'a>(head: &Eref<'a>) -> Option<Eref<'a>> {
-//            head.sibling.load_eref(head.q)
-//        }
-//        iter::successors(*self, next)
-//    }
-}
-
-/// Slab-internal pointer + the queue it's on, but _mutable_
-struct Emut<'a>{
-    q: &'a Equeue,
-    eptr: Eptr,
-    e: &'a mut Ebuf,
-}
-
-impl Debug for Emut<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Emut")
-            .field(&format_args!("gen {}", self.eptr_gen()))
-            .field(self.e)
-            .finish()
-    }
-}
-
-impl<'a> Emut<'a> {
-    unsafe fn from_parts(
-        q: &'a Equeue,
-        gen: ueptr,
-        e: &'a mut Ebuf
-    ) -> Emut<'a> {
-        Emut {
-            q: q,
-            eptr: Eptr::from_parts(q, gen, e),
-            e: e
-        }
-    }
-
-    fn from_ebuf(q: &'a Equeue, e: &'a mut Ebuf) -> Emut<'a> {
-        Emut {
-            q: q,
-            eptr: Eptr::from_ebuf(q, e),
-            e: e,
-        }
-    }
-
-    unsafe fn from_data_mut_ptr<T>(q: &'a Equeue, ptr: *mut T) -> Option<Emut<'a>> {
-        if let Some(e) = Ebuf::from_data_mut_ptr(ptr) {
-            Some(Emut::from_ebuf(q, e))
-        } else {
-            None
-        }
-    }
-
-    fn as_eref(&'a self) -> Eref<'a> {
-        Eref {
-            q: self.q,
-            eptr: self.eptr,
-            e: self.e
-        }
-    }
-
-    fn as_ptr(&self) -> *const Ebuf {
-        self.e as *const Ebuf
-    }
-
-    fn eptr(&self) -> Eptr {
-        self.eptr
-    }
-
-    fn eptr_gen(&self) -> ueptr {
-        self.eptr.gen(self.q)
-    }
-
-    fn gen(&self) -> ueptr {
-        self.e.gen(self.q)
-    }
-
-    fn id(&self) -> ueptr {
-        self.e.id(self.q)
-    }
-
-    fn inc_gen(&mut self) {
-        let gen = self.e.inc_gen(self.q);
-        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
-    }
-
-    fn inc_id(&mut self) {
-        let gen = self.e.inc_id(self.q);
-        self.eptr = unsafe { Eptr::from_parts(self.q, gen, &self.e) };
-    }
-
-    fn gen_mismatch(&self) -> bool {
-        let mask = !((1 << self.q.id_off) - 1);
-        (self.eptr.0 & mask) != (self.info.load().0 & mask)
-    }
-
-    fn id_mismatch(&self) -> bool {
-        let mask = !((1 << self.q.id_off) - 1) & ((1 << self.q.gen_off) - 1);
-        (self.eptr.0 & mask) != (self.info.load().0 & mask)
-    }
-}
-
-impl<'a> Deref for Emut<'a> {
-    type Target = &'a mut Ebuf;
-    fn deref<'b>(&'b self) -> &'b &'a mut Ebuf {
-        &self.e
-    }
-}
-
-impl<'a> DerefMut for Emut<'a> {
-    fn deref_mut<'b>(&'b mut self) -> &'b mut &'a mut Ebuf {
-        &mut self.e
-    }
-}
-
-trait OptionEmut<'a> {
-    fn as_ptr(&self) -> *const Ebuf;
-}
-
-impl<'a> OptionEmut<'a> for Option<Emut<'a>> {
-    fn as_ptr(&self) -> *const Ebuf {
-        match self.as_ref() {
-            Some(e) => e.as_ptr(),
-            None => ptr::null(),
-        }
-    }
-}
-
-impl Atomic<Eptr> {
-    fn load_eref<'a>(&self, q: &'a Equeue) -> Option<Eref<'a>> {
-        Eref::from_eptr(q, self.load())
-    }
-
-    fn store_eref<'a>(&self, e: Option<Eref<'a>>) {
-        self.store(match e {
-            Some(e) => e.as_eptr(),
+impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
+    fn as_eptr(&self, q: &Equeue) -> Eptr {
+        match self {
+            Some(e) => e.as_eptr(q),
             None => Eptr::null(),
-        })
-    }
-
-    // linked-list traversal
-    fn load_nexts<'a>(&self, q: &'a Equeue) -> impl Iterator<Item=Eref<'a>> + 'a {
-        iter::successors(self.load_eref(q), |head| {
-            head.next.load_eref(q)
-        })
-    }
-
-    fn load_siblings<'a>(&self, q: &'a Equeue) -> impl Iterator<Item=Eref<'a>> + 'a {
-        iter::successors(self.load_eref(q), |head| {
-            head.sibling.load_eref(q)
-        })
+        }
     }
 }
 
-//impl Equeue {
-//    // Eptr interactions
-//    fn eptr_from<'a>(
-//        &'a self,
-//        gen: usize,
-//        e: Option<&'a Ebuf>
-//    ) -> Eptr {
-//        let off = match e {
-//            Some(e) => unsafe {
-//                (e as *const Ebuf as *const u8)
-//                    .offset_from(self.slab.as_ptr())
-//                    as usize
-//                    / Eptr::ALIGN
-//            },
-//            None => 0,
-//        };
-//
-//        // make sure our gen/off aren't overflowing
-//        debug_assert!(gen <= (1 << self.gnpw2));
-//        debug_assert!(off <= (1 << self.enpw2));
-//
-//        Eptr((gen << self.enpw2) | off)
-//    }
-//
-//    fn gen_inc(&self, gen: usize) -> usize {
-//        // we need to mask properly
-//        let mask = (1 << self.gnpw2) - 1;
-//        gen.wrapping_add(1) & mask
-//    }
-//
-//    fn eptr_mark(&self, eptr: Eptr) -> usize {
-//        eptr.0 >> self.gnpw2+self.enpw2
-//    }
-//
-//    fn eptr_set_mark(&self, eptr: Eptr, mark: usize) -> Eptr {
-//        debug_assert!(mark <= (1 << self.gnpw2));
-//        let mask = (1 << self.gnpw2+self.enpw2) - 1;
-//        Eptr((mark << self.gnpw2+self.enpw2) | (eptr.0 & mask))
-//    }
-//
-//    fn eptr_inc_mark(&self, eptr: Eptr) -> Eptr {
-//        Eptr(eptr.0.wrapping_add(1 << self.gnpw2+self.enpw2))
-//    }
-//
-//    fn eptr_cp_mark(&self, eptr: Eptr, marked: Eptr) -> Eptr {
-//        let mask = (1 << self.gnpw2+self.enpw2) - 1;
-//        Eptr((marked.0 & !mask) | (eptr.0 & mask))
-//    }
-//
-//    fn eptr_gen(&self, eptr: Eptr) -> usize {
-//        let gmask = (1 << self.gnpw2) - 1;
-//        (eptr.0 >> self.enpw2) & gmask
-//    }
-//
-//    fn eptr_set_gen(&self, eptr: Eptr, gen: usize) -> Eptr {
-//        debug_assert!(gen <= (1 << self.gnpw2));
-//        let mask = !(((1 << self.gnpw2) - 1) << self.enpw2);
-//        Eptr((gen << self.enpw2) | (eptr.0 & mask))
-//    }
-//
-//    fn eptr_inc_gen(&self, eptr: Eptr) -> Eptr {
-//        Eptr(
-//            eptr.0
-//                .rotate_left(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
-//                .wrapping_add(1 << 8*size_of::<Eptr>() as u32 - self.gnpw2 as u32)
-//                .rotate_right(8*size_of::<Eptr>() as u32 - (self.gnpw2+self.enpw2) as u32)
-//        )
-//    }
-//
-//    fn eptr_as_ptr(&self, eptr: Eptr) -> *const Ebuf {
-//        let mask = (1 << self.enpw2) - 1;
-//        if eptr.0 & mask != 0 {
-//            &self.slab[(eptr.0 & mask) * Eptr::ALIGN]
-//                as *const u8 as *const Ebuf
-//        } else {
-//            ptr::null()
-//        }
-//    }
-//
-//    unsafe fn eptr_as_mut_ptr(&self, eptr: Eptr) -> *mut Ebuf {
-//        self.eptr_as_ptr(eptr) as *mut Ebuf
-//    }
-//
-//    fn eptr_as_ref<'a>(&'a self, eptr: Eptr) -> Option<&'a Ebuf> {
-//        unsafe { self.eptr_as_ptr(eptr).as_ref() }
-//    }
-//
-//    unsafe fn eptr_as_mut<'a>(&'a self, eptr: Eptr) -> Option<&'a mut Ebuf> {
-//        self.eptr_as_mut_ptr(eptr).as_mut()
-//    }
-//
-//    // Cas<Eptr> interactions
-//    fn eptr_load<'a>(&'a self, eptr: &Cas<Eptr>) -> Option<&'a Ebuf> {
-//        self.eptr_as_ref(eptr.load())
-//    }
-//
-//    fn eptr_load_ex<'a>(
-//        &'a self,
-//        eptr: &mut Cas<Eptr>
-//    ) -> Option<&'a mut Ebuf> {
-//        unsafe { self.eptr_as_mut(eptr.load_ex()) }
-//    }
-//}
-//
-//impl Ebuf {
-//    // info access
-//    fn npw2(&self) -> u8 {
-//        (self.info & 0xff) as u8
-//    }
-//
-//    fn size(&self) -> usize {
-//        // note this does not include metadata overhead
-//        Eptr::ALIGN << self.npw2()
-//    }
-//
-//    // access to the trailing buffer
-//    unsafe fn as_ptr<T>(&self) -> *const T {
-//        (self as *const Ebuf).add(1) as *const T
-//    }
-//
-//    unsafe fn as_mut_ptr<T>(&mut self) -> *mut T {
-//        (self as *mut Ebuf).add(1) as *mut T
-//    }
-//
-//    fn as_ref<'a, T>(&'a self) -> &'a T {
-//        unsafe { &*self.as_ptr() }
-//    }
-//
-//    fn as_mut<'a, T>(&'a mut self) -> &'a mut T {
-//        unsafe { &mut *self.as_mut_ptr() }
-//    }
-//
-//    unsafe fn from_mut_ptr<'a, T>(ptr: *mut T) -> Option<&'a mut Ebuf> {
-//        if !ptr.is_null() {
-//            Some(&mut *(ptr as *mut Ebuf).sub(1))
-//        } else {
-//            None
-//        }
-//    }
-//}
-//
-//impl Equeue {
-//    // we can "claim" an Ebuf once we remove it from shared structures,
-//    // the claim is unsafe, but afterwards we can leverage Rust's type
-//    // system to know whether or not we have exclusive access to the Ebuf
-//    unsafe fn ebuf_claim<'a>(&'a self, e: &'a Ebuf) -> &'a mut Ebuf {
-//        &mut *(e as *const Ebuf as *mut Ebuf)
-//    }
-//
-//    fn ebuf_id(&self, e: &Ebuf) -> usize {
-//        self.eptr_mark(Eptr(e.info))
-//    }
-//
-//    fn ebuf_inc_id(&self, e: &mut Ebuf) {
-//        e.info = self.eptr_inc_mark(Eptr(e.info)).0
-//    }
-//
-//    // access the generation count embedded in our event's mark
-//    fn ebuf_gen_load<'a>(&'a self, e: &'a Ebuf) -> usize {
-//        self.eptr_mark(e.next.load())
-//    }
-//
-//    fn ebuf_gen_load_ex<'a>(&'a self, e: &'a mut Ebuf) -> usize {
-//        self.eptr_mark(e.next.load_ex())
-//    }
-//
-//    fn ebuf_gen_inc_ex<'a>(&'a self, e: &'a mut Ebuf) {
-//        let next = self.eptr_inc_mark(e.next.load_ex());
-//        e.next.store_ex(next);
-//    }
-//}
 
 /// Event queue struct
 #[derive(Debug)]
 pub struct Equeue {
     // memory management
     slab: &'static [u8],
-    slab_front: Atomic<ueptr>,
-    slab_back: Atomic<ueptr>,
-    gen_off: u8,
-    id_off: u8,
+    slab_front: Atomic<usize, AtomicUsize>,
+    slab_back: Atomic<usize, AtomicUsize>,
 
     // queue management
-    queue: Atomic<Eptr>,
+    queue: Atomic<MarkedEptr, AtomicUatom>,
 
     // other things
     clock: DefaultClock,
@@ -774,42 +350,24 @@ unsafe impl Sync for Equeue {}
 impl Equeue {
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
         // align buffer
-        let align = alignup(buffer.as_ptr() as usize, Eptr::ALIGN)
+        let align = alignup(buffer.as_ptr() as usize, Ebuf::ALIGN)
             - buffer.as_ptr() as usize;
         let buffer = match buffer.get_mut(align..) {
             // already out of memory?
             Some(buffer) => buffer,
             None => return Err(Error::NoMem),
         };
-        let front = 0;
-        let back = ueptr::try_from(buffer.len()).map_err(|_| Error::Overflow)?;
 
         // go ahead and zero our buffer, this makes it easier to manage bucket
         // allocation, which needs to be null the moment a bucket is allocated
         buffer.fill(0);
 
-        // find the maximum gen/id field size in our eptrs, these are crammed
-        // next to the offset, which we make as small as possible by leveraging
-        // alignment and limiting references to our memory region
-        //
-        // we also make the offset 8-bits at minimum, since we cram npw2 here
-        // in ebuf info, and having a known minimum-size simplifies some things
-        let id_off = max(npw2(buffer.len() / Eptr::ALIGN), 8);
-        let gen_off = id_off + (8*size_of::<ueptr>() as u8 - id_off) / 2;
-
-        // make sure there is some minimum generation width, though this is
-        // pretty arbitrary...
-        assert!(8*size_of::<ueptr>() as u8 - gen_off >= 4);
-        assert!(gen_off - id_off >= 4);
-
         Ok(Equeue {
             slab: buffer,
-            slab_front: Atomic::new(front),
-            slab_back: Atomic::new(back),
-            gen_off: gen_off,
-            id_off: id_off,
+            slab_front: Atomic::new(0),
+            slab_back: Atomic::new(buffer.len()),
 
-            queue: Atomic::new(Eptr::null()),
+            queue: Atomic::new(MarkedEptr::null()),
 
             clock: DefaultClock::new(),
             lock: DefaultLock::new(),
@@ -826,35 +384,31 @@ impl Equeue {
             .contains(&(e.deref() as *const _ as *const u8))
     }
 
-    fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr>] {
-        let slab_front = self.slab_front.load();
+    fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr, AtomicUeptr>] {
+        let slab_front = self.slab_front.load() as usize;
         unsafe {
             slice::from_raw_parts(
-                self.slab.as_ptr() as *const Atomic<Eptr>,
+                self.slab.as_ptr() as *const Atomic<Eptr, AtomicUeptr>,
                 slab_front / size_of::<Eptr>()
             )
         }
     }
 
     // Memory management
-    fn alloc_ebuf<'a>(&'a self, layout: Layout) -> Result<Emut<'a>, Error> {
-        assert!(layout.align() <= Eptr::ALIGN);
+    fn alloc_ebuf<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
+        assert!(layout.align() <= Ebuf::ALIGN);
 
         // find best bucket
-        let npw2 = npw2((layout.size()+Eptr::ALIGN-1) / Eptr::ALIGN);
+        let npw2 = npw2((layout.size()+Ebuf::ALIGN-1) / Ebuf::ALIGN);
 
         // do we have an allocation in our buckets? we don't look
         // at larger buckets because those are likely to be reused, we don't
         // want to starve larger events with smaller events
-        if let Some(bucket) = self.buckets().get(npw2 as usize)
-            // don't bother locking if bucket is empty
-            .filter(|bucket| bucket.load_eref(self).is_some())
-        {
+        if let Some(bucket) = self.buckets().get(npw2 as usize) {
             // try to take an event from a bucket
             let e = self.lock.lock(|| {
-                // this could still fail
-                if let Some(e) = bucket.load_eref(self) {
-                    bucket.store_eref(e.sibling.load_eref(self));
+                if let Some(e) = bucket.load().as_ref(self) {
+                    bucket.store(e.sibling.load());
                     Some(e)
                 } else {
                     None
@@ -883,8 +437,10 @@ impl Equeue {
                 slab_front
             );
             let new_slab_back = aligndown(
-                slab_back.saturating_sub(size_of::<Ebuf>() + (Eptr::ALIGN << npw2)),
-                Eptr::ALIGN
+                slab_back.saturating_sub(
+                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
+                ),
+                Ebuf::ALIGN
             );
 
             if new_slab_front > new_slab_back {
@@ -915,12 +471,15 @@ impl Equeue {
         };
 
         unsafe {
-            let e = &self.slab[new_slab_back] as *const u8 as *const Ebuf as *mut Ebuf;
+            let e = &self.slab[new_slab_back as usize]
+                as *const u8 as *const Ebuf as *mut Ebuf;
             e.write(Ebuf {
-                info: Atomic::new(Einfo::new(self, 0, npw2)),
-                next: Atomic::new(Eptr::null()),
+                next: Atomic::new(MarkedEptr::null()),
+                next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
-                back: Atomic::new(None),
+                sibling_back: Atomic::new(Eptr::null()),
+                id: Atomic::new(0),
+                npw2: npw2,
 
                 cb: None,
                 drop: None,
@@ -928,597 +487,304 @@ impl Equeue {
                 period: -1,
             });
 
-            Ok(Eref::from_parts(self, 0, &mut *e).claim())
+            Ok(&mut *e)
         }
     }
 
-    fn dealloc_ebuf(&self, e: Emut) {
-        let mut e = e;
-        debug_assert!(self.contains_ebuf(&e));
+    fn dealloc_ebuf(&self, e: &mut Ebuf) {
+        debug_assert!(self.contains_ebuf(e));
 
         // we can load buckets here because it can never shrink
-        let bucket = &self.buckets()[e.npw2() as usize];
+        let bucket = &self.buckets()[e.npw2 as usize];
 
         // give our event a new id
         e.inc_id();
 
         // add our event to a bucket, while also incrementing our
         // generation count
-        let e = e.as_eref();
         self.lock.lock(|| {
             // push onto bucket
-            let sibling = bucket.load_eref(self);
-            debug_assert_ne!(e.as_ptr(), sibling.as_ptr());
-            e.sibling.store_eref(bucket.load_eref(self));
-            bucket.store_eref(Some(e));
+            let siblingptr = bucket.load();
+            debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
+            e.sibling.store(siblingptr);
+            bucket.store(e.as_eptr(self));
         })
     }
 
-//    // Queue management
-//    fn enqueue_ebuf(&self, e: Emut, target: utick) -> Id {
-//        let mut e = e;
-//        e.target = target;
-//        debug_assert!(e.cb.is_some());
-//
-//        let id = Id::from_emut(&e);
-//
-//        loop {
-//            // find insertion point
-//            let mut delta = Ordering::Greater;
-//            let mut next = None;
-//            let mut back = &self.queue;
-//            for head in self.queue.load_nexts(self) {
-//                
-//
-//                let ndelta = scmp(head.target, target);
-//                if ndelta.is_ge() {
-//                    delta = ndelta;
-//                    next = Some(head);
-//                    break;
-//                }
-//
-//                back = &head.next;
-//            }
-//
-//            // try to insert
-//            match delta {
-//                Ordering::Greater => {
-//                    // insert a new slice
-//                    e.next.store_eref(next);
-//                    e.sibling.store_eref(None);
-//                    e.back.store(Some(back));
-//
-//                    if self.lock.lock(|| {
-//                        todo!()
-//                    })
-//                }
-//                Ordering::Equal => {
-//                    // push onto existing slice
-//                    let next = next.unwrap();
-//                    e.next.store_eref(next.next.load_eref(self));
-//                    e.sibling.store_eref(Some(next));
-//                    e.back.store(Some(back));
-//
-//                    if self.lock.lock(|| {
-//                        todo!()
-//                    })
-//                }
-//                Ordering::Less => unreachable!(),
-//            }
-//
-//            break;
-//        }
-//
-//        id
-//              
-//
-//        //let eptr = self.eptr_from(self.ebuf_id(e), Some(e));
-//
-//        'retry: loop {
-//            let mut headptr = self.queue.load();
-//            let mut headsrc = &self.queue;
-//
-//            // find insertion point
-//            let mut delta = Ordering::Greater;
-//            let mut nextptr = Eptr::null();
-//            while let Some(head) = self.eptr_as_ref(headptr) {
-//                // generation mismatch? someone is trying to remove and we
-//                // need to help out
-//                nextptr = head.next.load();
-//                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
-//                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
-//                    if let Err(_) = headsrc.cas(headptr, nextptr) {
-//                        // someone else removed the event for us, but we don't know
-//                        // what else has happened, so we need to retry
-//                        continue 'retry;
-//                    }
-//
-//                    // if no one fixed this before us, we can continue
-//                    headptr = nextptr;
-//                    continue;
-//                }
-//
-//                let ndelta = scmp(head.target, target);
-//                if ndelta.is_ge() {
-//                    delta = ndelta;
-//                    break;
-//                }
-//
-//                headptr = nextptr;
-//                headsrc = &head.next;
-//            };
-//
-//            // set ourselves up for insertion
-//            let siblingptr;
-//            let eptr;
-//            match delta {
-//                Ordering::Greater => {
-//                    // inserting a new slice, nothing complicated here
-//                    let gen = self.eptr_mark(e.next.load_ex());
-//                    eptr = self.eptr_cp_mark(self.eptr_from(gen, Some(e)), headptr);
-//                    nextptr = self.eptr_set_mark(headptr, gen);
-//                    siblingptr = self.eptr_cp_mark(Eptr::null(), e.sibling.load_ex());
-//                }
-//                Ordering::Equal => {
-//                    // inserting onto an existing slice, which is a bit complicated
-//                    //
-//                    // We can't really replace the top event atomically, so instead
-//                    // we insert our event _after_ the existing slice, but with the
-//                    // existing slice in our sibling list, while also marking the
-//                    // existing slice to be removed. This creates duplicate
-//                    // entries, but as long as we fix removals before dispatching
-//                    // events things work out.
-//                    let predptr = headptr;
-//                    headptr = nextptr;
-//                    headsrc = &self.eptr_as_ref(predptr).unwrap().next;
-//
-//                    let gen = self.eptr_mark(e.next.load_ex());
-//                    eptr = self.eptr_cp_mark(self.eptr_from(gen, Some(e)), self.eptr_inc_mark(headptr));
-//                    nextptr = self.eptr_set_mark(headptr, gen);
-//                    // TODO probably a better way to do this gen inc
-//                    siblingptr = self.eptr_cp_mark(self.eptr_inc_gen(predptr), e.sibling.load_ex());
-//                }
-//                Ordering::Less => unreachable!(),
-//            };
-//            debug_assert_ne!(e as *const _, self.eptr_as_ptr(nextptr));
-//            debug_assert_ne!(e as *const _, self.eptr_as_ptr(siblingptr));
-//            e.next.store_ex(nextptr);
-//            e.sibling.store_ex(siblingptr);
-//
-//            // CAS try to insert our event into the queue
-//            if let Err(_) = headsrc.cas(headptr, eptr) {
-//                // if we fail here any number of things could have happened,
-//                // we need to completely restart
-//                continue 'retry;
-//            }
-//
-//            // In _theory_, if we were pushing onto an existing slice, we should
-//            // go back and clean up the duplicate entries we created.
-//            //
-//            // But this gets complicated, and in practice, since any access to
-//            // the queue must fix pending removes, the duplicate entries will
-//            // get fixed before they have any effect on either behavior or
-//            // runtime
-//            break;
-//        }
-//
-//        eptr
-//    }
-//
-//    fn unqueue_ebuf<'a>(&'a self, e: &'a Ebuf) {
-//        // try to find the event and reclaim the memory, this can always
-//        // fail if the event is already prepared for dispatch, and it can
-//        // be in this state for however long any callbacks block for
-//
-//        // we actually only care about the target, we clean any events we
-//        // come across since it's necessary to keep the queue in a stable
-//        // state
-//        let target = e.target;
-//        let mut defered_reclaim = None;
-//        'retry: loop {
-//            let mut headptr = self.queue.load();
-//            let mut headsrc = &self.queue;
-//
-//            // find target slice
-//            let mut delta = Ordering::Greater;
-//            let mut nextptr = Eptr::null();
-//            while let Some(head) = self.eptr_as_ref(headptr) {
-//                // generation mismatch? someone is trying to remove and we
-//                // need to help out
-//                nextptr = head.next.load();
-//                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
-//                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
-//                    if let Err(_) = headsrc.cas(headptr, nextptr) {
-//                        // someone else removed the event for us, but we don't know
-//                        // what else has happened, so we need to retry
-//                        continue 'retry;
-//                    }
-//
-//                    // if no one fixed this before us, we can continue
-//                    headptr = nextptr;
-//                    continue;
-//                }
-//
-//                let ndelta = scmp(head.target, target);
-//                if ndelta.is_ge() {
-//                    delta = ndelta;
-//                    break;
-//                }
-//
-//                headptr = nextptr;
-//                headsrc = &head.next;
-//            };
-//
-//            {
-//                if let Some(head) = self.eptr_as_ref(headptr) {
-//                    let mut headptr = head.sibling.load();
-//                    let mut headsrc = &head.sibling;
-//                    while let Some(head) = self.eptr_as_ref(headptr) {
-//                        // generation mismatch? someone is trying to remove and we
-//                        // need to help out
-//                        let id = self.ebuf_id(head);
-//                        let siblingptr = head.sibling.load();
-//                        if self.eptr_mark(siblingptr) != id {
-//                            let siblingptr = self.eptr_set_mark(siblingptr, self.eptr_mark(headptr));
-//                            if let Err(_) = headsrc.cas(headptr, siblingptr) {
-//                                // someone else removed the event for us, but we don't know
-//                                // what else has happened, so we need to retry
-//                                continue 'retry;
-//                            }
-//
-//                            // if no one fixed this before us, we can continue
-//                            headptr = siblingptr;
-//                            continue;
-//                        }
-//
-//                        let ndelta = scmp(head.target, target);
-//                        if ndelta.is_ge() {
-//                            delta = ndelta;
-//                            break;
-//                        }
-//
-//                        headptr = siblingptr;
-//                        headsrc = &head.sibling;
-//                    };
-//                }
-//            }
-//
-//            if let Some(reclaimme) = defered_reclaim {
-//                let e = unsafe { self.ebuf_claim(reclaimme) };
-//                if let Some(drop) = e.drop {
-//                    drop(unsafe { e.as_mut_ptr() });
-//                }
-//                self.dealloc_ebuf(e);
-//
-//                defered_reclaim = None
-//            }
-//
-//            // clean up any canceled events
-//            if let (Ordering::Equal, Some(head))
-//                = (delta, self.eptr_as_ref(headptr))
-//            {
-//                let id = self.ebuf_id(head);
-//                let siblingptr = head.sibling.load();
-//                match (
-//                    self.eptr_mark(siblingptr) != id,
-//                    self.eptr_as_ref(siblingptr)
-//                ) {
-//                    (true, Some(sibling)) => {
-//                        // found head of slice with siblings, in order to
-//                        // mark this for removal, we need to move the siblings
-//                        // next to us, fortunately we can do this while marking
-//                        // ourself for removal atomically
-//
-//                        // prepare sibling for reinsertion
-//                        let oldsiblingnextptr = sibling.next.load();
-//                        if self.eptr_mark(oldsiblingnextptr) != self.eptr_gen(siblingptr) {
-//                            // we may have already been dispatched by now
-//                            continue 'retry;
-//                        }
-//                        let siblingnextptr = self.eptr_cp_mark(
-//                            nextptr,
-//                            oldsiblingnextptr
-//                        );
-//                        debug_assert_ne!(sibling as *const _, self.eptr_as_ptr(siblingnextptr));
-//                        // TODO restructure a bit?
-//                        if oldsiblingnextptr != siblingnextptr {
-//                            if let Err(_) = sibling.next.cas(oldsiblingnextptr, siblingnextptr) {
-//                                // we may have already been dispatched by now
-//                                continue 'retry;
-//                            }
-//                        }
-//
-//                        // mark for removal and insert sibling
-//                        let dirty_nextptr = self.eptr_inc_mark(self.eptr_cp_mark(
-//                            siblingptr,
-//                            nextptr
-//                        ));
-//                        debug_assert_ne!(head as *const _, self.eptr_as_ptr(dirty_nextptr));
-//                        if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
-//                            continue 'retry;
-//                        }
-//
-//                        // we need to make sure the event is out of the queue
-//                        // before we can reclaim the memory
-//                        debug_assert!(defered_reclaim.is_none());
-//                        defered_reclaim = Some(head);
-//                        continue 'retry;
-//                    }
-//                    (true, None) => {
-////                        // found head of slice with no sibling, we can just
-////                        // mark ourself for removal
-////                        let dirty_nextptr = self.eptr_inc_mark(nextptr);
-////                        if let Err(x) = head.next.cas(nextptr, dirty_nextptr) {
-////                            continue 'retry;
-////                        }
-////
-////                        // we need to make sure the event is out of the queue
-////                        // before we can reclaim the memory
-////                        debug_assert!(defered_reclaim.is_none());
-////                        defered_reclaim = Some(head);
-////                        continue 'retry;
-//                    }
-//                    (false, _) => {
-//                    }
-//                }
-//            }
-//
-//            break;
-//        }
-//    }
-//
-//    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Result<&'a Ebuf, itick> {
-//        let mut dequeuedptr = Cas::new(Eptr::null());
-//        let mut dequeuedtail = &dequeuedptr;
-//        let delta = 'retry: loop {
-//            let mut headptr = self.queue.load();
-//            while let Some(head) = self.eptr_as_ref(headptr) {
-//                // generation mismatch? someone is trying to remove and we
-//                // need to help out
-//                let nextptr = head.next.load();
-//                if self.eptr_mark(nextptr) != self.eptr_gen(headptr) {
-//                    let nextptr = self.eptr_set_mark(nextptr, self.eptr_mark(headptr));
-//                    if let Err(_) = self.queue.cas(headptr, nextptr) {
-//                        // someone else removed the event for us, but we don't know
-//                        // what else has happened, so we need to retry
-//                        continue 'retry;
-//                    }
-//
-//                    // if no one fixed this before us, we can continue
-//                    headptr = nextptr;
-//                    continue;
-//                }
-//
-//                // is this slice ready to dispatch?
-//                let delta = sdiff(head.target, now);
-//                if delta > 0 {
-//                    // no? return how long until the next event
-//                    break 'retry delta;
-//                }
-//
-//                // ok, the slice is ready to dispatch
-//                //
-//                // CAS 1. mark the slice for removal
-//                let dirty_nextptr = self.eptr_inc_mark(nextptr);
-//                if let Err(_) = head.next.cas(nextptr, dirty_nextptr) {
-//                    continue 'retry;
-//                }
-//
-//                // we've effectively removed the slice, but can't claim the
-//                // memory yet
-//                //
-//                // but, if we continue around this loop until all events sooner
-//                // then our target have been processed, we can be sure that the
-//                // event will actually be removed
-//                
-//                // to actually keep track of all these events, stick them on
-//                // an ad-hoc queue, keep in mind that the sibling pointers never
-//                // change once an event is enqueued
-//                //
-//                // note that we're also inverting our slices, which act sort of
-//                // like stacks and are stored in reverse order
-//                let mut predptr = Eptr::null();
-//                let mut headptr = headptr;
-//                let mut head = head;
-//                let ndequeuedtail = &head.sibling;
-//                loop {
-//                    let mut siblingptr = head.sibling.load();
-//                    loop {
-//                        let predptr = self.eptr_cp_mark(predptr, siblingptr);
-//                        if let Err(x) = head.sibling.cas(siblingptr, predptr) {
-//                            // this can only happen if an event is canceled
-//                            siblingptr = x;
-//                            continue;
-//                        }
-//                        break;
-//                    }
-//
-//                    let sibling = match self.eptr_as_ref(siblingptr) {
-//                        Some(sibling) => sibling,
-//                        None => break,
-//                    };
-//
-//                    predptr = headptr;
-//                    headptr = siblingptr;
-//                    head = sibling;
-//                }
-//
-//                // stick on dequeued list
-//                let mut dequeuedtailptr = dequeuedtail.load();
-//                loop {
-//                    debug_assert_eq!(self.eptr_as_ptr(dequeuedtailptr), ptr::null());
-//                    let headptr = self.eptr_cp_mark(headptr, dequeuedtailptr);
-//                    if let Err(x) = dequeuedtail.cas(dequeuedtailptr, headptr) {
-//                        // this can only happend if an event is canceled
-//                        dequeuedtailptr = x;
-//                        continue;
-//                    }
-//                    break;
-//                }
-//                dequeuedtail = ndequeuedtail;
-//
-//                // continue to fix remove/find more slices
-//                continue 'retry;
-//            }
-//
-//            // nothing to do I guess
-//            break 'retry -1;
-//        };
-//
-//        // did we find any slices to dequeue?
-//        match self.eptr_as_ref(dequeuedptr.load_ex()) {
-//            Some(dequeued) => Ok(dequeued),
-//            None => Err(delta),
-//        }
-//    }
-//
-//    // Central post function
-//    fn post_ebuf(&self, e: &mut Ebuf, target: utick) -> Eptr {
-//        let eptr = self.enqueue_ebuf(e, target);
-//
-//        // signal queue has changed
-//        self.sema.signal();
-//
-//        eptr
-//    }
-//
-//    // Central dispatch function
-//    pub fn dispatch(&self, ticks: itick) {
-//        // get the current time
-//        let mut now = self.clock.now();
-//        let timeout = now.wrapping_add(ticks as u64);
-//
-//        loop {
-//            // get a slice to dispatch
-//            let mut slice = self.dequeue_ebufs(now).ok();
-//
-//            while let Some(e) = slice {
-//                // last chance to cancel
-//                let id = self.ebuf_id(e);
-//                let mut siblingptr = e.sibling.load();
-//                let canceled = loop {
-//                    // already canceled?
-//                    if self.eptr_mark(siblingptr) != id {
-//                        break true;
-//                    }
-//
-//                    // if we're periodic, we actually don't mark the event as
-//                    // complete, since periodic events are always cancelable
-//                    if e.period >= 0 {
-//                        break false;
-//                    }
-//
-//                    // mark event as complete
-//                    let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
-//                    if let Err(x) = e.sibling.cas(siblingptr, dirty_siblingptr) {
-//                        siblingptr = x;
-//                        continue;
-//                    }
-//
-//                    break false;
-//                };
-//
-//                // move to next event, claim current event
-//                slice = self.eptr_load(&e.sibling);
-//                let e = unsafe { self.ebuf_claim(e) };
-//
-//                if !canceled {
-//                    // dispatch!
-//                    e.cb.unwrap()(unsafe { e.as_mut_ptr() });
-//                }
-//
-//                if !canceled && e.period >= 0 {
-//                    // reenqueue?
-//                    self.enqueue_ebuf(
-//                        e,
-//                        self.clock.now().wrapping_add(e.period as u64)
-//                    );
-//                } else {
-//                    // call drop, return event to memory pool
-//                    if let Some(drop) = e.drop {
-//                        drop(unsafe { e.as_mut_ptr() });
-//                    }
-//                    self.dealloc_ebuf(e);
-//                }
-//            }
-//
-//            // should we stop dispatching?
-//            //
-//            // note that time could have changed _significantly_
-//            now = self.clock.now();
-//            let timeout_left = sdiff(timeout, now);
-//            if ticks >= 0 && timeout_left <= 0 {
-//                return;
-//            }
-//
-//            // ok how long should we sleep for
-//            //
-//            // Note that we always try to sleep between slices, this is
-//            // just to behave nicely in case the system's semaphore implementation
-//            // does something "clever". Note we also never enter here if
-//            // ticks is 0 for similar reasons.
-//            let mut delay = match self.eptr_as_ref(self.queue.load()) {
-//                Some(head) => max(sdiff(head.target, now), 0),
-//                None => -1,
-//            };
-//
-//            if (delay as utick) > (timeout_left as utick) {
-//                delay = timeout_left;
-//            }
-//
-//            self.sema.wait(delay);
-//
-//            // update current time
-//            now = self.clock.now();
-//        }
-//    }
-//
-//    // Central cancel function
-//    pub fn cancel(&self, id: Id) -> bool {
-//        let eptr = Eptr::from(id);
-//        let e = match self.eptr_as_ref(eptr)
-//            // I supposed eptrs could be passed between equeues, it's probably
-//            // an error to do so, but the correct action is to ignore the request
-//            .filter(|e| self.contains_ebuf(e))
-//        {
-//            Some(e) => e,
-//            None => return false,
-//        };
-//
-//        // try to cancel by incrementing the id shoved in our sibling mark
-//        let mut siblingptr = e.sibling.load();
-//        loop {
-//            if self.eptr_mark(siblingptr) != self.eptr_gen(eptr) {
-//                // already canceled?
-//                return false;
-//            }
-//
-//            let dirty_siblingptr = self.eptr_inc_mark(siblingptr);
-//            if let Err(x) = e.sibling.cas(siblingptr, dirty_siblingptr) {
-//                siblingptr = x;
-//                continue;
-//            }
-//
-//            break;
-//        }
-//
-//        // try to clean up memory
-//        self.unqueue_ebuf(e);
-//
-//        true
-//    }
+    // Queue management
+    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) -> Id {
+        let mut e = e;
+        debug_assert!(e.cb.is_some());
+        e.target = target;
+
+        let id = Id::from_ebuf(self, e);
+
+        'retry: loop {
+            // find insertion point
+            let mut back = None;
+            let mut sibling = None;
+
+            let mut headsrc = &self.queue;
+            let mut headptr = self.queue.load();
+            while let Some(head) = headptr.as_ref(self) {
+                // compare targets
+                match scmp(head.target, target) {
+                    Ordering::Greater => {
+                        sibling = None;
+                        break;
+                    }
+                    Ordering::Equal => {
+                        sibling = Some(head);
+                        break;
+                    }
+                    Ordering::Less => {
+                        // continue
+                    }
+                }
+
+                back = Some(head);
+                headsrc = &head.next;
+                headptr = match head.next.load_marked(headptr) {
+                    Ok(headptr) => headptr,
+                    Err(foundptr) => {
+                        // found a gen mismatch, most likely some changed
+                        // happened to the data-structure which puts us into
+                        // an unknown state, so we need to restart
+                        continue 'retry;
+                    }
+                };
+            }
+
+            // found our insertion point, now lets try to insert
+            match sibling {
+                None => {
+                    // insert a new slice
+                    e.next.store_marked(e.next.load(), headptr);
+                    e.next_back.store(back.as_eptr(self));
+                    e.sibling.store(e.as_eptr(self));
+                    e.sibling_back.store(e.as_eptr(self));
+
+                    // try to insert
+                    if !self.lock.lock(|| {
+                        if headsrc.load() == headptr {
+                            headsrc.store_marked(headptr, e.as_marked_eptr(self));
+                            true
+                        } else {
+                            // did someone already change our headsrc? restart
+                            false
+                        }
+                    }) {
+                        continue 'retry;
+                    }
+                }
+                Some(sibling) => {
+                    // push onto existing slice
+                    e.next.store_marked(e.next.load(), MarkedEptr::null());
+                    e.next_back.store(Eptr::null());
+                    e.sibling.store(sibling.as_eptr(self));
+
+                    // try to push
+                    if !self.lock.lock(|| {
+                        if headsrc.load() == headptr {
+                            // the real need for locking here is to make sure all of
+                            // the back-references are correct atomically
+                            let sibling_back = sibling.sibling_back.load()
+                                .as_ref(self).unwrap();
+                            sibling.sibling_back.store(e.as_eptr(self));
+                            
+                            sibling_back.sibling.store(e.as_eptr(self));
+                            e.sibling_back.store(sibling_back.as_eptr(self));
+                            true
+                        } else {
+                            // did someone already change our headsrc? restart
+                            false
+                        }
+                    }) {
+                        continue 'retry;
+                    }
+                }
+            }
+
+            break;
+        }
+
+        id
+    }
+
+    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
+        // after several implementations, this turned out rather simple,
+        // we just need to lock, remove the head of each slice, and make sure
+        // all back-references/generation counts are correct
+        //
+        // note we grab every slice that is available to run, which may
+        // be several
+        let mut dequeued = None;
+
+        while self.lock.lock(|| {
+            if let Some(head) = self.queue.load().as_ref(self) {
+                // is this slice ready to dispatch?
+                if scmp(head.target, now).is_gt() {
+                    return false
+                }
+
+                // remove slice from queue
+                let nextptr = head.next.load();
+                // make sure we update queue first to not get any readers stuck
+                self.queue.store(nextptr);
+                head.next.store_inc_marked(nextptr, MarkedEptr::null());
+                head.next_back.store(Eptr::null());
+
+                // make sure back-references are updated
+                if let Some(next) = nextptr.as_ref(self) {
+                    next.next_back.store(Eptr::null());
+                }
+
+                match dequeued {
+                    None => {
+                        // before we unlock, head is in a weird state where if it's
+                        // canceled we're suddenly pointing to garbage, so we go ahead 
+                        // and mark the head as executing, since that's the very next
+                        // thing we're going to do
+                        head.inc_id();
+                        dequeued = Some(head);
+                    }
+                    Some(dequeued) => {
+                        // append slice to what's already been dequeued
+                        let dequeued_back = dequeued.sibling_back.load()
+                            .as_ref(self).unwrap();
+                        let head_back = head.sibling_back.load()
+                            .as_ref(self).unwrap();
+
+                        dequeued_back.sibling.store(head.as_eptr(self));
+                        head.sibling_back.store(dequeued_back.as_eptr(self));
+
+                        head_back.sibling.store(dequeued.as_eptr(self));
+                        dequeued.sibling_back.store(head_back.as_eptr(self));
+                    }
+                }
+
+                true
+            } else {
+                false
+            }
+        }) {}
+
+        dequeued
+    }
+
+    // Central post function
+    fn post(&self, e: &mut Ebuf, target: utick) -> Id {
+        let id = self.enqueue_ebuf(e, target);
+
+        // signal queue has changed
+        self.sema.signal();
+
+        id
+    }
+
+    // Central dispatch function
+    pub fn dispatch(&self, ticks: itick) {
+        // get the current time
+        let mut now = self.clock.now();
+        let timeout = now.wrapping_add(ticks as u64);
+
+        loop {
+            // get a slice to dispatch
+            let mut slice = self.dequeue_ebufs(now);
+
+            let mut count = 0;
+            while let Some(e) = slice {
+                // last chance to cancel
+                self.lock.lock(|| {
+                    // TODO more strict incrementing of id? we increment way too
+                    // many times (3!)
+
+                    // mark the event as executing
+                    e.inc_id();
+
+                    // remove from sibling list
+                    let sibling = e.sibling.load().as_ref(self).unwrap();
+                    let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
+                    if sibling as *const _ == e as *const _ {
+                        slice = None;
+                    } else {
+                        sibling.sibling_back.store(sibling_back.as_eptr(self));
+                        sibling_back.sibling.store(sibling.as_eptr(self));
+                        slice = Some(sibling);
+                    }
+                });
+
+                // we now have exclusive access
+                let e = unsafe { e.claim() };
+                count += 1;
+
+                // dispatch!
+                e.cb.unwrap()(e.data_mut_ptr());
+
+                if e.period >= 0 {
+                    // reenqueue?
+                    self.enqueue_ebuf(
+                        e,
+                        self.clock.now().wrapping_add(e.period as u64)
+                    );
+                } else {
+                    // call drop, return event to memory pool
+                    if let Some(drop) = e.drop {
+                        drop(e.data_mut_ptr());
+                    }
+                    self.dealloc_ebuf(e);
+                }
+            }
+
+            // should we stop dispatching?
+            //
+            // note that time could have changed _significantly_
+            now = self.clock.now();
+            let timeout_left = sdiff(timeout, now);
+            if ticks >= 0 && timeout_left <= 0 {
+                return;
+            }
+
+            // ok how long should we sleep for
+            //
+            // Note that we always try to sleep between slices, this is
+            // just to behave nicely in case the system's semaphore implementation
+            // does something "clever". Note we also never enter here if
+            // ticks is 0 for similar reasons.
+            let mut delay = self.lock.lock(|| {
+                match self.queue.load().as_ref(self) {
+                    Some(head) => max(sdiff(head.target, now), 0),
+                    None => -1,
+                }
+            });
+
+            if (delay as utick) > (timeout_left as utick) {
+                delay = timeout_left;
+            }
+
+            self.sema.wait(delay);
+
+            // update current time
+            now = self.clock.now();
+        }
+    }
+
+    // Central cancel function
+    pub fn cancel(&self, id: Id) -> bool {
+        todo!()
+    }
 
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_ebuf(layout) {
-            Ok(mut e) => e.data_mut_ptr(),
+            Ok(e) => e.data_mut_ptr(),
             Err(_) => ptr::null_mut(),
         }
     }
 
     pub unsafe fn dealloc_raw(&self, e: *mut u8, _layout: Layout) {
         debug_assert!(e.is_null() || self.contains_raw(e));
-        let mut e = match Emut::from_data_mut_ptr(self, e) {
+        let e = match Ebuf::from_data_mut_ptr(e) {
             Some(e) => e,
             None => return, // do nothing
         };
@@ -1533,7 +799,7 @@ impl Equeue {
     }
 
     pub fn contains_raw(&self, e: *mut u8) -> bool {
-        match unsafe { (e as *mut Ebuf).as_ref() } {
+        match unsafe { Ebuf::from_data_mut_ptr(e) } {
             Some(e) => self.contains_ebuf(e),
             None => false,
         }
@@ -1541,32 +807,29 @@ impl Equeue {
 
     pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
         debug_assert!(self.contains_raw(e));
-        let mut e = Emut::from_data_mut_ptr(self, e).unwrap();
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.drop = Some(drop);
     }
 
     pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: itick) {
         debug_assert!(self.contains_raw(e));
-        let mut e = Emut::from_data_mut_ptr(self, e).unwrap();
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
         debug_assert!(delay >= 0);
         e.target = delay as utick;
     }
 
     pub unsafe fn set_raw_period(&self, e: *mut u8, period: itick) {
         debug_assert!(self.contains_raw(e));
-        let mut e = Emut::from_data_mut_ptr(self, e).unwrap();
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.period = period;
     }
 
-//    pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
-//        let mut e = Ebuf::from_mut_ptr(e).unwrap();
-//        debug_assert!(self.contains_ebuf(e));
-//        e.cb = Some(cb);
-//        let eptr = self.post_ebuf(e,
-//            self.clock.now().wrapping_add(e.target)
-//        );
-//        Id::try_from(eptr).unwrap()
-//    }
+    pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
+        debug_assert!(self.contains_raw(e));
+        let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
+        e.cb = Some(cb);
+        self.post(e, self.clock.now().wrapping_add(e.target))
+    }
 }
 
 
@@ -1584,181 +847,185 @@ impl<F: FnMut() + Send> Post for F {
 
 /// An id we can use to try to cancel an event
 #[derive(Copy, Clone)]
-pub struct Id(NonZeroUeptr);
+pub struct Id {
+    id: ugen,
+    eptr: NonZeroUeptr,
+}
 
 impl Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("Id")
-            .field(&format_args!("{:#x}", self.0))
+            .field(&self.id)
+            .field(&format_args!("{:#x}", self.eptr))
             .finish()
     }
 }
 
 impl Id {
-    fn from_emut(e: &Emut) -> Id {
-        let mask = (1 << e.q.gen_off) - 1;
-        Id(unsafe { NonZeroUeptr::new_unchecked(e.eptr.0 & mask) })
-    }
-
-    fn as_eref<'a>(&self, q: &'a Equeue) -> Eref<'a> {
-        Eref::from_eptr(q, Eptr(self.0.get())).unwrap()
+    fn from_ebuf(q: &Equeue, e: &mut Ebuf) -> Id {
+        Id {
+            id: e.id.load(),
+            eptr: unsafe { NonZeroUeptr::new_unchecked(e.as_eptr(q).0) }
+        }
     }
 }
 
 /// Event handle
-pub struct Event<'a, T>(Emut<'a>, PhantomData<T>);
+pub struct Event<'a, T> {
+    q: &'a Equeue,
+    e: &'a mut Ebuf,
+    _phantom: PhantomData<T>,
+}
 
 impl<T: Debug> Debug for Event<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Event")
-            .field(&self.0)
+            .field(&self.e)
             .field(&self.deref())
             .finish()
     }
 }
 
 impl<'a, T> Event<'a, T> {
-    fn new(e: Emut<'a>) -> Event<'a, T> {
-        Event(e, PhantomData)
+    fn new(q: &'a Equeue, e: &'a mut Ebuf) -> Event<'a, T> {
+        Event {
+            q: q,
+            e: e,
+            _phantom: PhantomData
+        }
     }
 
     pub unsafe fn from_raw_parts(q: &'a Equeue, e: *mut T) -> Event<'a, T> {
         debug_assert!(q.contains_raw(e as *mut u8));
-        let e = Emut::from_data_mut_ptr(q, e).unwrap();
-        Event::new(e)
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
+        Event::new(q, e)
     }
 }
 
 impl Equeue {
     pub fn alloc<'a, T: Default>(&'a self) -> Result<Event<'a, T>, Error> {
-        let mut e = self.alloc_ebuf(Layout::new::<T>())?;
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(T::default()); }
-        Ok(Event::new(e))
+        Ok(Event::new(self, e))
     }
 
     pub fn alloc_from<'a, T>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let mut e = self.alloc_ebuf(Layout::new::<T>())?;
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
-        Ok(Event::new(e))
+        Ok(Event::new(self, e))
     }
-
-//    // TODO should we even have this? it shouldn't be possible to pass
-//    // events between unrelated equeues...
-//    pub fn post<T: Post>(&self, e: Event<'_, T>) -> Id {
-//        // cb/drop thunks
-//        fn cb_thunk<T: Post>(e: *mut u8) {
-//            unsafe { &mut *(e as *mut T) }.post();
-//        }
-//
-//        fn drop_thunk<T>(e: *mut u8) {
-//            unsafe { drop_in_place(e as *mut T) };
-//        }
-//
-//        e.e.cb = Some(cb_thunk::<T>);
-//        e.e.drop = Some(drop_thunk::<T>);
-//
-//        // enqueue and then forget the event, it's up to equeue to
-//        // drop the event later
-//        let eptr = e.q.post_ebuf(e.e,
-//            self.clock.now().wrapping_add(e.e.target)
-//        );
-//        forget(e);
-//
-//        Id::try_from(eptr).unwrap()
-//    }
 }
 
 impl<T> Event<'_, T> {
     pub fn delay(mut self, delay: itick) -> Self {
         debug_assert!(delay >= 0);
-        self.0.target = delay as utick;
+        self.e.target = delay as utick;
         self
     }
 
     pub fn period(mut self, period: itick) -> Self {
-        self.0.period = period;
+        self.e.period = period;
         self
     }
+}
 
-//    pub fn post(self) -> Id {
-//        self.q.post(self)
-//    }
+impl<T: Post> Event<'_, T> {
+    pub fn post(self) -> Id {
+        // cb/drop thunks
+        fn cb_thunk<T: Post>(e: *mut u8) {
+            unsafe { &mut *(e as *mut T) }.post();
+        }
+
+        fn drop_thunk<T>(e: *mut u8) {
+            unsafe { drop_in_place(e as *mut T) };
+        }
+
+        self.e.cb = Some(cb_thunk::<T>);
+        self.e.drop = Some(drop_thunk::<T>);
+
+        // enqueue and then forget the event, it's up to equeue to
+        // drop the event later
+        let id = self.q.post(self.e, self.q.now().wrapping_add(self.e.target));
+        forget(self);
+
+        id
+    }
 }
 
 impl<T> Drop for Event<'_, T> {
     fn drop(&mut self) {
         // make sure we clean up if the event isn't dispatched
-        unsafe { drop_in_place(self.0.data_mut_ptr::<T>()) };
+        unsafe { drop_in_place(self.e.data_mut_ptr::<T>()) };
 
         // have to work around our own Emut lifetime here
-        self.0.q.dealloc_ebuf(unsafe { self.0.as_eref().claim() });
+        self.q.dealloc_ebuf(self.e);
     }
 }
 
 impl<T> Deref for Event<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { self.0.data_ref() }
+        unsafe { self.e.data_ref() }
     }
 }
 
 impl<T> DerefMut for Event<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { self.0.data_mut() }
+        unsafe { self.e.data_mut() }
     }
 }
 
 impl<T> AsRef<T> for Event<'_, T> {
     fn as_ref(&self) -> &T {
-        unsafe { self.0.data_ref() }
+        unsafe { self.e.data_ref() }
     }
 }
 
 impl<T> AsMut<T> for Event<'_, T> {
     fn as_mut(&mut self) -> &mut T {
-        unsafe { self.0.data_mut() }
+        unsafe { self.e.data_mut() }
     }
 }
 
 impl<T> Borrow<T> for Event<'_, T> {
     fn borrow(&self) -> &T {
-        unsafe { self.0.data_ref() }
+        unsafe { self.e.data_ref() }
     }
 }
 
 impl<T> BorrowMut<T> for Event<'_, T> {
     fn borrow_mut(&mut self) -> &mut T {
-        unsafe { self.0.data_mut() }
+        unsafe { self.e.data_mut() }
     }
 }
 
-//impl Equeue {
-//    // convenience functions
-//    pub fn call<F: Post>(&self, cb: F) -> Result<Id, Error>{
-//        Ok(
-//            self.alloc_from(cb)?
-//                .post()
-//        )
-//    }
-//
-//    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<Id, Error> {
-//        Ok(
-//            self.alloc_from(cb)?
-//                .delay(delay)
-//                .post()
-//        )
-//    }
-//
-//    pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
-//        Ok(
-//            self.alloc_from(cb)?
-//                .delay(period)
-//                .period(period)
-//                .post()
-//        )
-//    }
-//}
+impl Equeue {
+    // convenience functions
+    pub fn call<F: Post>(&self, cb: F) -> Result<Id, Error>{
+        Ok(
+            self.alloc_from(cb)?
+                .post()
+        )
+    }
+
+    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<Id, Error> {
+        Ok(
+            self.alloc_from(cb)?
+                .delay(delay)
+                .post()
+        )
+    }
+
+    pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
+        Ok(
+            self.alloc_from(cb)?
+                .delay(period)
+                .period(period)
+                .post()
+        )
+    }
+}
 
 
 #[derive(Debug, Clone)]
@@ -1781,8 +1048,8 @@ impl Equeue {
     pub fn usage(&self) -> Usage {
         // find slab usage
         let slab_total = self.slab.len();
-        let slab_front = self.slab_front.load();
-        let slab_back = self.slab_back.load();
+        let slab_front = self.slab_front.load() as usize;
+        let slab_back = self.slab_back.load() as usize;
         let slab_unused = slab_back - slab_front;
 
         let mut total = 0usize;
@@ -1791,32 +1058,36 @@ impl Equeue {
             .unwrap_or(ptr::null());
         while self.slab.as_ptr_range().contains(&p) {
             let e = unsafe { &*(p as *const Ebuf) };
-            // the risky thing about this is we can end up with an
-            // uninitialized ebuf here, which can be problematic
-            if e.npw2() > npw2(self.slab.len()) {
-                break;
-            }
 
             total += 1;
-            p = unsafe {
-                p.add(alignup(
-                    size_of::<Ebuf>() + e.size(),
-                    Eptr::ALIGN
-                ))
-            }
+            p = p.wrapping_add(alignup(
+                size_of::<Ebuf>() + e.size(),
+                Ebuf::ALIGN
+            ))
         }
 
         // find pending usage
         let mut pending = 0;
         let mut pending_bytes = 0;
         let mut slices = 0;
-        for head in self.queue.load_nexts(self) {
+        'slices: for head in iter::successors(
+            self.queue.load().as_ref(self),
+            |head| head.next.load().as_ref(self)
+        ) {
             slices += 1;
-            for sibling in iter::once(head)
-                .chain(head.sibling.load_siblings(self))
-            {
+            for sibling in iter::successors(
+                Some(head),
+                |sibling| sibling.sibling.load().as_ref(self)
+                    .filter(|&sibling| sibling as *const _ != head as *const _)
+            ) {
                 pending += 1;
                 pending_bytes += size_of::<Ebuf>() + sibling.size();
+
+                // this is all completely unsynchronized, so we have to set some
+                // hard limits to prevent getting stuck in an infinite loop, 
+                if pending > total {
+                    break 'slices;
+                }
             }
         }
 
@@ -1825,9 +1096,18 @@ impl Equeue {
         let mut free = 0;
         let mut free_bytes = 0;
         for (npw2, head) in buckets.iter().enumerate() {
-            for _ in head.load_siblings(self) {
+            for _ in iter::successors(
+                head.load().as_ref(self),
+                |head| head.sibling.load().as_ref(self)
+            ) {
                 free += 1;
-                free_bytes += size_of::<Ebuf>() + (Eptr::ALIGN << npw2);
+                free_bytes += size_of::<Ebuf>() + (Ebuf::ALIGN << npw2);
+
+                // this is all completely unsynchronized, so we have to set some
+                // hard limits to prevent getting stuck in an infinite loop, 
+                if free > total {
+                    break;
+                }
             }
         }
 
@@ -1838,6 +1118,8 @@ impl Equeue {
         // to avoid breaking user's code as much as possible
         let pending = min(pending, total);
         let pending_bytes = min(pending_bytes, slab_total.saturating_sub(slab_unused+slab_front));
+        let free = min(free, total-pending);
+        let free_bytes = min(free_bytes, slab_total.saturating_sub(slab_unused+slab_front)-pending_bytes);
 
         Usage {
             pending: pending,
@@ -1856,26 +1138,54 @@ impl Equeue {
     }
 
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
+        // this is just a guess
+        let total = self.slab.len() / size_of::<Ebuf>();
+
         for (bucket, head) in buckets.iter_mut()
             .zip(self.buckets())
         {
             let mut count = 0;
-            for _ in head.load_siblings(self) {
+            for _ in iter::successors(
+                head.load().as_ref(self),
+                |head| head.sibling.load().as_ref(self)
+            ) {
                 count += 1;
+
+                // this is all completely unsynchronized, so we have to set some
+                // hard limits to prevent getting stuck in an infinite loop, 
+                if count > total {
+                    break;
+                }
             }
             *bucket = count;
         }
     }
 
     pub fn slice_usage(&self, slices: &mut [usize]) {
+        // this is just a guess
+        let total = self.slab.len() / size_of::<Ebuf>();
+
         for (slice, head) in slices.iter_mut()
-            .zip(self.queue.load_siblings(self))
+            .zip(
+                iter::successors(
+                    self.queue.load().as_ref(self),
+                    |head| head.next.load().as_ref(self)
+                )
+            )
         {
             let mut count = 0;
-            for sibling in iter::once(head)
-                .chain(head.sibling.load_siblings(self))
-            {
+            for sibling in iter::successors(
+                Some(head),
+                |sibling| sibling.sibling.load().as_ref(self)
+                    .filter(|&sibling| sibling as *const _ != head as *const _)
+            ) {
                 count += 1;
+
+                // this is all completely unsynchronized, so we have to set some
+                // hard limits to prevent getting stuck in an infinite loop, 
+                if count > total {
+                    break;
+                }
             }
             *slice = count;
         }

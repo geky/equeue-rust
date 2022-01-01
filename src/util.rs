@@ -34,6 +34,18 @@ impl Align for usize {
     }
 }
 
+impl Align for u64 {
+    #[inline]
+    fn aligndown(self, align: usize) -> u64 {
+        self - (self % align as u64)
+    }
+
+    #[inline]
+    fn alignup(self, align: usize) -> u64 {
+        (self + align as u64-1).aligndown(align)
+    }
+}
+
 impl Align for *const u8 {
     #[inline]
     fn aligndown(self, align: usize) -> *const u8 {
