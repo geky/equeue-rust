@@ -620,56 +620,81 @@ impl Equeue {
         // be several
         let mut dequeued = None;
 
-        while self.lock.lock(|| {
-            if let Some(head) = self.queue.load().as_ref(self) {
-                // is this slice ready to dispatch?
-                if scmp(head.target, now).is_gt() {
-                    return false
-                }
-
-                // remove slice from queue
-                let nextptr = head.next.load();
-                // make sure we update queue first to not get any readers stuck
-                self.queue.store(nextptr);
-                head.next.store_inc_marked(nextptr, MarkedEptr::null());
-                head.next_back.store(Eptr::null());
-
-                // make sure back-references are updated
-                if let Some(next) = nextptr.as_ref(self) {
-                    next.next_back.store(Eptr::null());
-                }
-
-                match dequeued {
-                    None => {
-                        // before we unlock, head is in a weird state where if it's
-                        // canceled we're suddenly pointing to garbage, so we go ahead 
-                        // and mark the head as executing, since that's the very next
-                        // thing we're going to do
-                        head.inc_id();
-                        dequeued = Some(head);
-                    }
-                    Some(dequeued) => {
-                        // append slice to what's already been dequeued
-                        let dequeued_back = dequeued.sibling_back.load()
-                            .as_ref(self).unwrap();
-                        let head_back = head.sibling_back.load()
-                            .as_ref(self).unwrap();
-
-                        dequeued_back.sibling.store(head.as_eptr(self));
-                        head.sibling_back.store(dequeued_back.as_eptr(self));
-
-                        head_back.sibling.store(dequeued.as_eptr(self));
-                        dequeued.sibling_back.store(head_back.as_eptr(self));
-                    }
-                }
-
-                true
-            } else {
-                false
+        loop {
+            // check if we need to bother locking first
+            if self.delta(now).filter(|&delta| delta <= 0).is_none() {
+                break;
             }
-        }) {}
+
+            if !self.lock.lock(|| {
+                match self.queue.load().as_ref(self) {
+                    // is this slice ready to dispatch?
+                    Some(head) if scmp(head.target, now).is_le() => {
+                        // remove slice from queue
+                        let nextptr = head.next.load();
+                        // make sure we update queue first to not get any readers stuck
+                        self.queue.store(nextptr);
+                        head.next.store_inc_marked(nextptr, MarkedEptr::null());
+                        head.next_back.store(Eptr::null());
+
+                        // make sure back-references are updated
+                        if let Some(next) = nextptr.as_ref(self) {
+                            next.next_back.store(Eptr::null());
+                        }
+
+                        match dequeued {
+                            None => {
+                                // before we unlock, head is in a weird state where if it's
+                                // canceled we're suddenly pointing to garbage, so we go ahead 
+                                // and mark the head as executing, since that's the very next
+                                // thing we're going to do
+                                head.inc_id();
+                                dequeued = Some(head);
+                            }
+                            Some(dequeued) => {
+                                // append slice to what's already been dequeued
+                                let dequeued_back = dequeued.sibling_back.load()
+                                    .as_ref(self).unwrap();
+                                let head_back = head.sibling_back.load()
+                                    .as_ref(self).unwrap();
+
+                                dequeued_back.sibling.store(head.as_eptr(self));
+                                head.sibling_back.store(dequeued_back.as_eptr(self));
+
+                                head_back.sibling.store(dequeued.as_eptr(self));
+                                dequeued.sibling_back.store(head_back.as_eptr(self));
+                            }
+                        }
+                        true
+                    }
+                    _ => {
+                        false
+                    }
+                }
+            }) {
+                break;
+            }
+        }
 
         dequeued
+    }
+
+    // find time until next event without locking
+    fn delta(&self, now: utick) -> Option<itick> {
+        'retry: loop {
+            let headptr = self.queue.load();
+            let target = match headptr.as_ref(self) {
+                Some(head) => head.target,
+                None => return None,
+            };
+
+            // make sure headptr hasn't changed before we trust our target
+            if self.queue.load() != headptr {
+                continue 'retry;
+            }
+
+            return Some(sdiff(target, now));
+        }
     }
 
     // Central post function
@@ -751,18 +776,16 @@ impl Equeue {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let mut delay = self.lock.lock(|| {
-                match self.queue.load().as_ref(self) {
-                    Some(head) => max(sdiff(head.target, now), 0),
-                    None => -1,
-                }
-            });
+            let mut delta = match self.delta(now) {
+                Some(delta) => max(delta, 0),
+                None => -1,
+            };
 
-            if (delay as utick) > (timeout_left as utick) {
-                delay = timeout_left;
+            if (delta as utick) > (timeout_left as utick) {
+                delta = timeout_left;
             }
 
-            self.sema.wait(delay);
+            self.sema.wait(delta);
 
             // update current time
             now = self.clock.now();
