@@ -1109,6 +1109,12 @@ impl Equeue {
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
                 if pending > total {
+                    pending = 1;
+                    break;
+                }
+
+                if slices > total {
+                    slices = 1;
                     break 'slices;
                 }
             }
@@ -1129,6 +1135,7 @@ impl Equeue {
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
                 if free > total {
+                    free = 1;
                     break;
                 }
             }
@@ -1177,6 +1184,7 @@ impl Equeue {
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
                 if count > total {
+                    count = 1;
                     break;
                 }
             }
@@ -1207,6 +1215,7 @@ impl Equeue {
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
                 if count > total {
+                    count = 1;
                     break;
                 }
             }
