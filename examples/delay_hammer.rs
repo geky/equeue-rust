@@ -83,7 +83,6 @@ fn main() {
     // and now, in our main thread, lets render something nice looking
     println!();
 
-    let mut slice_max = 1;
     let mut bucket_max = 1;
     loop {
         let usage = q.usage();
@@ -91,12 +90,6 @@ fn main() {
         let mut buckets = vec![0; usage.buckets];
         q.slice_usage(&mut slices);
         q.bucket_usage(&mut buckets);
-
-        for &slice in slices.iter() {
-            if slice > slice_max {
-                slice_max = slice;
-            }
-        }
 
         let mut used_buckets = 0;
         for &bucket in buckets.iter() {
@@ -112,8 +105,7 @@ fn main() {
         // render this thing
         let print_slices = |row: usize| {
             for &slice in slices.iter().take(opt.width-2) {
-                let slice_dots = 2*3*slice;
-                let slice_dots = (slice_dots + slice_max-1) / slice_max;
+                let slice_dots = slice;
                 if slice_dots > 2*row+1 {
                     print!(":");
                 } else if slice_dots > 2*row {
