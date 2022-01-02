@@ -556,7 +556,12 @@ impl Equeue {
         let bucket = &self.buckets()[e.npw2() as usize];
 
         // give our event a new id
-        e.info.store(e.info.load().inc_id());
+        e.info.store(
+            e.info.load()
+                .inc_id()
+                .set_pending(false)
+                .set_canceled(false)
+        );
 
         // add our event to a bucket, while also incrementing our
         // generation count
@@ -570,7 +575,7 @@ impl Equeue {
     }
 
     // Queue management
-    fn enqueue_ebuf(&self, e: &mut Ebuf, target: utick) -> Id {
+    fn enqueue_ebuf<'a>(&self, e: &'a mut Ebuf, target: utick) -> Result<Id, &'a mut Ebuf> {
         let mut e = e;
         debug_assert!(e.cb.is_some());
         e.target = target;
@@ -623,8 +628,12 @@ impl Equeue {
                     e.sibling_back.store(e.as_eptr(self));
 
                     // try to insert
-                    if !self.lock.lock(|| {
-                        if headsrc.load() == headptr {
+                    match self.lock.lock(|| {
+                        // this may seem seem like a weird place for this check, but
+                        // it's the only place we lock before re-enqueueing periodic events
+                        if e.info.load().canceled() {
+                            None
+                        } else if headsrc.load() == headptr {
                             headsrc.store_marked(headptr, e.as_marked_eptr(self));
                             if let Some(next) = headptr.as_ref(self) {
                                 next.next_back.store(e.as_eptr(self));
@@ -636,13 +645,15 @@ impl Equeue {
                                     .set_pending(true)
                                     .set_canceled(false)
                             );
-                            true
+                            Some(true)
                         } else {
                             // did someone already change our headsrc? restart
-                            false
+                            Some(false)
                         }
                     }) {
-                        continue 'retry;
+                        Some(true) => return Ok(id),
+                        Some(false) => continue 'retry,
+                        None => return Err(e),
                     }
                 }
                 Some(sibling) => {
@@ -652,8 +663,12 @@ impl Equeue {
                     e.sibling.store(sibling.as_eptr(self));
 
                     // try to push
-                    if !self.lock.lock(|| {
-                        if headsrc.load() == headptr {
+                    match self.lock.lock(|| {
+                        // this may seem seem like a weird place for this check, but
+                        // it's the only place we lock before re-enqueueing periodic events
+                        if e.info.load().canceled() {
+                            None
+                        } else if headsrc.load() == headptr {
                             // the real need for locking here is to make sure all of
                             // the back-references are correct atomically
                             let sibling_back = sibling.sibling_back.load()
@@ -669,21 +684,19 @@ impl Equeue {
                                     .set_pending(true)
                                     .set_canceled(false)
                             );
-                            true
+                            Some(true)
                         } else {
                             // did someone already change our headsrc? restart
-                            false
+                            Some(false)
                         }
                     }) {
-                        continue 'retry;
+                        Some(true) => return Ok(id),
+                        Some(false) => continue 'retry,
+                        None => return Err(e),
                     }
                 }
             }
-
-            break;
         }
-
-        id
     }
 
     fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
@@ -837,7 +850,7 @@ impl Equeue {
 
     // Central post function
     fn post(&self, e: &mut Ebuf, target: utick) -> Id {
-        let id = self.enqueue_ebuf(e, target);
+        let id = self.enqueue_ebuf(e, target).unwrap();
 
         // signal queue has changed
         self.sema.signal();
@@ -855,7 +868,6 @@ impl Equeue {
             // get a slice to dispatch
             let mut slice = self.dequeue_ebufs(now);
 
-            let mut count = 0;
             while let Some(e) = slice {
                 // last chance to cancel
                 self.lock.lock(|| {
@@ -876,20 +888,22 @@ impl Equeue {
 
                 // we now have exclusive access
                 let e = unsafe { e.claim() };
-                count += 1;
 
                 // dispatch!
                 e.cb.unwrap()(e.data_mut_ptr());
 
-                // TODO is this the best place for this? we can fail to cancel
-                // a periodic event if we aren't enqueued after checking for cancelation
-                if e.period >= 0 && !e.info.load().canceled() {
+                let e = if e.period >= 0 {
                     // reenqueue?
                     self.enqueue_ebuf(
                         e,
                         self.clock.now().wrapping_add(e.period as u64)
-                    );
+                    ).err()
                 } else {
+                    Some(e)
+                };
+
+                // release memory?
+                if let Some(e) = e { 
                     // call drop, return event to memory pool
                     if let Some(drop) = e.drop {
                         drop(e.data_mut_ptr());
