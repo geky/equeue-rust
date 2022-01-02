@@ -276,7 +276,7 @@ fn test_race_delay() {
 }
 
 #[test]
-fn test_race_cancel__() {
+fn test_race_cancel() {
     let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
@@ -319,7 +319,7 @@ fn test_race_cancel__() {
 
 #[test]
 fn test_race_cancel_enqueue() {
-    let mut buffer = vec![0; 1024*1024*1024]; // TODO reduce mem
+    let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
@@ -354,7 +354,7 @@ fn test_race_cancel_enqueue() {
 
 #[test]
 fn test_race_cancel_dispatch() {
-    let mut buffer = vec![0; 1024*1024*1024]; // TODO reduce mem
+    let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());
@@ -407,7 +407,7 @@ fn test_race_cancel_dispatch() {
 
 #[test]
 fn test_race_cancel_periodic() {
-    let mut buffer = vec![0; 1024*1024*1024]; // TODO reduce mem
+    let mut buffer = vec![0; 1024*1024];
     let q = Arc::new(Equeue::with_buffer(
         unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
     ).unwrap());

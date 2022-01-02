@@ -50,6 +50,7 @@ impl Clock for DefaultClock {
     }
 }
 
+
 // Atomic primitives
 
 // TODO actually adjust these based on target_width + feature flags
@@ -156,79 +157,8 @@ impl AtomicU for AtomicUeptr {
     }
 }
 
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct AtomicUgen(AtomicU16);
 
-impl AtomicU for AtomicUgen {
-    type U = ugen;
-
-    #[inline]
-    fn new(v: ugen) -> Self {
-        Self(AtomicU16::new(v))
-    }
-
-    /// Atomic load
-    #[inline]
-    fn load(&self) -> ugen {
-        self.0.load(atomic::Ordering::SeqCst)
-    }
-
-    /// Atomic store, must always be inside a critical section
-    #[inline]
-    fn store(&self, v: ugen) {
-        self.0.store(v, atomic::Ordering::SeqCst)
-    }
-}
-
-//#[derive(Debug)]
-//#[repr(transparent)]
-//pub(crate) struct Cas<T>(AtomicUsize, PhantomData<T>);
-//
-//impl<T> Cas<T> {
-//    pub fn new(t: T) -> Self {
-//        debug_assert_eq!(size_of::<T>(), size_of::<usize>());
-//        Self(
-//            AtomicUsize::new(unsafe { *(&t as *const _ as *const usize) }),
-//            PhantomData
-//        )
-//    }
-//
-//    /// Atomic load
-//    pub fn load(&self) -> T where T: Copy {
-//        unsafe { *(&self.0.load(atomic::Ordering::SeqCst) as *const _ as *const T) }
-//    }
-//
-//    /// Atomic compare-and-swap
-//    pub fn cas(&self, old: T, new: T) -> Result<T, T> where T: Copy {
-//        unsafe { 
-//            //*(&self.0.compare_exchange_weak(
-//            *(&self.0.compare_exchange(
-//                *(&old as *const _ as *const usize),
-//                *(&new as *const _ as *const usize),
-//                atomic::Ordering::SeqCst,
-//                atomic::Ordering::SeqCst
-//            ) as *const _ as *const Result<T, T>)
-//        }
-//    }
-//
-//    /// Non-atomic load iff we have exclusive access, we can
-//    /// leverage Rust's mut for this
-//    pub fn load_ex(&mut self) -> T where T: Copy {
-//        unsafe { *(&self.0.load(atomic::Ordering::Relaxed) as *const _ as *const T) }
-//    }
-//
-//    /// Non-atomic store iff we have exclusive access, we can
-//    /// leverage Rust's mut for this
-//    pub fn store_ex(&mut self, new: T) {
-//        self.0.store(
-//            unsafe { *(&new as *const _ as *const usize) },
-//            // atomic::Ordering::Relaxed TODO
-//            atomic::Ordering::SeqCst
-//        )
-//    }
-//}
-
+// Locking primitive
 pub(crate) trait Lock: Send + Sync + Debug {
     fn new() -> Self;
     fn lock<R, F: FnOnce()->R>(&self, f: F) -> R;
@@ -248,29 +178,8 @@ impl Lock for DefaultLock {
     }
 }
 
-//#[derive(Debug)]
-//pub(crate) struct DefaultLock(AtomicBool);
-//
-//impl Lock for DefaultLock {
-//    fn new() -> Self {
-//        DefaultLock(AtomicBool::new(false))
-//    }
-//
-//    fn lock<R, F: FnOnce() -> R>(&self, f: F) -> R {
-//        while !self.0.compare_exchange(
-//            false, 
-//            true,
-//            atomic::Ordering::Acquire,
-//            atomic::Ordering::Relaxed
-//        ).is_ok() {}
-//        let r = f();
-//        self.0.store(false, atomic::Ordering::Release);
-//        r
-//    }
-//}
 
-
-// Semaphore primitives
+// Semaphore primitive
 pub(crate) trait Sema: Send + Sync + Debug {
     fn new() -> Self;
     fn signal(&self);

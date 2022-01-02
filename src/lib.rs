@@ -231,6 +231,66 @@ impl<S: AtomicU> Atomic<MarkedEptr, S> {
     }
 }
 
+/// Several event fields are crammed in here to avoid wasting space
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct Einfo(ueptr);
+
+impl Debug for Einfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // these really need to be in hex to be readable
+        f.debug_tuple("Einfo")
+            .field(&format_args!("{:#x}", self.0))
+            .finish()
+    }
+}
+
+impl Einfo {
+    fn new(id: ugen, pending: bool, canceled: bool, npw2: u8) -> Einfo {
+        Einfo(
+            ((id as ueptr) << 8*size_of::<ugen>())
+            | ((pending as ueptr) << (8*size_of::<ugen>()-1))
+            | ((canceled as ueptr) << (8*size_of::<ugen>()-2))
+            | (npw2 as ueptr)
+        )
+    }
+
+    fn id(&self) -> ugen {
+        (self.0 >> 8*size_of::<ugen>()) as ugen
+    }
+
+    fn pending(&self) -> bool {
+        self.0 & (1 << (8*size_of::<ugen>()-1)) != 0
+    }
+
+    fn canceled(&self) -> bool {
+        self.0 & (1 << (8*size_of::<ugen>()-2)) != 0
+    }
+
+    fn npw2(&self) -> u8 {
+        (self.0 & ((1 << (8*size_of::<ugen>()-2)) - 1)) as u8
+    }
+
+    fn inc_id(self) -> Einfo {
+        Einfo(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
+    }
+
+    fn set_pending(self, pending: bool) -> Einfo {
+        if pending {
+            Einfo(self.0 | (1 << (8*size_of::<ugen>()-1)))
+        } else {
+            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-1)))
+        }
+    }
+
+    fn set_canceled(self, canceled: bool) -> Einfo {
+        if canceled {
+            Einfo(self.0 | (1 << (8*size_of::<ugen>()-2)))
+        } else {
+            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-2)))
+        }
+    }
+}
+
 /// Internal event header
 #[derive(Debug)]
 struct Ebuf {
@@ -238,8 +298,7 @@ struct Ebuf {
     next_back: Atomic<Eptr, AtomicUeptr>,
     sibling: Atomic<Eptr, AtomicUeptr>,
     sibling_back: Atomic<Eptr, AtomicUeptr>,
-    id: Atomic<ugen, AtomicUgen>,
-    npw2: u8,
+    info: Atomic<Einfo, AtomicUeptr>,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -269,13 +328,13 @@ impl Ebuf {
         MarkedEptr::from_ebuf(q, 0, self)
     }
 
-    fn size(&self) -> usize {
-        Ebuf::ALIGN << self.npw2
+    // info access
+    fn npw2(&self) -> u8 {
+        self.info.load().npw2()
     }
 
-    fn inc_id(&self) {
-        let id = self.id.load();
-        self.id.store(id.wrapping_add(1));
+    fn size(&self) -> usize {
+        Ebuf::ALIGN << self.npw2()
     }
 
     // access to the trailing buffer
@@ -478,8 +537,7 @@ impl Equeue {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                id: Atomic::new(0),
-                npw2: npw2,
+                info: Atomic::new(Einfo::new(0, false, false, npw2)),
 
                 cb: None,
                 drop: None,
@@ -495,10 +553,10 @@ impl Equeue {
         debug_assert!(self.contains_ebuf(e));
 
         // we can load buckets here because it can never shrink
-        let bucket = &self.buckets()[e.npw2 as usize];
+        let bucket = &self.buckets()[e.npw2() as usize];
 
         // give our event a new id
-        e.inc_id();
+        e.info.store(e.info.load().inc_id());
 
         // add our event to a bucket, while also incrementing our
         // generation count
@@ -546,7 +604,7 @@ impl Equeue {
                 headsrc = &head.next;
                 headptr = match head.next.load_marked(headptr) {
                     Ok(headptr) => headptr,
-                    Err(foundptr) => {
+                    Err(_) => {
                         // found a gen mismatch, most likely some changed
                         // happened to the data-structure which puts us into
                         // an unknown state, so we need to restart
@@ -568,6 +626,16 @@ impl Equeue {
                     if !self.lock.lock(|| {
                         if headsrc.load() == headptr {
                             headsrc.store_marked(headptr, e.as_marked_eptr(self));
+                            if let Some(next) = headptr.as_ref(self) {
+                                next.next_back.store(e.as_eptr(self));
+                            }
+
+                            // mark as pending here, enabling removals
+                            e.info.store(
+                                e.info.load()
+                                    .set_pending(true)
+                                    .set_canceled(false)
+                            );
                             true
                         } else {
                             // did someone already change our headsrc? restart
@@ -594,6 +662,13 @@ impl Equeue {
                             
                             sibling_back.sibling.store(e.as_eptr(self));
                             e.sibling_back.store(sibling_back.as_eptr(self));
+
+                            // mark as pending here, enabling removals
+                            e.info.store(
+                                e.info.load()
+                                    .set_pending(true)
+                                    .set_canceled(false)
+                            );
                             true
                         } else {
                             // did someone already change our headsrc? restart
@@ -648,7 +723,7 @@ impl Equeue {
                                 // canceled we're suddenly pointing to garbage, so we go ahead 
                                 // and mark the head as executing, since that's the very next
                                 // thing we're going to do
-                                head.inc_id();
+                                head.info.store(head.info.load().set_pending(false));
                                 dequeued = Some(head);
                             }
                             Some(dequeued) => {
@@ -677,6 +752,69 @@ impl Equeue {
         }
 
         dequeued
+    }
+
+    fn unqueue_ebuf<'a>(&'a self, id: Id) -> (bool, Option<&'a mut Ebuf>) {
+        // check to see if we need to bother locking
+        if !self.pending(id) {
+            return (false, None);
+        }
+
+        let e = id.as_ref(self);
+
+        self.lock.lock(|| {
+            // still the same event?
+            let info = e.info.load();
+            if info.id() != id.id {
+                return (false, None);
+            }
+            
+            // a bit different logic here, we can cancel periodic events, but
+            // we can't reclaim the memory if it's in the middle of executing
+            if info.pending() {
+                // we can disentangle the event here and reclaim the memory
+                let nextptr = e.next.load();
+                let next = nextptr.as_ref(self);
+                let next_back = e.next_back.load().as_ref(self);
+                let sibling = e.sibling.load().as_ref(self).unwrap();
+                let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
+
+                // we also need to remove from the queue if we are the head, and
+                // this needs to be done first to avoid invalidating traversals.
+                // we can't just point to queue here with next_back because eptrs
+                // are limited to in-slab events.
+                if self.queue.load().as_ptr(self) == e as *const _ {
+                    self.queue.store_marked(MarkedEptr::null(), nextptr);
+                }
+
+                // update next_back's next first to avoid invalidating traversals
+                if let Some(next_back) = next_back {
+                    next_back.next.store_marked(next_back.next.load(), nextptr);
+                }
+                if let Some(next) = next {
+                    next.next_back.store(next_back.as_eptr(self));
+                }
+                sibling_back.sibling.store(sibling.as_eptr(self));
+                sibling.sibling_back.store(sibling_back.as_eptr(self));
+
+                // mark as removed
+                e.next.store_inc_marked(nextptr, MarkedEptr::null());
+                // mark as not-pending
+                e.info.store(e.info.load().set_pending(false));
+                
+                // note we are responsible for the memory now
+                let e = unsafe { e.claim() };
+
+                (true, Some(e))
+            } else if e.period >= 0 {
+                // if we're periodic and currently executing best we can do is
+                // mark the event so it isn't re-enqueued
+                e.info.store(info.set_canceled(true));
+                (true, None)
+            } else {
+                (false, None)
+            }
+        })
     }
 
     // find time until next event without locking
@@ -721,18 +859,15 @@ impl Equeue {
             while let Some(e) = slice {
                 // last chance to cancel
                 self.lock.lock(|| {
-                    // TODO more strict incrementing of id? we increment way too
-                    // many times (3!)
-
-                    // mark the event as executing
-                    e.inc_id();
-
                     // remove from sibling list
                     let sibling = e.sibling.load().as_ref(self).unwrap();
                     let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
                     if sibling as *const _ == e as *const _ {
                         slice = None;
                     } else {
+                        // mark the next event as executing
+                        sibling.info.store(sibling.info.load().set_pending(false));
+
                         sibling.sibling_back.store(sibling_back.as_eptr(self));
                         sibling_back.sibling.store(sibling.as_eptr(self));
                         slice = Some(sibling);
@@ -746,7 +881,9 @@ impl Equeue {
                 // dispatch!
                 e.cb.unwrap()(e.data_mut_ptr());
 
-                if e.period >= 0 {
+                // TODO is this the best place for this? we can fail to cancel
+                // a periodic event if we aren't enqueued after checking for cancelation
+                if e.period >= 0 && !e.info.load().canceled() {
                     // reenqueue?
                     self.enqueue_ebuf(
                         e,
@@ -792,9 +929,33 @@ impl Equeue {
         }
     }
 
+    // Is the event pending?
+    pub fn pending(&self, id: Id) -> bool {
+        let e = id.as_ref(self);
+        if !self.contains_ebuf(e) {
+            return false;
+        }
+
+        // note that periodic events are always pending, we load period
+        // first since it is not necessarily atomic
+        let period = e.period;
+        let info = e.info.load();
+        info.id() == id.id && (info.pending() || period >= 0)
+    }
+
     // Central cancel function
     pub fn cancel(&self, id: Id) -> bool {
-        todo!()
+        let (canceled, e) = self.unqueue_ebuf(id);
+
+        if let Some(e) = e {
+            // make sure to clean up memory
+            if let Some(drop) = e.drop {
+                drop(e.data_mut_ptr());
+            }
+            self.dealloc_ebuf(e);
+        }
+
+        canceled
     }
 
     // Handling of raw allocations
@@ -888,9 +1049,13 @@ impl Debug for Id {
 impl Id {
     fn from_ebuf(q: &Equeue, e: &mut Ebuf) -> Id {
         Id {
-            id: e.id.load(),
+            id: e.info.load().id(),
             eptr: unsafe { NonZeroUeptr::new_unchecked(e.as_eptr(q).0) }
         }
+    }
+
+    fn as_ref<'a>(&self, q: &'a Equeue) -> &'a Ebuf {
+        Eptr(self.eptr.get()).as_ref(q).unwrap()
     }
 }
 
