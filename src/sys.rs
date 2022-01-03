@@ -54,13 +54,13 @@ impl Clock for DefaultClock {
 // Atomic primitives
 
 // TODO actually adjust these based on target_width + feature flags
-/// The atomic unit used in equeue
+/// The atomic double-word unit used in equeue
 #[allow(non_camel_case_types)]
-pub(crate) type uatom = u64;
+pub(crate) type udeptr = u64;
 #[allow(non_camel_case_types)]
-pub(crate) type iatom = i64;
+pub(crate) type ideptr = i64;
 
-/// Integer that fits an in-slab equeue pointer, should be 1/2 of a uatom
+/// Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
 #[allow(non_camel_case_types)]
 pub(crate) type ueptr = u32;
 #[allow(non_camel_case_types)]
@@ -68,7 +68,7 @@ pub(crate) type ieptr = i32;
 
 pub(crate) type NonZeroUeptr = NonZeroU32;
 
-/// Integer that fits a pointer generation count, should be 1/4 of a uatom
+/// Integer that fits a pointer generation count, should be 1/4 of a udeptr
 #[allow(non_camel_case_types)]
 pub(crate) type ugen = u16;
 #[allow(non_camel_case_types)]
@@ -109,25 +109,25 @@ impl AtomicU for AtomicUsize {
 
 #[derive(Debug)]
 #[repr(transparent)]
-pub(crate) struct AtomicUatom(AtomicU64);
+pub(crate) struct AtomicUdeptr(AtomicU64);
 
-impl AtomicU for AtomicUatom {
-    type U = uatom;
+impl AtomicU for AtomicUdeptr {
+    type U = udeptr;
 
     #[inline]
-    fn new(v: uatom) -> Self {
+    fn new(v: udeptr) -> Self {
         Self(AtomicU64::new(v))
     }
 
     /// Atomic load
     #[inline]
-    fn load(&self) -> uatom {
+    fn load(&self) -> udeptr {
         self.0.load(atomic::Ordering::SeqCst)
     }
 
     /// Atomic store, must always be inside a critical section
     #[inline]
-    fn store(&self, v: uatom) {
+    fn store(&self, v: udeptr) {
         self.0.store(v, atomic::Ordering::SeqCst)
     }
 }

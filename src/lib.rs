@@ -53,7 +53,7 @@ impl fmt::Display for Error {
 }
 
 
-/// Small wrapper to generalize atomics to any <= uatom sized type
+/// Small wrapper to generalize atomics to any <= udeptr sized type
 #[repr(transparent)]
 struct Atomic<T, S: AtomicU>(S, PhantomData<T>);
 
@@ -294,7 +294,7 @@ impl Einfo {
 /// Internal event header
 #[derive(Debug)]
 struct Ebuf {
-    next: Atomic<MarkedEptr, AtomicUatom>,
+    next: Atomic<MarkedEptr, AtomicUdeptr>,
     next_back: Atomic<Eptr, AtomicUeptr>,
     sibling: Atomic<Eptr, AtomicUeptr>,
     sibling_back: Atomic<Eptr, AtomicUeptr>,
@@ -394,7 +394,7 @@ pub struct Equeue {
     slab_back: Atomic<usize, AtomicUsize>,
 
     // queue management
-    queue: Atomic<MarkedEptr, AtomicUatom>,
+    queue: Atomic<MarkedEptr, AtomicUdeptr>,
 
     // other things
     clock: DefaultClock,
