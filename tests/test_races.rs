@@ -27,7 +27,7 @@ fn test_race_alloc_unique() {
         let set = set.clone();
         threads.push(thread::spawn(move || {
             let mut es = vec![];
-            let layout = Layout::from_size_align(10, 1).unwrap();
+            let layout = Layout::from_size_align(4, 1).unwrap();
             for _ in 0..100 {
                 let e = unsafe { q.alloc_raw(layout) };
                 assert!(!e.is_null());

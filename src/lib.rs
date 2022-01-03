@@ -108,7 +108,7 @@ impl Eptr {
             ((e as *const Ebuf as *const u8)
                 .offset_from(q.slab.as_ptr())
                 as usize
-                / Ebuf::ALIGN)
+                / align_of::<Ebuf>())
                 as ueptr
         })
     }
@@ -117,7 +117,7 @@ impl Eptr {
         match self.0 {
             0 => ptr::null(),
             _ => (
-                &q.slab[self.0 as usize * Ebuf::ALIGN]
+                &q.slab[self.0 as usize * align_of::<Ebuf>()]
                     as *const _ as *const Ebuf
             )
         }
@@ -307,19 +307,6 @@ struct Ebuf {
 }
 
 impl Ebuf {
-    // maximum alignment of internal allocations, this must be larger than
-    // Eptr's alignment, and pointer alignment is a common alignment
-    //
-    // TODO should these take advantage of the npw2(event size) to be compressed
-    // even further?
-    //
-    const ALIGN: usize = {
-        let mut align = align_of::<Ebuf>();
-        if align_of::<Eptr>() > align { align = align_of::<Eptr>() }
-        if align_of::<*const ()>() > align { align = align_of::<*const ()>() }
-        align
-    };
-
     fn as_eptr(&self, q: &Equeue) -> Eptr {
         Eptr::from_ebuf(q, self)
     }
@@ -334,7 +321,7 @@ impl Ebuf {
     }
 
     fn size(&self) -> usize {
-        Ebuf::ALIGN << self.npw2()
+        align_of::<Ebuf>() << self.npw2()
     }
 
     // access to the trailing buffer
@@ -409,7 +396,7 @@ unsafe impl Sync for Equeue {}
 impl Equeue {
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
         // align buffer
-        let align = alignup(buffer.as_ptr() as usize, Ebuf::ALIGN)
+        let align = alignup(buffer.as_ptr() as usize, align_of::<Ebuf>())
             - buffer.as_ptr() as usize;
         let buffer = match buffer.get_mut(align..) {
             // already out of memory?
@@ -455,10 +442,15 @@ impl Equeue {
 
     // Memory management
     fn alloc_ebuf<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
-        assert!(layout.align() <= Ebuf::ALIGN);
+        // this looks arbitrary, but Ebuf should have a pretty reasonable
+        // alignment since it contains both function pointers and AtomicUdeptrs
+        assert!(layout.align() <= align_of::<Ebuf>());
 
         // find best bucket
-        let npw2 = npw2((layout.size()+Ebuf::ALIGN-1) / Ebuf::ALIGN);
+        let npw2 = npw2(
+            alignup(layout.size(), align_of::<Ebuf>())
+                / align_of::<Ebuf>()
+        );
 
         // do we have an allocation in our buckets? we don't look
         // at larger buckets because those are likely to be reused, we don't
@@ -497,9 +489,9 @@ impl Equeue {
             );
             let new_slab_back = aligndown(
                 slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
+                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
                 ),
-                Ebuf::ALIGN
+                align_of::<Ebuf>()
             );
 
             if new_slab_front > new_slab_back {
@@ -1290,10 +1282,7 @@ impl Equeue {
             let e = unsafe { &*(p as *const Ebuf) };
 
             total += 1;
-            p = p.wrapping_add(alignup(
-                size_of::<Ebuf>() + e.size(),
-                Ebuf::ALIGN
-            ))
+            p = p.wrapping_add(size_of::<Ebuf>() + e.size());
         }
 
         // find pending usage
@@ -1337,7 +1326,7 @@ impl Equeue {
                 |head| head.sibling.load().as_ref(self)
             ) {
                 free += 1;
-                free_bytes += size_of::<Ebuf>() + (Ebuf::ALIGN << npw2);
+                free_bytes += size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2);
 
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
