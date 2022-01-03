@@ -556,9 +556,10 @@ impl Equeue {
         let bucket = &self.buckets()[e.npw2() as usize];
 
         // give our event a new id
+        let info = e.info.load();
+        debug_assert!(!info.pending());
         e.info.store(
-            e.info.load()
-                .inc_id()
+            info.inc_id()
                 .set_pending(false)
                 .set_canceled(false)
         );
@@ -668,7 +669,7 @@ impl Equeue {
                         // it's the only place we lock before re-enqueueing periodic events
                         if e.info.load().canceled() {
                             None
-                        } else if headsrc.load() == headptr {
+                        } else if headsrc.load() == headptr && sibling.next.load_marked(headptr).is_ok() {
                             // the real need for locking here is to make sure all of
                             // the back-references are correct atomically
                             let sibling_back = sibling.sibling_back.load()
@@ -791,22 +792,49 @@ impl Equeue {
                 let next_back = e.next_back.load().as_ref(self);
                 let sibling = e.sibling.load().as_ref(self).unwrap();
                 let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
+                // we also need to remove the queue if we are the head, we can't
+                // just point to queue here with next_back because eptrs are
+                // limited to in-slab events
+                let headptr = self.queue.load();
 
-                // we also need to remove from the queue if we are the head, and
-                // this needs to be done first to avoid invalidating traversals.
-                // we can't just point to queue here with next_back because eptrs
-                // are limited to in-slab events.
-                if self.queue.load().as_ptr(self) == e as *const _ {
-                    self.queue.store_marked(MarkedEptr::null(), nextptr);
+                if next_back.is_some() || headptr.as_ptr(self) == e as *const _ {
+                    if sibling as *const _ == e as *const _ {
+                        // just remove the slice
+
+                        // update next_back's next/queue head first to avoid invalidating traversals
+                        if headptr.as_ptr(self) == e as *const _ {
+                            self.queue.store_marked(MarkedEptr::null(), nextptr);
+                        }
+                        if let Some(next_back) = next_back {
+                            next_back.next.store_marked(next_back.next.load(), nextptr);
+                        }
+                        if let Some(next) = next {
+                            next.next_back.store(next_back.as_eptr(self));
+                        }
+                    } else {
+                        // remove from siblings
+
+                        // we need this claim here to notate that it's safe to create
+                        // a markedptr from sibling, this loads the generation count from
+                        // the sibling's next pointer, which could be a race condition
+                        // if we aren't locked
+                        let sibling = unsafe { sibling.claim() };
+                        sibling.next.store_marked(sibling.next.load(), nextptr);
+                        sibling.next_back.store(next_back.as_eptr(self));
+
+                        // update next_back's next/queue head first to avoid invalidating traversals
+                        if headptr.as_ptr(self) == e as *const _ {
+                            self.queue.store_marked(MarkedEptr::null(), sibling.as_marked_eptr(self));
+                        }
+                        if let Some(next_back) = next_back {
+                            next_back.next.store_marked(next_back.next.load(), sibling.as_marked_eptr(self));
+                        }
+                        if let Some(next) = next {
+                            next.next_back.store(sibling.as_eptr(self));
+                        }
+                    }
                 }
 
-                // update next_back's next first to avoid invalidating traversals
-                if let Some(next_back) = next_back {
-                    next_back.next.store_marked(next_back.next.load(), nextptr);
-                }
-                if let Some(next) = next {
-                    next.next_back.store(next_back.as_eptr(self));
-                }
                 sibling_back.sibling.store(sibling.as_eptr(self));
                 sibling.sibling_back.store(sibling_back.as_eptr(self));
 
