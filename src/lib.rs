@@ -394,6 +394,31 @@ unsafe impl Send for Equeue {}
 unsafe impl Sync for Equeue {}
 
 impl Equeue {
+    /// Number of bits of precision to use for scheduling events, this is limits
+    /// the number of significant digits used in long-term events in order to
+    /// create better bucketing and power consumption
+    ///
+    /// So if you needed to schedule an event in 20 minutes, aka 1200000
+    /// milliseconds, aka 0b000100100100111110000000 if equeue is running
+    /// with a millisecond-based clock:
+    ///
+    /// 000100100100111110000000
+    /// 000100000000000000000000 => 1-bit of precision => ~20-37.48 minutes
+    /// 000110000000000000000000 => 2-bits of precision => ~20-28.74 minutes
+    /// 000111100000000000000000 => 4-bits of precision => ~20-22.18 minutes
+    /// 000111111110000000000000 => 8-bits of precision => ~20-20.14 minutes
+    /// 000111111111111111100000 => 16-bits of precision => ~20-20.00052 minutes
+    /// 000111111111111111111111 => 32-bits of precision => ~20 minutes
+    ///
+    /// This probably deserves more analysis, but some handwavey theorized
+    /// runtimes:
+    ///
+    /// - precision = n   => O(n)
+    /// - precision = n/2 => O(sqrt(n))
+    /// - precision = 1   => O(log(n))
+    ///
+    const PRECISION: u8 = 6;
+
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
         // align buffer
         let align = alignup(buffer.as_ptr() as usize, align_of::<Ebuf>())
@@ -423,6 +448,22 @@ impl Equeue {
 
     pub fn now(&self) -> utick {
         self.clock.now()
+    }
+
+    fn imprecise_add(&self, a: utick, b: itick) -> utick {
+        // In order to limit precision (which leads to more efficient data
+        // structures and fewer wakeups/power consumption), we round up to
+        // latest deadline in the configured precision. This just means
+        // oring any bits lower than the precision with 1.
+        //
+        // Note that this always ensures a later deadline.
+        let mask = (1 << (
+            (8*size_of::<utick>() as u8).saturating_sub(
+                b.leading_zeros() as u8 + Equeue::PRECISION
+            )
+        )) - 1;
+
+        a.wrapping_add(b as utick) | mask
     }
 
     fn contains_ebuf(&self, e: &Ebuf) -> bool {
@@ -882,7 +923,7 @@ impl Equeue {
     pub fn dispatch(&self, ticks: itick) {
         // get the current time
         let mut now = self.clock.now();
-        let timeout = now.wrapping_add(ticks as u64);
+        let timeout = now.wrapping_add(ticks as utick);
 
         loop {
             // get a slice to dispatch
@@ -916,7 +957,7 @@ impl Equeue {
                     // reenqueue?
                     self.enqueue_ebuf(
                         e,
-                        self.clock.now().wrapping_add(e.period as u64)
+                        self.imprecise_add(self.clock.now(), e.period)
                     ).err()
                 } else {
                     Some(e)
@@ -1046,7 +1087,7 @@ impl Equeue {
         debug_assert!(self.contains_raw(e));
         let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.cb = Some(cb);
-        self.post(e, self.clock.now().wrapping_add(e.target))
+        self.post(e, self.imprecise_add(self.clock.now(), e.target as itick))
     }
 }
 
@@ -1168,7 +1209,7 @@ impl<T: Post> Event<'_, T> {
 
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        let id = self.q.post(self.e, self.q.now().wrapping_add(self.e.target));
+        let id = self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
         forget(self);
 
         id

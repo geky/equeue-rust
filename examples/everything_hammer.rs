@@ -70,9 +70,9 @@ fn main() {
                 // so it showcases the grouping a bit nicer, when scaled, grouping is lost,
                 // because events rarely share a timeslice
                 let delay = rng.gen_range(0..max(2000*opt.scale/1000_000, 10));
-                let now = q.now();
-                let gran = max((2000*opt.scale/1000_000) / opt.width as u64, 1);
-                let delay = (((delay+now+gran-1)/gran)*gran) - now;
+                //let now = q.now();
+                //let gran = max((2000*opt.scale/1000_000) / opt.width as u64, 1);
+                //let delay = (((delay+now+gran-1)/gran)*gran) - now;
                 unsafe { q.set_raw_delay(e, delay as i64) };
 
                 let id = unsafe { q.post_raw(cb, e) };
