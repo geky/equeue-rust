@@ -57,7 +57,6 @@ fn main() {
     // and now, in our main thread, lets render something nice looking
     println!();
 
-    let mut bucket_max = 1;
     loop {
         let usage = q.usage();
         let mut buckets = vec![0; usage.buckets];
@@ -65,10 +64,6 @@ fn main() {
 
         let mut used_buckets = 0;
         for &bucket in buckets.iter() {
-            if bucket > bucket_max {
-                bucket_max = bucket
-            }
-
             if bucket != 0 {
                 used_buckets += 1;
             }
@@ -77,16 +72,17 @@ fn main() {
         // render this thing
         let print_buckets = |row: usize| {
             for &bucket in buckets.iter().take((opt.width-2)/2) {
-                let bucket_dots = 2*3*bucket;
-                let bucket_dots = (bucket_dots + bucket_max-1) / bucket_max;
-                for _ in 0..2 {
-                    if bucket_dots > 2*row+1 {
-                        print!(":");
-                    } else if bucket_dots > 2*row {
-                        print!(".");
-                    } else {
-                        print!(" ");
-                    }
+                let bucket_dots = bucket;
+                if bucket_dots > 4*row+3 {
+                    print!("::");
+                } else if bucket_dots > 4*row+2 {
+                    print!(":.");
+                } else if bucket_dots > 4*row+1 {
+                    print!("..");
+                } else if bucket_dots > 4*row {
+                    print!(". ");
+                } else {
+                    print!("  ");
                 }
             }
 
