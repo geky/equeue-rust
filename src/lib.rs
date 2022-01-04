@@ -231,6 +231,7 @@ impl<S: AtomicU> Atomic<MarkedEptr, S> {
     }
 }
 
+
 /// Several event fields are crammed in here to avoid wasting space
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct Einfo(ueptr);
@@ -244,12 +245,37 @@ impl Debug for Einfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Estatus {
+    InFlight,
+    Pending,
+    Canceled,
+}
+
+impl Estatus {
+    fn from(status: u8) -> Estatus {
+        match status {
+            0 => Estatus::InFlight,
+            1 => Estatus::Pending,
+            2 => Estatus::Canceled,
+            _ => unreachable!(),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            Estatus::InFlight => 0,
+            Estatus::Pending  => 1,
+            Estatus::Canceled => 2,
+        }
+    }
+}
+
 impl Einfo {
-    fn new(id: ugen, pending: bool, canceled: bool, npw2: u8) -> Einfo {
+    fn new(id: ugen, status: Estatus, npw2: u8) -> Einfo {
         Einfo(
             ((id as ueptr) << 8*size_of::<ugen>())
-            | ((pending as ueptr) << (8*size_of::<ugen>()-1))
-            | ((canceled as ueptr) << (8*size_of::<ugen>()-2))
+            | ((status.as_u8() as ueptr) << (8*size_of::<ugen>()-2))
             | (npw2 as ueptr)
         )
     }
@@ -258,12 +284,8 @@ impl Einfo {
         (self.0 >> 8*size_of::<ugen>()) as ugen
     }
 
-    fn pending(&self) -> bool {
-        self.0 & (1 << (8*size_of::<ugen>()-1)) != 0
-    }
-
-    fn canceled(&self) -> bool {
-        self.0 & (1 << (8*size_of::<ugen>()-2)) != 0
+    fn status(&self) -> Estatus {
+        Estatus::from(0x3 & (self.0 >> (8*size_of::<ugen>()-2)) as u8)
     }
 
     fn npw2(&self) -> u8 {
@@ -274,20 +296,11 @@ impl Einfo {
         Einfo(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
     }
 
-    fn set_pending(self, pending: bool) -> Einfo {
-        if pending {
-            Einfo(self.0 | (1 << (8*size_of::<ugen>()-1)))
-        } else {
-            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-1)))
-        }
-    }
-
-    fn set_canceled(self, canceled: bool) -> Einfo {
-        if canceled {
-            Einfo(self.0 | (1 << (8*size_of::<ugen>()-2)))
-        } else {
-            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-2)))
-        }
+    fn set_status(self, status: Estatus) -> Einfo {
+        Einfo(
+            (self.0 & !(0x3 << (8*size_of::<ugen>()-2)))
+            | ((status.as_u8() as ueptr) << (8*size_of::<ugen>()-2))
+        )
     }
 }
 
@@ -519,7 +532,7 @@ impl Equeue {
             }
         }
 
-        let new_slab_back = loop {
+        let new_slab_back = match self.lock.lock(|| {
             // check if we even have enough memory available, we allocate both
             // an event and maybe some buckets if we don't have enough
             let slab_front = self.slab_front.load();
@@ -539,27 +552,18 @@ impl Equeue {
                 return Err(Error::NoMem);
             }
 
-            // try to actually commit our allocation, if slab_front/slab_back
-            // changed already, we just try again, someone should be making
-            // progress if that happens
-            if self.lock.lock(|| {
-                if self.slab_front.load() == slab_front
-                    && self.slab_back.load() == slab_back
-                {
-                    if new_slab_front > slab_front {
-                        self.slab_front.store(new_slab_front);
-                    }
-
-                    debug_assert!(new_slab_back < slab_back);
-                    self.slab_back.store(new_slab_back);
-
-                    true
-                } else {
-                    false
-                }
-            }) {
-                break new_slab_back;
+            // actually commit our allocation
+            if new_slab_front > slab_front {
+                self.slab_front.store(new_slab_front);
             }
+
+            debug_assert!(new_slab_back < slab_back);
+            self.slab_back.store(new_slab_back);
+
+            Ok(new_slab_back)
+        }) {
+            Ok(new_slab_back) => new_slab_back,
+            Err(err) => return Err(err),
         };
 
         unsafe {
@@ -570,7 +574,7 @@ impl Equeue {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Einfo::new(0, false, false, npw2)),
+                info: Atomic::new(Einfo::new(0, Estatus::InFlight, npw2)),
 
                 cb: None,
                 drop: None,
@@ -590,11 +594,10 @@ impl Equeue {
 
         // give our event a new id
         let info = e.info.load();
-        debug_assert!(!info.pending());
+        debug_assert_ne!(info.status(), Estatus::Pending);
         e.info.store(
             info.inc_id()
-                .set_pending(false)
-                .set_canceled(false)
+                .set_status(Estatus::InFlight)
         );
 
         // add our event to a bucket, while also incrementing our
@@ -652,8 +655,9 @@ impl Equeue {
                 };
             }
 
+
             // found our insertion point, now lets try to insert
-            match sibling {
+            match match sibling {
                 None => {
                     // insert a new slice
                     e.next.store_marked(e.next.load(), headptr);
@@ -662,33 +666,34 @@ impl Equeue {
                     e.sibling_back.store(e.as_eptr(self));
 
                     // try to insert
-                    match self.lock.lock(|| {
+                    self.lock.lock(|| {
+                        // are we trying to enqueue an event that's already been canceled?
+                        //
                         // this may seem seem like a weird place for this check, but
                         // it's the only place we lock before re-enqueueing periodic events
-                        if e.info.load().canceled() {
-                            None
-                        } else if headsrc.load() == headptr {
-                            headsrc.store_marked(headptr, e.as_marked_eptr(self));
-                            if let Some(next) = headptr.as_ref(self) {
-                                next.next_back.store(e.as_eptr(self));
-                            }
-
-                            // mark as pending here, enabling removals
-                            e.info.store(
-                                e.info.load()
-                                    .set_pending(true)
-                                    .set_canceled(false)
-                            );
-                            Some(true)
-                        } else {
-                            // did someone already change our headsrc? restart
-                            Some(false)
+                        match e.info.load().status() {
+                            Estatus::InFlight => {},
+                            Estatus::Pending => unreachable!(),
+                            Estatus::Canceled => return None,
                         }
-                    }) {
-                        Some(true) => return Ok(id),
-                        Some(false) => continue 'retry,
-                        None => return Err(e),
-                    }
+
+                        // did someone already change our headsrc? restart
+                        if headsrc.load() != headptr {
+                            return Some(false);
+                        }
+
+                        headsrc.store_marked(headptr, e.as_marked_eptr(self));
+                        if let Some(next) = headptr.as_ref(self) {
+                            next.next_back.store(e.as_eptr(self));
+                        }
+
+                        // mark as pending here, enabling removals
+                        e.info.store(
+                            e.info.load()
+                                .set_status(Estatus::Pending)
+                        );
+                        Some(true)
+                    })
                 }
                 Some(sibling) => {
                     // push onto existing slice
@@ -697,38 +702,43 @@ impl Equeue {
                     e.sibling.store(sibling.as_eptr(self));
 
                     // try to push
-                    match self.lock.lock(|| {
+                    self.lock.lock(|| {
+                        // are we trying to enqueue an event that's already been canceled?
+                        //
                         // this may seem seem like a weird place for this check, but
                         // it's the only place we lock before re-enqueueing periodic events
-                        if e.info.load().canceled() {
-                            None
-                        } else if headsrc.load() == headptr && sibling.next.load_marked(headptr).is_ok() {
-                            // the real need for locking here is to make sure all of
-                            // the back-references are correct atomically
-                            let sibling_back = sibling.sibling_back.load()
-                                .as_ref(self).unwrap();
-                            sibling.sibling_back.store(e.as_eptr(self));
-                            
-                            sibling_back.sibling.store(e.as_eptr(self));
-                            e.sibling_back.store(sibling_back.as_eptr(self));
-
-                            // mark as pending here, enabling removals
-                            e.info.store(
-                                e.info.load()
-                                    .set_pending(true)
-                                    .set_canceled(false)
-                            );
-                            Some(true)
-                        } else {
-                            // did someone already change our headsrc? restart
-                            Some(false)
+                        match e.info.load().status() {
+                            Estatus::InFlight => {},
+                            Estatus::Pending => unreachable!(),
+                            Estatus::Canceled => return None,
                         }
-                    }) {
-                        Some(true) => return Ok(id),
-                        Some(false) => continue 'retry,
-                        None => return Err(e),
-                    }
+
+                        // did someone already change our headsrc? restart
+                        if headsrc.load() != headptr {
+                            return Some(false);
+                        }
+
+                        // the real need for locking here is to make sure all of
+                        // the back-references are correct atomically
+                        let sibling_back = sibling.sibling_back.load()
+                            .as_ref(self).unwrap();
+                        sibling.sibling_back.store(e.as_eptr(self));
+                        
+                        sibling_back.sibling.store(e.as_eptr(self));
+                        e.sibling_back.store(sibling_back.as_eptr(self));
+
+                        // mark as pending here, enabling removals
+                        e.info.store(
+                            e.info.load()
+                                .set_status(Estatus::Pending)
+                        );
+                        Some(true)
+                    })
                 }
+            } {
+                Some(true) => return Ok(id),
+                Some(false) => continue 'retry,
+                None => return Err(e),
             }
         }
     }
@@ -770,7 +780,7 @@ impl Equeue {
                                 // canceled we're suddenly pointing to garbage, so we go ahead 
                                 // and mark the head as executing, since that's the very next
                                 // thing we're going to do
-                                head.info.store(head.info.load().set_pending(false));
+                                head.info.store(head.info.load().set_status(Estatus::InFlight));
                                 dequeued = Some(head);
                             }
                             Some(dequeued) => {
@@ -818,75 +828,79 @@ impl Equeue {
             
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
-            if info.pending() {
-                // we can disentangle the event here and reclaim the memory
-                let nextptr = e.next.load();
-                let next = nextptr.as_ref(self);
-                let next_back = e.next_back.load().as_ref(self);
-                let sibling = e.sibling.load().as_ref(self).unwrap();
-                let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
-                // we also need to remove the queue if we are the head, we can't
-                // just point to queue here with next_back because eptrs are
-                // limited to in-slab events
-                let headptr = self.queue.load();
+            match info.status() {
+                Estatus::Pending => {
+                    // we can disentangle the event here and reclaim the memory
+                    let nextptr = e.next.load();
+                    let next = nextptr.as_ref(self);
+                    let next_back = e.next_back.load().as_ref(self);
+                    let sibling = e.sibling.load().as_ref(self).unwrap();
+                    let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
+                    // we also need to remove the queue if we are the head, we can't
+                    // just point to queue here with next_back because eptrs are
+                    // limited to in-slab events
+                    let headptr = self.queue.load();
 
-                if next_back.is_some() || headptr.as_ptr(self) == e as *const _ {
-                    if sibling as *const _ == e as *const _ {
-                        // just remove the slice
+                    if next_back.is_some() || headptr.as_ptr(self) == e as *const _ {
+                        if sibling as *const _ == e as *const _ {
+                            // just remove the slice
 
-                        // update next_back's next/queue head first to avoid invalidating traversals
-                        if headptr.as_ptr(self) == e as *const _ {
-                            self.queue.store_marked(MarkedEptr::null(), nextptr);
-                        }
-                        if let Some(next_back) = next_back {
-                            next_back.next.store_marked(next_back.next.load(), nextptr);
-                        }
-                        if let Some(next) = next {
-                            next.next_back.store(next_back.as_eptr(self));
-                        }
-                    } else {
-                        // remove from siblings
+                            // update next_back's next/queue head first to avoid invalidating traversals
+                            if headptr.as_ptr(self) == e as *const _ {
+                                self.queue.store_marked(MarkedEptr::null(), nextptr);
+                            }
+                            if let Some(next_back) = next_back {
+                                next_back.next.store_marked(next_back.next.load(), nextptr);
+                            }
+                            if let Some(next) = next {
+                                next.next_back.store(next_back.as_eptr(self));
+                            }
+                        } else {
+                            // remove from siblings
 
-                        // we need this claim here to notate that it's safe to create
-                        // a markedptr from sibling, this loads the generation count from
-                        // the sibling's next pointer, which could be a race condition
-                        // if we aren't locked
-                        let sibling = unsafe { sibling.claim() };
-                        sibling.next.store_marked(sibling.next.load(), nextptr);
-                        sibling.next_back.store(next_back.as_eptr(self));
+                            // we need this claim here to notate that it's safe to create
+                            // a markedptr from sibling, this loads the generation count from
+                            // the sibling's next pointer, which could be a race condition
+                            // if we aren't locked
+                            let sibling = unsafe { sibling.claim() };
+                            sibling.next.store_marked(sibling.next.load(), nextptr);
+                            sibling.next_back.store(next_back.as_eptr(self));
 
-                        // update next_back's next/queue head first to avoid invalidating traversals
-                        if headptr.as_ptr(self) == e as *const _ {
-                            self.queue.store_marked(MarkedEptr::null(), sibling.as_marked_eptr(self));
-                        }
-                        if let Some(next_back) = next_back {
-                            next_back.next.store_marked(next_back.next.load(), sibling.as_marked_eptr(self));
-                        }
-                        if let Some(next) = next {
-                            next.next_back.store(sibling.as_eptr(self));
+                            // update next_back's next/queue head first to avoid invalidating traversals
+                            if headptr.as_ptr(self) == e as *const _ {
+                                self.queue.store_marked(MarkedEptr::null(), sibling.as_marked_eptr(self));
+                            }
+                            if let Some(next_back) = next_back {
+                                next_back.next.store_marked(next_back.next.load(), sibling.as_marked_eptr(self));
+                            }
+                            if let Some(next) = next {
+                                next.next_back.store(sibling.as_eptr(self));
+                            }
                         }
                     }
+
+                    sibling_back.sibling.store(sibling.as_eptr(self));
+                    sibling.sibling_back.store(sibling_back.as_eptr(self));
+
+                    // mark as removed
+                    e.next.store_inc_marked(nextptr, MarkedEptr::null());
+                    // mark as not-pending
+                    e.info.store(e.info.load().set_status(Estatus::InFlight));
+                    
+                    // note we are responsible for the memory now
+                    let e = unsafe { e.claim() };
+
+                    (true, Some(e))
                 }
-
-                sibling_back.sibling.store(sibling.as_eptr(self));
-                sibling.sibling_back.store(sibling_back.as_eptr(self));
-
-                // mark as removed
-                e.next.store_inc_marked(nextptr, MarkedEptr::null());
-                // mark as not-pending
-                e.info.store(e.info.load().set_pending(false));
-                
-                // note we are responsible for the memory now
-                let e = unsafe { e.claim() };
-
-                (true, Some(e))
-            } else if e.period >= 0 {
-                // if we're periodic and currently executing best we can do is
-                // mark the event so it isn't re-enqueued
-                e.info.store(info.set_canceled(true));
-                (true, None)
-            } else {
-                (false, None)
+                Estatus::InFlight if e.period >= 0 => {
+                    // if we're periodic and currently executing best we can do is
+                    // mark the event so it isn't re-enqueued
+                    e.info.store(info.set_status(Estatus::Canceled));
+                    (true, None)
+                }
+                _ => {
+                    (false, None)
+                }
             }
         })
     }
@@ -939,7 +953,7 @@ impl Equeue {
                         slice = None;
                     } else {
                         // mark the next event as executing
-                        sibling.info.store(sibling.info.load().set_pending(false));
+                        sibling.info.store(sibling.info.load().set_status(Estatus::InFlight));
 
                         sibling.sibling_back.store(sibling_back.as_eptr(self));
                         sibling_back.sibling.store(sibling.as_eptr(self));
@@ -1015,7 +1029,12 @@ impl Equeue {
         // first since it is not necessarily atomic
         let period = e.period;
         let info = e.info.load();
-        info.id() == id.id && (info.pending() || period >= 0)
+        info.id() == id.id
+            && match info.status() {
+                Estatus::InFlight => period >= 0,
+                Estatus::Pending => true,
+                Estatus::Canceled => false,
+            }
     }
 
     // Central cancel function
