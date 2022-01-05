@@ -132,7 +132,6 @@ impl Eptr {
 /// of the data structures
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct MarkedEptr {
-    mark: ugen,
     gen: ugen,
     eptr: Eptr,
 }
@@ -141,7 +140,6 @@ impl Debug for MarkedEptr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("MarkedEptr")
-            .field(&self.mark)
             .field(&self.gen)
             .field(&format_args!("{:#x}", self.eptr.0))
             .finish()
@@ -151,29 +149,14 @@ impl Debug for MarkedEptr {
 impl MarkedEptr {
     const fn null() -> MarkedEptr {
         MarkedEptr {
-            mark: 0,
             gen: 0,
             eptr: Eptr::null(),
         }
     }
 
-    // avoids loading the generation count from the ebuf
-    fn from_parts(q: &Equeue, mark: ugen, gen: ugen, e: &Ebuf) -> MarkedEptr {
+    fn from_ebuf(q: &Equeue, e: &mut Ebuf) -> MarkedEptr {
         MarkedEptr {
-            mark: mark,
-            gen: gen,
-            eptr: Eptr::from_ebuf(q, e),
-        }
-    }
-
-    // loads gen from the ebuf, the resulting MarkedEptr will always be in sync
-    //
-    // we take a mutable ebuf to avoid races, otherwise we probably don't have
-    // exclusive access, so the code would probably be broken anyways
-    fn from_ebuf(q: &Equeue, mark: ugen, e: &mut Ebuf) -> MarkedEptr {
-        MarkedEptr {
-            mark: mark,
-            gen: e.next.load().mark,
+            gen: 0,
             eptr: Eptr::from_ebuf(q, e),
         }
     }
@@ -187,26 +170,16 @@ impl MarkedEptr {
     }
 
     // test if mark matches expected gen from src MarkedEptr
-    fn check_mark(self, src: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        if src.gen == self.mark {
-            Ok(self)
-        } else {
-            Err(self)
-        }
-    }
-
     fn cp_mark(self, src: MarkedEptr) -> MarkedEptr {
         MarkedEptr {
-            mark: src.mark,
-            gen: self.gen,
+            gen: src.gen,
             eptr: self.eptr,
         }
     }
 
     fn inc_mark(self) -> MarkedEptr {
         MarkedEptr {
-            mark: self.mark.wrapping_add(1),
-            gen: self.gen,
+            gen: self.gen.wrapping_add(1),
             eptr: self.eptr,
         }
     }
@@ -214,10 +187,6 @@ impl MarkedEptr {
 
 // interactions with atomics
 impl<S: AtomicU> Atomic<MarkedEptr, S> {
-    fn load_marked(&self, src: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        self.load().check_mark(src)
-    }
-
     fn store_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
         let eptr = new.cp_mark(src);
         self.store(eptr);
@@ -304,6 +273,11 @@ impl Einfo {
     }
 }
 
+/// A stub function useful for Event operations
+fn enop(_: *mut u8) {
+    // do nothing
+}
+
 /// Internal event header
 #[derive(Debug)]
 struct Ebuf {
@@ -313,8 +287,8 @@ struct Ebuf {
     sibling_back: Atomic<Eptr, AtomicUeptr>,
     info: Atomic<Einfo, AtomicUeptr>,
 
-    cb: Option<fn(*mut u8)>,
-    drop: Option<fn(*mut u8)>,
+    cb: fn(*mut u8),
+    drop: fn(*mut u8),
     target: utick,
     period: itick,
 }
@@ -325,7 +299,7 @@ impl Ebuf {
     }
 
     fn as_marked_eptr(&mut self, q: &Equeue) -> MarkedEptr {
-        MarkedEptr::from_ebuf(q, 0, self)
+        MarkedEptr::from_ebuf(q, self)
     }
 
     // info access
@@ -524,8 +498,8 @@ impl Equeue {
                 let mut e = unsafe { e.claim() };
 
                 // zero certain fields
-                e.cb = None;
-                e.drop = None;
+                e.cb = enop;
+                e.drop = enop;
                 e.target = 0;
                 e.period = -1;
                 return Ok(e);
@@ -576,8 +550,8 @@ impl Equeue {
                 sibling_back: Atomic::new(Eptr::null()),
                 info: Atomic::new(Einfo::new(0, Estatus::InFlight, npw2)),
 
-                cb: None,
-                drop: None,
+                cb: enop,
+                drop: enop,
                 target: 0,
                 period: -1,
             });
@@ -614,7 +588,6 @@ impl Equeue {
     // Queue management
     fn enqueue_ebuf<'a>(&self, e: &'a mut Ebuf, target: utick) -> Result<Id, &'a mut Ebuf> {
         let mut e = e;
-        debug_assert!(e.cb.is_some());
         e.target = target;
 
         let id = Id::from_ebuf(self, e);
@@ -624,8 +597,8 @@ impl Equeue {
             let mut back = None;
             let mut sibling = None;
 
-            let mut headsrc = &self.queue;
             let mut headptr = self.queue.load();
+            let mut headsrc = &self.queue;
             while let Some(head) = headptr.as_ref(self) {
                 // compare targets
                 match scmp(head.target, target) {
@@ -643,16 +616,17 @@ impl Equeue {
                 }
 
                 back = Some(head);
+                let nextptr = head.next.load();
+
+                // check that the previous next pointer hasn't changed on us, if
+                // so the node we were traversing could have been removed which
+                // means we need to restart
+                if headsrc.load() != headptr {
+                    continue 'retry;
+                }
+
+                headptr = nextptr;
                 headsrc = &head.next;
-                headptr = match head.next.load_marked(headptr) {
-                    Ok(headptr) => headptr,
-                    Err(_) => {
-                        // found a gen mismatch, most likely some changed
-                        // happened to the data-structure which puts us into
-                        // an unknown state, so we need to restart
-                        continue 'retry;
-                    }
-                };
             }
 
 
@@ -965,7 +939,7 @@ impl Equeue {
                 let e = unsafe { e.claim() };
 
                 // dispatch!
-                e.cb.unwrap()(e.data_mut_ptr());
+                (e.cb)(e.data_mut_ptr());
 
                 let e = if e.period >= 0 {
                     // reenqueue?
@@ -980,9 +954,7 @@ impl Equeue {
                 // release memory?
                 if let Some(e) = e { 
                     // call drop, return event to memory pool
-                    if let Some(drop) = e.drop {
-                        drop(e.data_mut_ptr());
-                    }
+                    (e.drop)(e.data_mut_ptr());
                     self.dealloc_ebuf(e);
                 }
             }
@@ -1043,9 +1015,7 @@ impl Equeue {
 
         if let Some(e) = e {
             // make sure to clean up memory
-            if let Some(drop) = e.drop {
-                drop(e.data_mut_ptr());
-            }
+            (e.drop)(e.data_mut_ptr());
             self.dealloc_ebuf(e);
         }
 
@@ -1068,9 +1038,7 @@ impl Equeue {
         };
 
         // make sure we call drop!
-        if let Some(drop) = e.drop {
-            drop(e.data_mut_ptr());
-        }
+        (e.drop)(e.data_mut_ptr());
 
         // if we don't post, we need to increment our generation here
         self.dealloc_ebuf(e);
@@ -1081,12 +1049,6 @@ impl Equeue {
             Some(e) => self.contains_ebuf(e),
             None => false,
         }
-    }
-
-    pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
-        debug_assert!(self.contains_raw(e));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.drop = Some(drop);
     }
 
     pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: itick) {
@@ -1102,10 +1064,16 @@ impl Equeue {
         e.period = period;
     }
 
+    pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
+        debug_assert!(self.contains_raw(e));
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
+        e.drop = drop;
+    }
+
     pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
         debug_assert!(self.contains_raw(e));
         let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.cb = Some(cb);
+        e.cb = cb;
         self.post(e, self.imprecise_add(self.clock.now(), e.target as itick))
     }
 }
@@ -1116,12 +1084,35 @@ pub trait Post {
     fn post(&mut self);
 }
 
-// TODO wait, should we also accept FnOnce for non-periodic events?
 impl<F: FnMut() + Send> Post for F {
     fn post(&mut self) {
         self()
     }
 }
+
+/// Post-once trait, a special case
+pub trait PostOnce {
+    fn post_once(self);
+}
+
+impl<F: FnOnce() + Send> PostOnce for F {
+    fn post_once(self) {
+        self()
+    }
+}
+
+/// Post-static trait, a post that does not reclaim memory
+pub trait PostStatic: Sized {
+    fn post_static(&mut self, e: Event<'_, Self>);
+}
+
+impl<F: FnMut(Event<'_, Self>)> PostStatic for F {
+    fn post_static(&mut self, e: Event<'_, Self>) {
+        self(e)
+    }
+}
+
+
 
 /// An id we can use to try to cancel an event
 #[derive(Copy, Clone)]
@@ -1223,8 +1214,8 @@ impl<T: Post> Event<'_, T> {
             unsafe { drop_in_place(e as *mut T) };
         }
 
-        self.e.cb = Some(cb_thunk::<T>);
-        self.e.drop = Some(drop_thunk::<T>);
+        self.e.cb = cb_thunk::<T>;
+        self.e.drop = drop_thunk::<T>;
 
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
@@ -1284,19 +1275,42 @@ impl<T> BorrowMut<T> for Event<'_, T> {
 
 impl Equeue {
     // convenience functions
-    pub fn call<F: Post>(&self, cb: F) -> Result<Id, Error>{
-        Ok(
-            self.alloc_from(cb)?
-                .post()
-        )
+    pub fn call<F: PostOnce>(&self, cb: F) -> Result<Id, Error>{
+        let e = self.alloc_ebuf(Layout::new::<F>())?;
+        unsafe { e.data_mut_ptr::<F>().write(cb); }
+
+        // cb/drop thunks
+        fn cb_thunk<F: PostOnce>(e: *mut u8) {
+            unsafe { (e as *mut F).read() }.post_once();
+        }
+
+        fn drop_thunk<F>(e: *mut u8) {
+            // e will already be dropped
+        }
+
+        e.cb = cb_thunk::<F>;
+        e.drop = drop_thunk::<F>;
+        
+        Ok(self.post(e, self.imprecise_add(self.now(), 0)))
     }
 
-    pub fn call_in<F: Post>(&self, delay: itick, cb: F) -> Result<Id, Error> {
-        Ok(
-            self.alloc_from(cb)?
-                .delay(delay)
-                .post()
-        )
+    pub fn call_in<F: PostOnce>(&self, delay: itick, cb: F) -> Result<Id, Error> {
+        let e = self.alloc_ebuf(Layout::new::<F>())?;
+        unsafe { e.data_mut_ptr::<F>().write(cb); }
+
+        // cb/drop thunks
+        fn cb_thunk<F: PostOnce>(e: *mut u8) {
+            unsafe { (e as *mut F).read() }.post_once();
+        }
+
+        fn drop_thunk<F>(e: *mut u8) {
+            // e will already be dropped
+        }
+
+        e.cb = cb_thunk::<F>;
+        e.drop = drop_thunk::<F>;
+        
+        Ok(self.post(e, self.imprecise_add(self.now(), delay)))
     }
 
     pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
