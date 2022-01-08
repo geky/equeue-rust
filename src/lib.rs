@@ -28,6 +28,8 @@ use core::num::NonZeroUsize;
 use core::num::TryFromIntError;
 use core::fmt::Debug;
 use core::iter;
+use core::future::Future;
+use core::pin::Pin;
 
 mod util;
 mod sys;
@@ -215,36 +217,43 @@ impl Debug for Einfo {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Estatus {
-    InFlight,
-    Pending,
-    Canceled,
+enum Pending {
+    Alloced     = 0,
+    Pending     = 2,
+    Dispatching = 4,
+    Nested      = 6,
+    Canceled    = 7,
 }
 
-impl Estatus {
-    fn from(status: u8) -> Estatus {
-        match status {
-            0 => Estatus::InFlight,
-            1 => Estatus::Pending,
-            2 => Estatus::Canceled,
+impl Pending {
+    fn from_ueptr(pending: ueptr) -> Pending {
+        match pending {
+            0 | 1 => Pending::Alloced,
+            2 | 3 => Pending::Pending,
+            4 | 5 => Pending::Dispatching,
+            6     => Pending::Nested,
+            7     => Pending::Canceled,
             _ => unreachable!(),
         }
     }
 
-    fn as_u8(&self) -> u8 {
+    fn as_ueptr(&self) -> ueptr {
         match self {
-            Estatus::InFlight => 0,
-            Estatus::Pending  => 1,
-            Estatus::Canceled => 2,
+            Pending::Alloced     => 0,
+            Pending::Pending     => 2,
+            Pending::Dispatching => 4,
+            Pending::Nested      => 6,
+            Pending::Canceled    => 7,
         }
     }
 }
 
 impl Einfo {
-    fn new(id: ugen, status: Estatus, npw2: u8) -> Einfo {
+    fn new(id: ugen, pending: Pending, static_: bool, npw2: u8) -> Einfo {
         Einfo(
             ((id as ueptr) << 8*size_of::<ugen>())
-            | ((status.as_u8() as ueptr) << (8*size_of::<ugen>()-2))
+            | (pending.as_ueptr() << (8*size_of::<ugen>()-3))
+            | ((!static_ as ueptr) << (8*size_of::<ugen>()-3))
             | (npw2 as ueptr)
         )
     }
@@ -253,30 +262,40 @@ impl Einfo {
         (self.0 >> 8*size_of::<ugen>()) as ugen
     }
 
-    fn status(&self) -> Estatus {
-        Estatus::from(0x3 & (self.0 >> (8*size_of::<ugen>()-2)) as u8)
+    fn pending(&self) -> Pending {
+        Pending::from_ueptr(0x7 & (self.0 >> (8*size_of::<ugen>()-3)))
+    }
+
+    fn static_(&self) -> bool {
+        // static is inverted so we can mask it with canceled statuses
+        !(self.0 & (1 << (8*size_of::<ugen>()-3)) != 0)
     }
 
     fn npw2(&self) -> u8 {
-        (self.0 & ((1 << (8*size_of::<ugen>()-2)) - 1)) as u8
+        (self.0 & ((1 << (8*size_of::<ugen>()-3)) - 1)) as u8
     }
 
     fn inc_id(self) -> Einfo {
         Einfo(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
     }
 
-    fn set_status(self, status: Estatus) -> Einfo {
+    fn set_pending(self, pending: Pending) -> Einfo {
         Einfo(
-            (self.0 & !(0x3 << (8*size_of::<ugen>()-2)))
-            | ((status.as_u8() as ueptr) << (8*size_of::<ugen>()-2))
+            (self.0 & !(0x6 << (8*size_of::<ugen>()-3)))
+            | (pending.as_ueptr() << (8*size_of::<ugen>()-3))
         )
+    }
+
+    fn set_static(self, static_: bool) -> Einfo {
+        // static is inverted so we can mask it with canceled statuses
+        if !static_ {
+            Einfo(self.0 | (1 << (8*size_of::<ugen>()-3)))
+        } else {
+            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-3)))
+        }
     }
 }
 
-/// A stub function useful for Event operations
-fn enop(_: *mut u8) {
-    // do nothing
-}
 
 /// Internal event header
 #[derive(Debug)]
@@ -287,8 +306,8 @@ struct Ebuf {
     sibling_back: Atomic<Eptr, AtomicUeptr>,
     info: Atomic<Einfo, AtomicUeptr>,
 
-    cb: fn(*mut u8),
-    drop: fn(*mut u8),
+    cb: Option<fn(*mut u8)>,
+    drop: Option<fn(*mut u8)>,
     target: utick,
     period: itick,
 }
@@ -498,8 +517,8 @@ impl Equeue {
                 let mut e = unsafe { e.claim() };
 
                 // zero certain fields
-                e.cb = enop;
-                e.drop = enop;
+                e.cb = None;
+                e.drop = None;
                 e.target = 0;
                 e.period = -1;
                 return Ok(e);
@@ -548,10 +567,10 @@ impl Equeue {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Einfo::new(0, Estatus::InFlight, npw2)),
+                info: Atomic::new(Einfo::new(0, Pending::Alloced, false, npw2)),
 
-                cb: enop,
-                drop: enop,
+                cb: None,
+                drop: None,
                 target: 0,
                 period: -1,
             });
@@ -566,17 +585,18 @@ impl Equeue {
         // we can load buckets here because it can never shrink
         let bucket = &self.buckets()[e.npw2() as usize];
 
-        // give our event a new id
-        let info = e.info.load();
-        debug_assert_ne!(info.status(), Estatus::Pending);
-        e.info.store(
-            info.inc_id()
-                .set_status(Estatus::InFlight)
-        );
-
         // add our event to a bucket, while also incrementing our
         // generation count
         self.lock.lock(|| {
+            // give our event a new id
+            let info = e.info.load();
+            debug_assert_ne!(info.pending(), Pending::Pending);
+            e.info.store(
+                info.inc_id()
+                    .set_pending(Pending::Alloced)
+                    .set_static(false)
+            );
+
             // push onto bucket
             let siblingptr = bucket.load();
             debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
@@ -586,11 +606,15 @@ impl Equeue {
     }
 
     // Queue management
-    fn enqueue_ebuf<'a>(&self, e: &'a mut Ebuf, target: utick) -> Result<Id, &'a mut Ebuf> {
+    fn enqueue_ebuf<'a>(
+        &self,
+        e: &'a mut Ebuf,
+        target: utick,
+        dispatching: bool
+    ) -> Result<(), &'a mut Ebuf> {
         let mut e = e;
+        debug_assert!(e.cb.is_some());
         e.target = target;
-
-        let id = Id::from_ebuf(self, e);
 
         'retry: loop {
             // find insertion point
@@ -629,68 +653,59 @@ impl Equeue {
                 headsrc = &head.next;
             }
 
-
-            // found our insertion point, now lets try to insert
-            match match sibling {
+            // prepare event before locking
+            match sibling {
                 None => {
                     // insert a new slice
                     e.next.store_marked(e.next.load(), headptr);
                     e.next_back.store(back.as_eptr(self));
                     e.sibling.store(e.as_eptr(self));
                     e.sibling_back.store(e.as_eptr(self));
-
-                    // try to insert
-                    self.lock.lock(|| {
-                        // are we trying to enqueue an event that's already been canceled?
-                        //
-                        // this may seem seem like a weird place for this check, but
-                        // it's the only place we lock before re-enqueueing periodic events
-                        match e.info.load().status() {
-                            Estatus::InFlight => {},
-                            Estatus::Pending => unreachable!(),
-                            Estatus::Canceled => return None,
-                        }
-
-                        // did someone already change our headsrc? restart
-                        if headsrc.load() != headptr {
-                            return Some(false);
-                        }
-
-                        headsrc.store_marked(headptr, e.as_marked_eptr(self));
-                        if let Some(next) = headptr.as_ref(self) {
-                            next.next_back.store(e.as_eptr(self));
-                        }
-
-                        // mark as pending here, enabling removals
-                        e.info.store(
-                            e.info.load()
-                                .set_status(Estatus::Pending)
-                        );
-                        Some(true)
-                    })
                 }
                 Some(sibling) => {
                     // push onto existing slice
                     e.next.store_marked(e.next.load(), MarkedEptr::null());
                     e.next_back.store(Eptr::null());
                     e.sibling.store(sibling.as_eptr(self));
+                }
+            }
 
-                    // try to push
-                    self.lock.lock(|| {
-                        // are we trying to enqueue an event that's already been canceled?
-                        //
-                        // this may seem seem like a weird place for this check, but
-                        // it's the only place we lock before re-enqueueing periodic events
-                        match e.info.load().status() {
-                            Estatus::InFlight => {},
-                            Estatus::Pending => unreachable!(),
-                            Estatus::Canceled => return None,
-                        }
+            // try to insert
+            match self.lock.lock(|| {
+                // are we trying to enqueue an event that's already been canceled?
+                //
+                // this may seem seem like a weird place for this check, but
+                // it's the only place we lock before re-enqueueing periodic events
+                let info = e.info.load();
+                match info.pending() {
+                    Pending::Alloced => {},
+                    Pending::Pending => return Some(true),
+                    Pending::Dispatching | Pending::Nested if dispatching => {},
+                    Pending::Dispatching => {
+                        // we can't enqueue now, but we can mark as nested
+                        e.info.store(info.set_pending(Pending::Nested));
+                        return Some(true);
+                    }
+                    Pending::Nested => return Some(true),
+                    Pending::Canceled => return None,
+                }
 
-                        // did someone already change our headsrc? restart
-                        if headsrc.load() != headptr {
-                            return Some(false);
+                // did someone already change our headsrc? restart
+                if headsrc.load() != headptr {
+                    return Some(false);
+                }
+
+                // found our insertion point, now lets try to insert
+                match sibling {
+                    None => {
+                        // insert a new slice
+                        headsrc.store_marked(headptr, e.as_marked_eptr(self));
+                        if let Some(next) = headptr.as_ref(self) {
+                            next.next_back.store(e.as_eptr(self));
                         }
+                    }
+                    Some(sibling) => {
+                        // push onto existing slice
 
                         // the real need for locking here is to make sure all of
                         // the back-references are correct atomically
@@ -700,17 +715,14 @@ impl Equeue {
                         
                         sibling_back.sibling.store(e.as_eptr(self));
                         e.sibling_back.store(sibling_back.as_eptr(self));
-
-                        // mark as pending here, enabling removals
-                        e.info.store(
-                            e.info.load()
-                                .set_status(Estatus::Pending)
-                        );
-                        Some(true)
-                    })
+                    }
                 }
-            } {
-                Some(true) => return Ok(id),
+
+                // mark as pending here, enabling removals
+                e.info.store(info.set_pending(Pending::Pending));
+                Some(true)
+            }) {
+                Some(true) => return Ok(()),
                 Some(false) => continue 'retry,
                 None => return Err(e),
             }
@@ -754,7 +766,7 @@ impl Equeue {
                                 // canceled we're suddenly pointing to garbage, so we go ahead 
                                 // and mark the head as executing, since that's the very next
                                 // thing we're going to do
-                                head.info.store(head.info.load().set_status(Estatus::InFlight));
+                                head.info.store(head.info.load().set_pending(Pending::Dispatching));
                                 dequeued = Some(head);
                             }
                             Some(dequeued) => {
@@ -802,8 +814,8 @@ impl Equeue {
             
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
-            match info.status() {
-                Estatus::Pending => {
+            match info.pending() {
+                Pending::Pending => {
                     // we can disentangle the event here and reclaim the memory
                     let nextptr = e.next.load();
                     let next = nextptr.as_ref(self);
@@ -859,20 +871,24 @@ impl Equeue {
                     // mark as removed
                     e.next.store_inc_marked(nextptr, MarkedEptr::null());
                     // mark as not-pending
-                    e.info.store(e.info.load().set_status(Estatus::InFlight));
+                    e.info.store(e.info.load().set_pending(Pending::Canceled));
                     
                     // note we are responsible for the memory now
                     let e = unsafe { e.claim() };
 
                     (true, Some(e))
                 }
-                Estatus::InFlight if e.period >= 0 => {
-                    // if we're periodic and currently executing best we can do is
-                    // mark the event so it isn't re-enqueued
-                    e.info.store(info.set_status(Estatus::Canceled));
-                    (true, None)
+                Pending::Alloced => {
+                    // well this shouldn't happen
+                    unreachable!()
                 }
-                _ => {
+                Pending::Dispatching | Pending::Nested => {
+                    // if we're periodic/static and currently executing best we
+                    // can do is mark the event so it isn't re-enqueued
+                    e.info.store(info.set_pending(Pending::Canceled));
+                    (info.static_() || e.period >= 0, None)
+                }
+                Pending::Canceled => {
                     (false, None)
                 }
             }
@@ -898,8 +914,8 @@ impl Equeue {
     }
 
     // Central post function
-    fn post(&self, e: &mut Ebuf, target: utick) -> Id {
-        let id = self.enqueue_ebuf(e, target).unwrap();
+    fn post(&self, e: &mut Ebuf, target: utick) {
+        let id = self.enqueue_ebuf(e, target, false).unwrap();
 
         // signal queue has changed
         self.sema.signal();
@@ -927,7 +943,7 @@ impl Equeue {
                         slice = None;
                     } else {
                         // mark the next event as executing
-                        sibling.info.store(sibling.info.load().set_status(Estatus::InFlight));
+                        sibling.info.store(sibling.info.load().set_pending(Pending::Dispatching));
 
                         sibling.sibling_back.store(sibling_back.as_eptr(self));
                         sibling_back.sibling.store(sibling.as_eptr(self));
@@ -939,14 +955,41 @@ impl Equeue {
                 let e = unsafe { e.claim() };
 
                 // dispatch!
-                (e.cb)(e.data_mut_ptr());
+                (e.cb.unwrap())(e.data_mut_ptr());
 
+                let info = e.info.load();
                 let e = if e.period >= 0 {
-                    // reenqueue?
+                    // if periodic, reenqueue, unless we get canceled
                     self.enqueue_ebuf(
                         e,
-                        self.imprecise_add(self.clock.now(), e.period)
+                        self.imprecise_add(self.clock.now(), e.period),
+                        true
                     ).err()
+                } else if info.static_() {
+                    // if static, try to mark as no-longer pending, but
+                    // note we could be canceled or recursively pended
+                    let (reenqueue, e) = self.lock.lock(|| {
+                        let info = e.info.load();
+                        match info.pending() {
+                            Pending::Dispatching => {
+                                e.info.store(info.set_pending(Pending::Alloced));
+                                (None, None)
+                            }
+                            Pending::Nested => {
+                                (Some(e), None)
+                            }
+                            Pending::Canceled => {
+                                (None, Some(e))
+                            }
+                            _ => unreachable!(),
+                        }
+                    });
+
+                    if let Some(e) = reenqueue {
+                        self.enqueue_ebuf(e, self.clock.now(), true).err()
+                    } else {
+                        e
+                    }
                 } else {
                     Some(e)
                 };
@@ -954,7 +997,9 @@ impl Equeue {
                 // release memory?
                 if let Some(e) = e { 
                     // call drop, return event to memory pool
-                    (e.drop)(e.data_mut_ptr());
+                    if let Some(drop) = e.drop {
+                        drop(e.data_mut_ptr());
+                    }
                     self.dealloc_ebuf(e);
                 }
             }
@@ -999,13 +1044,14 @@ impl Equeue {
 
         // note that periodic events are always pending, we load period
         // first since it is not necessarily atomic
-        let period = e.period;
         let info = e.info.load();
         info.id() == id.id
-            && match info.status() {
-                Estatus::InFlight => period >= 0,
-                Estatus::Pending => true,
-                Estatus::Canceled => false,
+            && match info.pending() {
+                Pending::Alloced => false,
+                Pending::Pending => true,
+                Pending::Dispatching => info.static_() || e.period >= 0,
+                Pending::Nested => true,
+                Pending::Canceled => false,
             }
     }
 
@@ -1015,7 +1061,9 @@ impl Equeue {
 
         if let Some(e) = e {
             // make sure to clean up memory
-            (e.drop)(e.data_mut_ptr());
+            if let Some(drop) = e.drop {
+                drop(e.data_mut_ptr());
+            }
             self.dealloc_ebuf(e);
         }
 
@@ -1038,7 +1086,9 @@ impl Equeue {
         };
 
         // make sure we call drop!
-        (e.drop)(e.data_mut_ptr());
+        if let Some(drop) = e.drop {
+            drop(e.data_mut_ptr());
+        }
 
         // if we don't post, we need to increment our generation here
         self.dealloc_ebuf(e);
@@ -1067,14 +1117,17 @@ impl Equeue {
     pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.drop = drop;
+        e.drop = Some(drop);
     }
 
     pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
         debug_assert!(self.contains_raw(e));
         let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.cb = cb;
-        self.post(e, self.imprecise_add(self.clock.now(), e.target as itick))
+        e.cb = Some(cb);
+
+        let id = Id::new(self, e);
+        self.post(e, self.imprecise_add(self.clock.now(), e.target as itick));
+        id
     }
 }
 
@@ -1103,15 +1156,8 @@ impl<F: FnOnce() + Send> PostOnce for F {
 
 /// Post-static trait, a post that does not reclaim memory
 pub trait PostStatic: Sized {
-    fn post_static(&mut self, e: Event<'_, Self>);
+    fn post_static(self_: Event<'_, Self>);
 }
-
-impl<F: FnMut(Event<'_, Self>)> PostStatic for F {
-    fn post_static(&mut self, e: Event<'_, Self>) {
-        self(e)
-    }
-}
-
 
 
 /// An id we can use to try to cancel an event
@@ -1132,10 +1178,10 @@ impl Debug for Id {
 }
 
 impl Id {
-    fn from_ebuf(q: &Equeue, e: &mut Ebuf) -> Id {
+    fn new(q: &Equeue, e: &mut Ebuf) -> Id {
         Id {
             id: e.info.load().id(),
-            eptr: unsafe { NonZeroUeptr::new_unchecked(e.as_eptr(q).0) }
+            eptr: unsafe { NonZeroUeptr::new_unchecked(e.as_eptr(q).0) },
         }
     }
 
@@ -1147,6 +1193,7 @@ impl Id {
 /// Event handle
 pub struct Event<'a, T> {
     q: &'a Equeue,
+    id: Id,
     e: &'a mut Ebuf,
     _phantom: PhantomData<T>,
 }
@@ -1154,6 +1201,7 @@ pub struct Event<'a, T> {
 impl<T: Debug> Debug for Event<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Event")
+            .field(&self.id)
             .field(&self.e)
             .field(&self.deref())
             .finish()
@@ -1164,15 +1212,10 @@ impl<'a, T> Event<'a, T> {
     fn new(q: &'a Equeue, e: &'a mut Ebuf) -> Event<'a, T> {
         Event {
             q: q,
+            id: Id::new(q, e),
             e: e,
             _phantom: PhantomData
         }
-    }
-
-    pub unsafe fn from_raw_parts(q: &'a Equeue, e: *mut T) -> Event<'a, T> {
-        debug_assert!(q.contains_raw(e as *mut u8));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        Event::new(q, e)
     }
 }
 
@@ -1191,6 +1234,10 @@ impl Equeue {
 }
 
 impl<T> Event<'_, T> {
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
     pub fn delay(mut self, delay: itick) -> Self {
         debug_assert!(delay >= 0);
         self.e.target = delay as utick;
@@ -1201,10 +1248,8 @@ impl<T> Event<'_, T> {
         self.e.period = period;
         self
     }
-}
 
-impl<T: Post> Event<'_, T> {
-    pub fn post(self) -> Id {
+    pub fn post(self) -> Id where T: Post {
         // cb/drop thunks
         fn cb_thunk<T: Post>(e: *mut u8) {
             unsafe { &mut *(e as *mut T) }.post();
@@ -1214,18 +1259,78 @@ impl<T: Post> Event<'_, T> {
             unsafe { drop_in_place(e as *mut T) };
         }
 
-        self.e.cb = cb_thunk::<T>;
-        self.e.drop = drop_thunk::<T>;
+        self.e.cb = Some(cb_thunk::<T>);
+        self.e.drop = Some(drop_thunk::<T>);
 
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        let id = self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+        let id = self.id;
+        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
         forget(self);
 
         id
     }
+
+    pub fn post_once(self) -> Id where T: PostOnce {
+        // can't have a period for PostOnce events!
+        assert!(self.e.period < 0);
+
+        // cb/drop thunks
+        fn cb_thunk<F: PostOnce>(e: *mut u8) {
+            unsafe { (e as *mut F).read() }.post_once();
+        }
+
+        self.e.cb = Some(cb_thunk::<T>);
+        self.e.drop = None; // e will already be dropped
+
+        // enqueue and then forget the event, it's up to equeue to
+        // drop the event later
+        let id = self.id;
+        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+        forget(self);
+
+        id
+    }
+
+    pub fn post_static(self) -> Id where T: PostStatic {
+        // can't have a period for PostStatic events!
+        assert!(self.e.period < 0);
+
+        todo!()
+
+//        // cb/drop thunks
+//        fn cb_thunk<T: PostStatic>(e: *mut u8) {
+//            let e = Event::new(q, unsafe { Ebuf::from_data_mut_ptr(e).unwrap() });
+//            T::post_static(e);
+//        }
+//
+//        fn drop_thunk<T>(e: *mut u8) {
+//            unsafe { drop_in_place(e as *mut T) };
+//        }
+//
+//        self.e.cb = Some(cb_thunk::<T>);
+//        self.e.drop = Some(drop_thunk::<T>);
+//
+//        // mark as static
+//        self.e.info.store(self.e.info.load().set_static(true));
+//
+//        // enqueue and then forget the event
+//        let id = self.id;
+//        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+//        forget(self);
+//
+//        id
+    }
+
+    pub fn run(self) -> Id where T: Future<Output=()> {
+        // can't have a period for Futures!
+        assert!(self.e.period < 0);
+
+        todo!()
+    }
 }
 
+// TODO we also need to implement drop for Equeue
 impl<T> Drop for Event<'_, T> {
     fn drop(&mut self) {
         // make sure we clean up if the event isn't dispatched
@@ -1276,41 +1381,18 @@ impl<T> BorrowMut<T> for Event<'_, T> {
 impl Equeue {
     // convenience functions
     pub fn call<F: PostOnce>(&self, cb: F) -> Result<Id, Error>{
-        let e = self.alloc_ebuf(Layout::new::<F>())?;
-        unsafe { e.data_mut_ptr::<F>().write(cb); }
-
-        // cb/drop thunks
-        fn cb_thunk<F: PostOnce>(e: *mut u8) {
-            unsafe { (e as *mut F).read() }.post_once();
-        }
-
-        fn drop_thunk<F>(e: *mut u8) {
-            // e will already be dropped
-        }
-
-        e.cb = cb_thunk::<F>;
-        e.drop = drop_thunk::<F>;
-        
-        Ok(self.post(e, self.imprecise_add(self.now(), 0)))
+        Ok(
+            self.alloc_from(cb)?
+                .post_once()
+        )
     }
 
     pub fn call_in<F: PostOnce>(&self, delay: itick, cb: F) -> Result<Id, Error> {
-        let e = self.alloc_ebuf(Layout::new::<F>())?;
-        unsafe { e.data_mut_ptr::<F>().write(cb); }
-
-        // cb/drop thunks
-        fn cb_thunk<F: PostOnce>(e: *mut u8) {
-            unsafe { (e as *mut F).read() }.post_once();
-        }
-
-        fn drop_thunk<F>(e: *mut u8) {
-            // e will already be dropped
-        }
-
-        e.cb = cb_thunk::<F>;
-        e.drop = drop_thunk::<F>;
-        
-        Ok(self.post(e, self.imprecise_add(self.now(), delay)))
+        Ok(
+            self.alloc_from(cb)?
+                .delay(delay)
+                .post_once()
+        )
     }
 
     pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
@@ -1319,6 +1401,13 @@ impl Equeue {
                 .delay(period)
                 .period(period)
                 .post()
+        )
+    }
+
+    pub fn run<F: Future<Output=()>>(&self, cb: F) -> Result<Id, Error> {
+        Ok(
+            self.alloc_from(cb)?
+                .run()
         )
     }
 }

@@ -85,10 +85,10 @@ fn test_race_alloc_many() {
     ).unwrap());
 
     let mut threads = vec![];
-    for _ in 0..100 {
+    for i in 0..100 {
         let q = q.clone();
         threads.push(thread::spawn(move || {
-            for i in 0..1000 {
+            for _ in 0..1000 {
                 let layout = Layout::from_size_align(10*i, 1).unwrap();
                 let e = unsafe { q.alloc_raw(layout) };
                 assert!(!e.is_null());
