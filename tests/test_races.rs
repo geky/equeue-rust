@@ -506,7 +506,7 @@ fn test_race_repost() {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             for _ in 0..100 {
-                q.repost(id);
+                q.trigger(id);
             }
         }));
     }

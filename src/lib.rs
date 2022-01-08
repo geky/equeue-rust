@@ -42,19 +42,22 @@ use util::*;
 use sys::*;
 
 
+// TODO we should clean these up, maybe separate into distinct error types?
 /// Event queue errors
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     NoMem,
     Overflow,
+    Timeout,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NoMem => write!(f, "Out of memory"),
+            Error::NoMem    => write!(f, "Out of memory"),
             Error::Overflow => write!(f, "Value could not fit in type"),
+            Error::Timeout  => write!(f, "A timeout occured"),
         }
     }
 }
@@ -314,7 +317,6 @@ struct Ebuf {
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
     target: utick,
-    // TODO pack period and q into one field? they are mutually exclusive
     period: itick,
     q: *const Equeue,
 }
@@ -615,6 +617,7 @@ impl Equeue {
     }
 
     // Queue management
+    #[must_use]
     fn enqueue_ebuf<'a>(
         &self,
         e: &'a mut Ebuf,
@@ -738,62 +741,16 @@ impl Equeue {
         }
     }
 
-    // Central post function
-    fn post(&self, e: &mut Ebuf, target: utick) {
-        self.enqueue_ebuf(e, target, false).unwrap();
-
-        // signal queue has changed
-        self.sema.signal();
-    }
-
-    // repost an static event which may already be pending
-    pub fn repost(&self, id: Id) {
-        let e = id.as_ref(self);
-        // TODO can we avoid this?
-        let e = unsafe { e.claim() };
-        
-        // can't repost non-static events
-        // TODO also check for id mismatches
-        let info = e.info.load();
-        if !info.static_() {
-            return;
-        }
-
-        self.post(e, self.clock.now());
-    }
-
-    // Is the event pending?
-    pub fn pending(&self, id: Id) -> bool {
-        let e = id.as_ref(self);
-        if !self.contains_ebuf(e) {
-            return false;
-        }
-
-        // note that periodic events are always pending, we load period
-        // first since it is not necessarily atomic
-        let info = e.info.load();
-        info.id() == id.id
-            && match info.pending() {
-                Pending::Alloced => false,
-                Pending::Pending => true,
-                Pending::Dispatching => info.static_() || e.period >= 0,
-                Pending::Nested => true,
-                Pending::Canceled => false,
-            }
-    }
-
-    fn unqueue_ebuf<'a>(&'a self, id: Id) -> (bool, Option<&'a mut Ebuf>) {
-        // check to see if we need to bother locking
-        if !self.pending(id) {
-            return (false, None);
-        }
-
-        let e = id.as_ref(self);
-
+    fn unqueue_ebuf<'a>(
+        &'a self,
+        e: &'a Ebuf,
+        id: ugen,
+        cancel: bool,
+    ) -> (bool, Option<&'a mut Ebuf>) {
         self.lock.lock(|| {
             // still the same event?
             let info = e.info.load();
-            if info.id() != id.id {
+            if info.id() != id {
                 return (false, None);
             }
             
@@ -856,33 +813,71 @@ impl Equeue {
                     // mark as removed
                     e.next.store_inc_marked(nextptr, MarkedEptr::null());
                     // mark as not-pending
-                    e.info.store(e.info.load().set_pending(Pending::Canceled));
+                    e.info.store(e.info.load().set_pending(if cancel {
+                        Pending::Canceled
+                    } else {
+                        Pending::Alloced
+                    }));
                     
                     // note we are responsible for the memory now
                     let e = unsafe { e.claim() };
 
                     (true, Some(e))
                 }
-                Pending::Alloced => {
-                    // well this shouldn't happen
-                    unreachable!()
-                }
                 Pending::Dispatching | Pending::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
-                    e.info.store(info.set_pending(Pending::Canceled));
+                    if cancel {
+                        e.info.store(info.set_pending(Pending::Canceled));
+                    }
                     (info.static_() || e.period >= 0, None)
                 }
-                Pending::Canceled => {
+                Pending::Alloced | Pending::Canceled => {
                     (false, None)
                 }
             }
         })
     }
 
+    // Central post function
+    fn post(&self, e: &mut Ebuf, target: utick) {
+        self.enqueue_ebuf(e, target, false).unwrap();
+
+        // signal queue has changed
+        self.sema.signal();
+    }
+
+    // Is the event pending?
+    pub fn pending(&self, id: Id) -> bool {
+        let e = match id.as_ref(self) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let info = e.info.load();
+        if info.id() != id.id {
+            return false;
+        }
+
+        // note that periodic events are always pending, we load period
+        // first since it is not necessarily atomic
+        match info.pending() {
+            Pending::Alloced => false,
+            Pending::Pending => true,
+            Pending::Dispatching => info.static_() || e.period >= 0,
+            Pending::Nested => true,
+            Pending::Canceled => false,
+        }
+    }
+
     // Central cancel function
     pub fn cancel(&self, id: Id) -> bool {
-        let (canceled, e) = self.unqueue_ebuf(id);
+        // check to see if we need to bother locking
+        if !self.pending(id) {
+            return false;
+        }
+
+        let (canceled, e) = self.unqueue_ebuf(id.as_ref(self).unwrap(), id.id, true);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -893,6 +888,83 @@ impl Equeue {
         }
 
         canceled
+    }
+
+    // repost an static event which may already be pending
+    pub fn trigger(&self, id: Id) -> bool {
+        let e = match id.as_ref(self) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let info = e.info.load();
+        if info.id() != id.id {
+            return false;
+        }
+
+        loop {
+            // The main difference between trigger and post is that we may
+            // be triggering an event that's already pending. This means several
+            // more corner cases to handle.
+            let now = self.clock.now();
+            match self.lock.lock(|| {
+                // still the same event?
+                let info = e.info.load();
+                if info.id() != id.id {
+                    return Err(false);
+                }
+
+                match info.pending() {
+                    Pending::Alloced => {
+                        // if we're alloced we can just enqueue, make sure to mark
+                        // and claim the event first
+                        e.info.store(info.set_pending(Pending::Nested));
+                        Ok(Ok(unsafe { e.claim() }))
+                    }
+                    Pending::Pending if scmp(now, e.target).is_lt() => {
+                        // we're pending, but in the future, we want to move this
+                        // to execute immediately
+                        Ok(Err(e))
+                    }
+                    Pending::Dispatching => {
+                        // someone else is dispatching, just make sure we mark that
+                        // we are interested in the event being retriggered
+                        e.info.store(info.set_pending(Pending::Nested));
+                        Err(true)
+                    }
+                    Pending::Pending | Pending::Nested => {
+                        // do nothing, the event is already pending
+                        Err(true)
+                    }
+                    Pending::Canceled => {
+                        Err(false)
+                    }
+                }
+            }) {
+                Ok(Ok(e)) => {
+                    // reenqueue
+                    match self.enqueue_ebuf(e, now, true) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            // surprisingly enough, this can fail here,
+                            // if we're canceled as we enqueue
+                            if let Some(drop) = e.drop {
+                                drop(e.data_mut_ptr());
+                            }
+                            self.dealloc_ebuf(e);
+                            return false;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    // try to unqueue and continue the loop to reenqueue sooner
+                    self.unqueue_ebuf(e, id.id, false);
+                }
+                Err(success) => {
+                    return success;
+                }
+            }
+        }
     }
 
     // find time until next event without locking
@@ -1021,7 +1093,15 @@ impl Equeue {
 
                 let info = e.info.load();
                 let e = if id != info.id() {
+                    // deallocated while dispatching?
                     None
+                } else if e.period >= 0 {
+                    // if periodic, reenqueue, unless we get canceled
+                    self.enqueue_ebuf(
+                        e,
+                        self.imprecise_add(self.clock.now(), e.period),
+                        true
+                    ).err()
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
                     // note we could be canceled or recursively pended
@@ -1047,13 +1127,6 @@ impl Equeue {
                     } else {
                         e
                     }
-                } else if e.period >= 0 {
-                    // if periodic, reenqueue, unless we get canceled
-                    self.enqueue_ebuf(
-                        e,
-                        self.imprecise_add(self.clock.now(), e.period),
-                        true
-                    ).err()
                 } else {
                     Some(e)
                 };
@@ -1162,7 +1235,7 @@ impl Equeue {
         let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.cb = Some(cb);
 
-        let id = Id::new(self, e);
+        let id = Id::new(self, e.info.load().id(), e);
         self.post(e, self.imprecise_add(self.clock.now(), e.target as itick));
         id
     }
@@ -1198,32 +1271,36 @@ pub trait PostStatic: Sized + Send {
 
 
 /// An id we can use to try to cancel an event
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Id {
     id: ugen,
-    eptr: NonZeroUeptr,
-}
-
-impl Debug for Id {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // these really need to be in hex to be readable
-        f.debug_tuple("Id")
-            .field(&self.id)
-            .field(&format_args!("{:#x}", self.eptr))
-            .finish()
-    }
+    eptr: Eptr,
 }
 
 impl Id {
-    fn new(q: &Equeue, e: &mut Ebuf) -> Id {
+    pub const fn null() -> Id {
+        // Ids can not be zero because that's where our buckets go in the slab
         Id {
-            id: e.info.load().id(),
-            eptr: unsafe { NonZeroUeptr::new_unchecked(e.as_eptr(q).0) },
+            id: 0,
+            eptr: Eptr::null(),
         }
     }
 
-    fn as_ref<'a>(&self, q: &'a Equeue) -> &'a Ebuf {
-        Eptr(self.eptr.get()).as_ref(q).unwrap()
+    fn new(q: &Equeue, id: ugen, e: &mut Ebuf) -> Id {
+        Id {
+            id: id,
+            eptr: e.as_eptr(q),
+        }
+    }
+
+    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+        self.eptr.as_ref(q)
+    }
+}
+
+impl Default for Id {
+    fn default() -> Id {
+        Id::null()
     }
 }
 
@@ -1262,9 +1339,50 @@ unsafe fn event_waker_clone(e: *const ()) -> RawWaker {
 }
 
 unsafe fn event_waker_wake(e: *const ()) {
-    let e = Ebuf::from_data_mut_ptr(e as *mut ()).unwrap();
+    // Fitting event ids into RawWaker is a bit frustrating
+    //
+    // Because of equeue's history, we already provide a unique id for each
+    // event built out of a compressed pointer and counter that fits into
+    // a single word. However, we also need to know which actual equeue
+    // instance we're running on. Waker only has a single word of storage,
+    // so this sort of ruins our plans (we really can't use an Arc here
+    // because this is intended for no-alloc systems).
+    //
+    // We want:
+    // [--   q   --][- id -|-  e -]
+    //       ^          ^      ^-- compressed eptr
+    //       |          '--------- id of event
+    //       '-------------------- pointer to equeue
+    // 
+    // In order to make this work with the RawWaker interface:
+    //
+    // 1. We store a reference to the equeue instance in the event, this
+    //    costs an extra word of space for each event which is otherwise
+    //    unused
+    //
+    // 2. We take advantage of alignment to store a truncated id in the lower
+    //    bits of the pointer. Whether or not this is enough to prevent bad id
+    //    matches in practice is unknown.
+    //
+    // [--   e   -|id]
+    //       ^      ^-- truncated id of event
+    //       '--------- uncompressed pointer to event
+
+    let mask = align_of::<Ebuf>()-1;
+    let id_trunc = ((e as usize) & mask) as ugen;
+    let e = Ebuf::from_data_mut_ptr(
+        ((e as usize) & !mask) as *mut ()
+    ).unwrap();
+
+    // check that id matches first
+    let id = e.info.load().id();
+    if id_trunc != id & mask as ugen {
+        return;
+    }
+
+    // trigger
     let q = e.q.as_ref().unwrap();
-    q.post(e, q.now());
+    q.trigger(Id::new(q, id, e));
 }
 
 unsafe fn event_waker_drop(e: *const ()) {
@@ -1396,9 +1514,9 @@ impl<T> Event<'_, T> {
     }
 
     // note this consumes the Event, otherwise we'd risk multiple access
-    // if the id is reposted
+    // if the id is triggered while we still have a mutable reference
     pub fn into_id(self) -> Id {
-        let id = Id::new(self.q, self.e);
+        let id = Id::new(self.q, self.e.info.load().id(), self.e);
         forget(self);
         id
     }
@@ -1406,7 +1524,7 @@ impl<T> Event<'_, T> {
     pub fn post(self) -> Id {
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        let id = Id::new(self.q, self.e);
+        let id = Id::new(self.q, self.e.info.load().id(), self.e);
         self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
         forget(self);
         id
@@ -1481,6 +1599,170 @@ impl Equeue {
             self.alloc_future(cb)?
                 .post()
         )
+    }
+}
+
+
+// async functions
+
+// NOTE, these could actually be optimized to not require additional allocations
+// for timeouts, however we would need to know if we are currently executing in
+// an Equeue instance, and have some way to access the Equeue.
+//
+// This is currently not possible. We could get to the Equeue from the RawWaker
+// instance, but the Context/Waker wrappers are a one-way type that can't be
+// reversed safely.
+//
+// An alternative would be storing additional data in the Context (why else
+// does this class exist), but this is also not supported.
+//
+// https://github.com/rust-lang/rfcs/issues/2900
+
+#[derive(Debug)]
+struct AsyncYield<'a> {
+    q: &'a Equeue,
+    yielded: bool
+}
+
+impl Future for AsyncYield<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // just pend once
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            self.yielded = true;
+            Poll::Pending
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AsyncSleep<'a> {
+    q: &'a Equeue,
+    yielded: bool,
+    timeout: utick,
+    id: Id,
+}
+
+impl Future for AsyncSleep<'_> {
+    type Output = Result<(), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // expired?
+        let delta = sdiff(self.timeout, self.q.clock.now());
+        if delta <= 0 {
+            if self.yielded {
+                Poll::Ready(Ok(()))
+            } else {
+                // make sure we always yield at least once
+                cx.waker().wake_by_ref();
+                self.yielded = true;
+                Poll::Pending
+            }
+        } else {
+            self.q.cancel(self.id);
+            let waker = cx.waker().clone();
+            match self.q.call_in(delta, move || waker.wake()) {
+                Ok(id) => {
+                    self.id = id;
+                    self.yielded = true;
+                    Poll::Pending
+                }
+                Err(err) => {
+                    // oops, ran out of memory
+                    Poll::Ready(Err(err))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AsyncSleep<'_> {
+    fn drop(&mut self) {
+        // make sure we cancel our timeout
+        self.q.cancel(self.id);
+    }
+}
+
+#[derive(Debug)]
+struct AsyncTimeout<'a, F> {
+    q: &'a Equeue,
+    f: F,
+    timeout: utick,
+    id: Id,
+}
+
+impl<F: Future> Future for AsyncTimeout<'_, F> {
+    type Output = Result<F::Output, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let self_ = unsafe { self.get_unchecked_mut() };
+
+        // first, is f ready?
+        let f = unsafe { Pin::new_unchecked(&mut self_.f) };
+        if let Poll::Ready(r) = f.poll(cx) {
+            self_.q.cancel(self_.id);
+            return Poll::Ready(Ok(r));
+        }
+
+        // expired?
+        let delta = sdiff(self_.timeout, self_.q.clock.now());
+        if delta <= 0 {
+            Poll::Ready(Err(Error::Timeout))
+        } else {
+            self_.q.cancel(self_.id);
+            let waker = cx.waker().clone();
+            match self_.q.call_in(delta, move || waker.wake()) {
+                Ok(id) => {
+                    self_.id = id;
+                    Poll::Pending
+                }
+                Err(err) => {
+                    // oops, ran out of memory
+                    Poll::Ready(Err(err))
+                }
+            }
+        }
+    }
+}
+
+impl<F> Drop for AsyncTimeout<'_, F> {
+    fn drop(&mut self) {
+        // make sure we cancel our timeout
+        self.q.cancel(self.id);
+    }
+}
+
+impl Equeue {
+    pub async fn yield_(&self) {
+        AsyncYield {
+            q: self,
+            yielded: false
+        }.await
+    }
+
+    pub async fn sleep(&self, ticks: itick) -> Result<(), Error> {
+        AsyncSleep {
+            q: self,
+            yielded: false,
+            timeout: self.clock.now().wrapping_add(ticks as utick),
+            id: Id::null(),
+        }.await
+    }
+
+    pub async fn timeout<F, R> (&self, ticks: itick, f: F) -> Result<R, Error>
+    where
+        F: Future<Output=R>
+    {
+        AsyncTimeout {
+            q: self,
+            f: f,
+            timeout: self.clock.now().wrapping_add(ticks as utick),
+            id: Id::null(),
+        }.await
     }
 }
 
