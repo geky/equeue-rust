@@ -44,12 +44,13 @@ use sys::*;
 
 // TODO we should clean these up, maybe separate into distinct error types?
 /// Event queue errors
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
     NoMem,
     Overflow,
     Timeout,
+    Break,
 }
 
 impl fmt::Display for Error {
@@ -58,6 +59,7 @@ impl fmt::Display for Error {
             Error::NoMem    => write!(f, "Out of memory"),
             Error::Overflow => write!(f, "Value could not fit in type"),
             Error::Timeout  => write!(f, "A timeout occured"),
+            Error::Break    => write!(f, "Break requested"),
         }
     }
 }
@@ -395,6 +397,7 @@ pub struct Equeue {
     slab_front: Atomic<usize, AtomicUsize>,
     slab_back: Atomic<usize, AtomicUsize>,
     alloced: bool,
+    break_: Atomic<bool, AtomicUeptr>,
 
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
@@ -467,6 +470,7 @@ impl Equeue {
             slab_front: Atomic::new(0),
             slab_back: Atomic::new(buffer.len()),
             alloced: false,
+            break_: Atomic::new(false),
 
             queue: Atomic::new(MarkedEptr::null()),
 
@@ -1098,7 +1102,7 @@ impl Equeue {
     }
 
     // Central dispatch function
-    pub fn dispatch(&self, ticks: itick) {
+    pub fn dispatch(&self, ticks: itick) -> Error {
         // get the current time
         let mut now = self.clock.now();
         let timeout = now.wrapping_add(ticks as utick);
@@ -1191,7 +1195,7 @@ impl Equeue {
             now = self.clock.now();
             let timeout_left = sdiff(timeout, now);
             if ticks >= 0 && timeout_left <= 0 {
-                return;
+                return Error::Timeout;
             }
 
             // ok how long should we sleep for
@@ -1211,9 +1215,31 @@ impl Equeue {
 
             self.sema.wait(delta);
 
+            // was break requested?
+            if self.break_.load() {
+                if self.lock.lock(|| {
+                    if self.break_.load() {
+                        self.break_.store(false);
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    return Error::Break;
+                }
+            }
+
             // update current time
             now = self.clock.now();
         }
+    }
+
+    // request dispatch to exit once done dispatching events
+    pub fn break_(&self) {
+        self.lock.lock(|| {
+            self.break_.store(true);
+        });
+        self.sema.signal();
     }
 }
 
