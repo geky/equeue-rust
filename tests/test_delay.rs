@@ -145,7 +145,7 @@ fn test_periodic() {
 
     let count = AtomicU32::new(0);
     for i in 0..10 {
-        q.alloc_from(|| {
+        q.alloc(|| {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap()
             .delay(i*100)

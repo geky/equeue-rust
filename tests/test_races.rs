@@ -1,6 +1,8 @@
 
 use equeue::Equeue;
 use equeue::Error;
+use equeue::PostStatic;
+use equeue::Event;
 
 use std::mem::transmute;
 use std::alloc::Layout;
@@ -11,6 +13,7 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::mem::forget;
 
 #[test]
 fn test_race_alloc_unique() {
@@ -458,5 +461,68 @@ fn test_race_cancel_periodic() {
     // we can't really check any output here, events may or may not
     // be dispatched, instead we just test that nothing explodes
 
+    println!("usage: {:#?}", q.usage());
+}
+
+struct StaticIncrement(Arc<AtomicU32>);
+
+impl PostStatic for StaticIncrement {
+    fn post_static(self_: Event<'_, Self>) {
+        self_.0.fetch_add(1, Ordering::SeqCst);
+        forget(self_); // TODO should we try to avoid this?
+    }
+}
+
+
+#[test]
+fn test_race_repost() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Arc::new(Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    ).unwrap());
+
+    let count = Arc::new(AtomicU32::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let dispatch_thread = {
+        let q = q.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                q.dispatch(0);
+            }
+
+            // make sure we catch any lingering events
+            q.dispatch(0);
+        })
+    };
+
+    let id = q.alloc_static(StaticIncrement(count.clone()))
+        .unwrap()
+        .into_id();
+
+    let mut threads = vec![];
+    for _ in 0..100 {
+        let q = q.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..100 {
+                q.repost(id);
+            }
+        }));
+    }
+
+    for thread in threads.into_iter() {
+        thread.join().unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    done.fetch_or(true, Ordering::SeqCst);
+    dispatch_thread.join().unwrap();
+
+    // we can't really check any output here, events may or may not
+    // be dispatched, instead we just test that nothing explodes
+    assert!(count.load(Ordering::SeqCst) > 0);
+    println!("found: {:?}", count.load(Ordering::SeqCst));
     println!("usage: {:#?}", q.usage());
 }

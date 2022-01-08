@@ -30,6 +30,11 @@ use core::fmt::Debug;
 use core::iter;
 use core::future::Future;
 use core::pin::Pin;
+use core::task::Poll;
+use core::task::Context;
+use core::task::Waker;
+use core::task::RawWaker;
+use core::task::RawWakerVTable;
 
 mod util;
 mod sys;
@@ -309,7 +314,9 @@ struct Ebuf {
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
     target: utick,
+    // TODO pack period and q into one field? they are mutually exclusive
     period: itick,
+    q: *const Equeue,
 }
 
 impl Ebuf {
@@ -521,6 +528,7 @@ impl Equeue {
                 e.drop = None;
                 e.target = 0;
                 e.period = -1;
+                e.q = ptr::null();
                 return Ok(e);
             }
         }
@@ -573,6 +581,7 @@ impl Equeue {
                 drop: None,
                 target: 0,
                 period: -1,
+                q: ptr::null(),
             });
 
             Ok(&mut *e)
@@ -731,12 +740,26 @@ impl Equeue {
 
     // Central post function
     fn post(&self, e: &mut Ebuf, target: utick) {
-        let id = self.enqueue_ebuf(e, target, false).unwrap();
+        self.enqueue_ebuf(e, target, false).unwrap();
 
         // signal queue has changed
         self.sema.signal();
+    }
 
-        id
+    // repost an static event which may already be pending
+    pub fn repost(&self, id: Id) {
+        let e = id.as_ref(self);
+        // TODO can we avoid this?
+        let e = unsafe { e.claim() };
+        
+        // can't repost non-static events
+        // TODO also check for id mismatches
+        let info = e.info.load();
+        if !info.static_() {
+            return;
+        }
+
+        self.post(e, self.clock.now());
     }
 
     // Is the event pending?
@@ -989,17 +1012,16 @@ impl Equeue {
                 // we now have exclusive access
                 let e = unsafe { e.claim() };
 
+                // load id here so we can tell if it changes (which happens if the
+                // event is reclaimed in dispatch)
+                let id = e.info.load().id();
+
                 // dispatch!
                 (e.cb.unwrap())(e.data_mut_ptr());
 
                 let info = e.info.load();
-                let e = if e.period >= 0 {
-                    // if periodic, reenqueue, unless we get canceled
-                    self.enqueue_ebuf(
-                        e,
-                        self.imprecise_add(self.clock.now(), e.period),
-                        true
-                    ).err()
+                let e = if id != info.id() {
+                    None
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
                     // note we could be canceled or recursively pended
@@ -1025,6 +1047,13 @@ impl Equeue {
                     } else {
                         e
                     }
+                } else if e.period >= 0 {
+                    // if periodic, reenqueue, unless we get canceled
+                    self.enqueue_ebuf(
+                        e,
+                        self.imprecise_add(self.clock.now(), e.period),
+                        true
+                    ).err()
                 } else {
                     Some(e)
                 };
@@ -1116,6 +1145,12 @@ impl Equeue {
         e.period = period;
     }
 
+    pub unsafe fn set_raw_static(&self, e: *mut u8, static_: bool) {
+        debug_assert!(self.contains_raw(e));
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
+        e.info.store(e.info.load().set_static(static_));
+    }
+
     pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
@@ -1135,7 +1170,7 @@ impl Equeue {
 
 
 /// Post trait
-pub trait Post {
+pub trait Post: Send {
     fn post(&mut self);
 }
 
@@ -1146,7 +1181,7 @@ impl<F: FnMut() + Send> Post for F {
 }
 
 /// Post-once trait, a special case
-pub trait PostOnce {
+pub trait PostOnce: Send {
     fn post_once(self);
 }
 
@@ -1157,7 +1192,7 @@ impl<F: FnOnce() + Send> PostOnce for F {
 }
 
 /// Post-static trait, a post that does not reclaim memory
-pub trait PostStatic: Sized {
+pub trait PostStatic: Sized + Send {
     fn post_static(self_: Event<'_, Self>);
 }
 
@@ -1192,18 +1227,18 @@ impl Id {
     }
 }
 
+
 /// Event handle
 pub struct Event<'a, T> {
     q: &'a Equeue,
-    id: Id,
     e: &'a mut Ebuf,
+    once: bool,
     _phantom: PhantomData<T>,
 }
 
 impl<T: Debug> Debug for Event<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Event")
-            .field(&self.id)
             .field(&self.e)
             .field(&self.deref())
             .finish()
@@ -1211,47 +1246,43 @@ impl<T: Debug> Debug for Event<'_, T> {
 }
 
 impl<'a, T> Event<'a, T> {
-    fn new(q: &'a Equeue, e: &'a mut Ebuf) -> Event<'a, T> {
+    fn new(q: &'a Equeue, e: &'a mut Ebuf, once: bool) -> Event<'a, T> {
         Event {
             q: q,
-            id: Id::new(q, e),
             e: e,
+            once: once,
             _phantom: PhantomData
         }
     }
 }
 
-impl Equeue {
-    pub fn alloc<'a, T: Default>(&'a self) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
-        unsafe { e.data_mut_ptr::<T>().write(T::default()); }
-        Ok(Event::new(self, e))
-    }
-
-    pub fn alloc_from<'a, T>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
-        unsafe { e.data_mut_ptr::<T>().write(t); }
-        Ok(Event::new(self, e))
-    }
+// event waker vtable callbacks
+unsafe fn event_waker_clone(e: *const ()) -> RawWaker {
+    RawWaker::new(e, &EVENT_WAKER_VTABLE)
 }
 
-impl<T> Event<'_, T> {
-    pub fn id(&self) -> Id {
-        self.id
-    }
+unsafe fn event_waker_wake(e: *const ()) {
+    let e = Ebuf::from_data_mut_ptr(e as *mut ()).unwrap();
+    let q = e.q.as_ref().unwrap();
+    q.post(e, q.now());
+}
 
-    pub fn delay(mut self, delay: itick) -> Self {
-        debug_assert!(delay >= 0);
-        self.e.target = delay as utick;
-        self
-    }
+unsafe fn event_waker_drop(e: *const ()) {
+    // do nothing
+}
 
-    pub fn period(mut self, period: itick) -> Self {
-        self.e.period = period;
-        self
-    }
+const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    event_waker_clone,
+    event_waker_wake,
+    event_waker_wake,
+    event_waker_drop,
+);
 
-    pub fn post(self) -> Id where T: Post {
+impl Equeue {
+    pub fn alloc<'a, T: Post>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
+        unsafe { e.data_mut_ptr::<T>().write(t); }
+
         // cb/drop thunks
         fn cb_thunk<T: Post>(e: *mut u8) {
             unsafe { &mut *(e as *mut T) }.post();
@@ -1261,74 +1292,124 @@ impl<T> Event<'_, T> {
             unsafe { drop_in_place(e as *mut T) };
         }
 
-        self.e.cb = Some(cb_thunk::<T>);
-        self.e.drop = Some(drop_thunk::<T>);
+        e.cb = Some(cb_thunk::<T>);
+        e.drop = Some(drop_thunk::<T>);
 
-        // enqueue and then forget the event, it's up to equeue to
-        // drop the event later
-        let id = self.id;
-        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
-        forget(self);
-
-        id
+        Ok(Event::new(self, e, false))
     }
 
-    pub fn post_once(self) -> Id where T: PostOnce {
-        // can't have a period for PostOnce events!
-        assert!(self.e.period < 0);
+    pub fn alloc_once<'a, T: PostOnce>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
+        unsafe { e.data_mut_ptr::<T>().write(t); }
 
         // cb/drop thunks
-        fn cb_thunk<F: PostOnce>(e: *mut u8) {
-            unsafe { (e as *mut F).read() }.post_once();
+        fn cb_thunk<T: PostOnce>(e: *mut u8) {
+            unsafe { (e as *mut T).read() }.post_once();
         }
 
-        self.e.cb = Some(cb_thunk::<T>);
-        self.e.drop = None; // e will already be dropped
+        e.cb = Some(cb_thunk::<T>);
+        e.drop = None; // e will already be dropped
 
-        // enqueue and then forget the event, it's up to equeue to
-        // drop the event later
-        let id = self.id;
-        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+        // mark as a one-time event so we panic if we try to enqueue
+        // multiple times
+        Ok(Event::new(self, e, true))
+    }
+
+    pub fn alloc_static<'a, T: PostStatic>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
+        unsafe { e.data_mut_ptr::<T>().write(t); }
+        e.q = self as *const Equeue;
+
+        // cb/drop thunks
+        fn cb_thunk<T: PostStatic>(e: *mut u8) {
+            let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
+            let e = Event::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
+            T::post_static(e);
+        }
+
+        fn drop_thunk<T>(e: *mut u8) {
+            unsafe { drop_in_place(e as *mut T) };
+        }
+
+        e.cb = Some(cb_thunk::<T>);
+        e.drop = Some(drop_thunk::<T>);
+
+        // mark as static
+        e.info.store(e.info.load().set_static(true));
+        Ok(Event::new(self, e, false))
+    }
+
+    pub fn alloc_future<'a, T: Future<Output=()>>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_ebuf(Layout::new::<T>())?;
+        unsafe { e.data_mut_ptr::<T>().write(t); }
+        e.q = self as *const Equeue;
+
+        fn cb_thunk<T: Future<Output=()>>(e: *mut u8) {
+            let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
+            assert!(e.info.load().static_());
+            let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
+
+            let waker = unsafe {
+                Waker::from_raw(event_waker_clone(
+                    e.deref() as *const T as *const ()
+                ))
+            };
+            let mut context = Context::from_waker(&waker);
+            let pinned = unsafe { Pin::new_unchecked(e.deref_mut()) };
+
+            match pinned.poll(&mut context) {
+                Poll::Pending => {
+                    // not done, forget so we don't clean up
+                    forget(e);
+                },
+                Poll::Ready(()) => {
+                    // done! dropping e will automatically clean up the memory
+                }
+            }
+        }
+
+        fn drop_thunk<T>(e: *mut u8) {
+            unsafe { drop_in_place(e as *mut T) };
+        }
+
+        e.cb = Some(cb_thunk::<T>);
+        e.drop = Some(drop_thunk::<T>);
+
+        // mark as static
+        e.info.store(e.info.load().set_static(true));
+        Ok(Event::new(self, e, false))
+    }
+}
+
+impl<T> Event<'_, T> {
+    pub fn delay(mut self, delay: itick) -> Self {
+        debug_assert!(delay >= 0);
+        self.e.target = delay as utick;
+        self
+    }
+
+    pub fn period(mut self, period: itick) -> Self {
+        // can't set period for PostOnce events 
+        assert!(!self.once);
+        self.e.period = period;
+        self
+    }
+
+    // note this consumes the Event, otherwise we'd risk multiple access
+    // if the id is reposted
+    pub fn into_id(self) -> Id {
+        let id = Id::new(self.q, self.e);
         forget(self);
-
         id
     }
 
-    pub fn post_static(self) -> Id where T: PostStatic {
-        // can't have a period for PostStatic events!
-        assert!(self.e.period < 0);
-
-        todo!()
-
-//        // cb/drop thunks
-//        fn cb_thunk<T: PostStatic>(e: *mut u8) {
-//            let e = Event::new(q, unsafe { Ebuf::from_data_mut_ptr(e).unwrap() });
-//            T::post_static(e);
-//        }
-//
-//        fn drop_thunk<T>(e: *mut u8) {
-//            unsafe { drop_in_place(e as *mut T) };
-//        }
-//
-//        self.e.cb = Some(cb_thunk::<T>);
-//        self.e.drop = Some(drop_thunk::<T>);
-//
-//        // mark as static
-//        self.e.info.store(self.e.info.load().set_static(true));
-//
-//        // enqueue and then forget the event
-//        let id = self.id;
-//        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
-//        forget(self);
-//
-//        id
-    }
-
-    pub fn run(self) -> Id where T: Future<Output=()> {
-        // can't have a period for Futures!
-        assert!(self.e.period < 0);
-
-        todo!()
+    pub fn post(self) -> Id {
+        // enqueue and then forget the event, it's up to equeue to
+        // drop the event later
+        let id = Id::new(self.q, self.e);
+        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+        forget(self);
+        id
     }
 }
 
@@ -1368,38 +1449,27 @@ impl<T> AsMut<T> for Event<'_, T> {
     }
 }
 
-impl<T> Borrow<T> for Event<'_, T> {
-    fn borrow(&self) -> &T {
-        unsafe { self.e.data_ref() }
-    }
-}
 
-impl<T> BorrowMut<T> for Event<'_, T> {
-    fn borrow_mut(&mut self) -> &mut T {
-        unsafe { self.e.data_mut() }
-    }
-}
-
+// convenience functions
 impl Equeue {
-    // convenience functions
     pub fn call<F: PostOnce>(&self, cb: F) -> Result<Id, Error>{
         Ok(
-            self.alloc_from(cb)?
-                .post_once()
+            self.alloc_once(cb)?
+                .post()
         )
     }
 
     pub fn call_in<F: PostOnce>(&self, delay: itick, cb: F) -> Result<Id, Error> {
         Ok(
-            self.alloc_from(cb)?
+            self.alloc_once(cb)?
                 .delay(delay)
-                .post_once()
+                .post()
         )
     }
 
     pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
         Ok(
-            self.alloc_from(cb)?
+            self.alloc(cb)?
                 .delay(period)
                 .period(period)
                 .post()
@@ -1408,8 +1478,8 @@ impl Equeue {
 
     pub fn run<F: Future<Output=()>>(&self, cb: F) -> Result<Id, Error> {
         Ok(
-            self.alloc_from(cb)?
-                .run()
+            self.alloc_future(cb)?
+                .post()
         )
     }
 }
