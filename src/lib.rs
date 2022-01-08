@@ -729,72 +729,34 @@ impl Equeue {
         }
     }
 
-    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
-        // after several implementations, this turned out rather simple,
-        // we just need to lock, remove the head of each slice, and make sure
-        // all back-references/generation counts are correct
-        //
-        // note we grab every slice that is available to run, which may
-        // be several
-        let mut dequeued = None;
+    // Central post function
+    fn post(&self, e: &mut Ebuf, target: utick) {
+        let id = self.enqueue_ebuf(e, target, false).unwrap();
 
-        loop {
-            // check if we need to bother locking first
-            if self.delta(now).filter(|&delta| delta <= 0).is_none() {
-                break;
-            }
+        // signal queue has changed
+        self.sema.signal();
 
-            if !self.lock.lock(|| {
-                match self.queue.load().as_ref(self) {
-                    // is this slice ready to dispatch?
-                    Some(head) if scmp(head.target, now).is_le() => {
-                        // remove slice from queue
-                        let nextptr = head.next.load();
-                        // make sure we update queue first to not get any readers stuck
-                        self.queue.store(nextptr);
-                        head.next.store_inc_marked(nextptr, MarkedEptr::null());
-                        head.next_back.store(Eptr::null());
+        id
+    }
 
-                        // make sure back-references are updated
-                        if let Some(next) = nextptr.as_ref(self) {
-                            next.next_back.store(Eptr::null());
-                        }
-
-                        match dequeued {
-                            None => {
-                                // before we unlock, head is in a weird state where if it's
-                                // canceled we're suddenly pointing to garbage, so we go ahead 
-                                // and mark the head as executing, since that's the very next
-                                // thing we're going to do
-                                head.info.store(head.info.load().set_pending(Pending::Dispatching));
-                                dequeued = Some(head);
-                            }
-                            Some(dequeued) => {
-                                // append slice to what's already been dequeued
-                                let dequeued_back = dequeued.sibling_back.load()
-                                    .as_ref(self).unwrap();
-                                let head_back = head.sibling_back.load()
-                                    .as_ref(self).unwrap();
-
-                                dequeued_back.sibling.store(head.as_eptr(self));
-                                head.sibling_back.store(dequeued_back.as_eptr(self));
-
-                                head_back.sibling.store(dequeued.as_eptr(self));
-                                dequeued.sibling_back.store(head_back.as_eptr(self));
-                            }
-                        }
-                        true
-                    }
-                    _ => {
-                        false
-                    }
-                }
-            }) {
-                break;
-            }
+    // Is the event pending?
+    pub fn pending(&self, id: Id) -> bool {
+        let e = id.as_ref(self);
+        if !self.contains_ebuf(e) {
+            return false;
         }
 
-        dequeued
+        // note that periodic events are always pending, we load period
+        // first since it is not necessarily atomic
+        let info = e.info.load();
+        info.id() == id.id
+            && match info.pending() {
+                Pending::Alloced => false,
+                Pending::Pending => true,
+                Pending::Dispatching => info.static_() || e.period >= 0,
+                Pending::Nested => true,
+                Pending::Canceled => false,
+            }
     }
 
     fn unqueue_ebuf<'a>(&'a self, id: Id) -> (bool, Option<&'a mut Ebuf>) {
@@ -895,6 +857,21 @@ impl Equeue {
         })
     }
 
+    // Central cancel function
+    pub fn cancel(&self, id: Id) -> bool {
+        let (canceled, e) = self.unqueue_ebuf(id);
+
+        if let Some(e) = e {
+            // make sure to clean up memory
+            if let Some(drop) = e.drop {
+                drop(e.data_mut_ptr());
+            }
+            self.dealloc_ebuf(e);
+        }
+
+        canceled
+    }
+
     // find time until next event without locking
     fn delta(&self, now: utick) -> Option<itick> {
         'retry: loop {
@@ -913,14 +890,72 @@ impl Equeue {
         }
     }
 
-    // Central post function
-    fn post(&self, e: &mut Ebuf, target: utick) {
-        let id = self.enqueue_ebuf(e, target, false).unwrap();
+    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
+        // after several implementations, this turned out rather simple,
+        // we just need to lock, remove the head of each slice, and make sure
+        // all back-references/generation counts are correct
+        //
+        // note we grab every slice that is available to run, which may
+        // be several
+        let mut dequeued = None;
 
-        // signal queue has changed
-        self.sema.signal();
+        loop {
+            // check if we need to bother locking first
+            if self.delta(now).filter(|&delta| delta <= 0).is_none() {
+                break;
+            }
 
-        id
+            if !self.lock.lock(|| {
+                match self.queue.load().as_ref(self) {
+                    // is this slice ready to dispatch?
+                    Some(head) if scmp(head.target, now).is_le() => {
+                        // remove slice from queue
+                        let nextptr = head.next.load();
+                        // make sure we update queue first to not get any readers stuck
+                        self.queue.store(nextptr);
+                        head.next.store_inc_marked(nextptr, MarkedEptr::null());
+                        head.next_back.store(Eptr::null());
+
+                        // make sure back-references are updated
+                        if let Some(next) = nextptr.as_ref(self) {
+                            next.next_back.store(Eptr::null());
+                        }
+
+                        match dequeued {
+                            None => {
+                                // before we unlock, head is in a weird state where if it's
+                                // canceled we're suddenly pointing to garbage, so we go ahead 
+                                // and mark the head as executing, since that's the very next
+                                // thing we're going to do
+                                head.info.store(head.info.load().set_pending(Pending::Dispatching));
+                                dequeued = Some(head);
+                            }
+                            Some(dequeued) => {
+                                // append slice to what's already been dequeued
+                                let dequeued_back = dequeued.sibling_back.load()
+                                    .as_ref(self).unwrap();
+                                let head_back = head.sibling_back.load()
+                                    .as_ref(self).unwrap();
+
+                                dequeued_back.sibling.store(head.as_eptr(self));
+                                head.sibling_back.store(dequeued_back.as_eptr(self));
+
+                                head_back.sibling.store(dequeued.as_eptr(self));
+                                dequeued.sibling_back.store(head_back.as_eptr(self));
+                            }
+                        }
+                        true
+                    }
+                    _ => {
+                        false
+                    }
+                }
+            }) {
+                break;
+            }
+        }
+
+        dequeued
     }
 
     // Central dispatch function
@@ -1034,42 +1069,9 @@ impl Equeue {
             now = self.clock.now();
         }
     }
+}
 
-    // Is the event pending?
-    pub fn pending(&self, id: Id) -> bool {
-        let e = id.as_ref(self);
-        if !self.contains_ebuf(e) {
-            return false;
-        }
-
-        // note that periodic events are always pending, we load period
-        // first since it is not necessarily atomic
-        let info = e.info.load();
-        info.id() == id.id
-            && match info.pending() {
-                Pending::Alloced => false,
-                Pending::Pending => true,
-                Pending::Dispatching => info.static_() || e.period >= 0,
-                Pending::Nested => true,
-                Pending::Canceled => false,
-            }
-    }
-
-    // Central cancel function
-    pub fn cancel(&self, id: Id) -> bool {
-        let (canceled, e) = self.unqueue_ebuf(id);
-
-        if let Some(e) = e {
-            // make sure to clean up memory
-            if let Some(drop) = e.drop {
-                drop(e.data_mut_ptr());
-            }
-            self.dealloc_ebuf(e);
-        }
-
-        canceled
-    }
-
+impl Equeue {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_ebuf(layout) {
