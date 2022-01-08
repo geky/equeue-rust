@@ -394,6 +394,7 @@ pub struct Equeue {
     slab: &'static [u8],
     slab_front: Atomic<usize, AtomicUsize>,
     slab_back: Atomic<usize, AtomicUsize>,
+    alloced: bool,
 
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
@@ -404,9 +405,9 @@ pub struct Equeue {
     sema: DefaultSema,
 }
 
-// TODO can we assert that these are already satisfied?
-unsafe impl Send for Equeue {}
-unsafe impl Sync for Equeue {}
+// assert that we implement Send + Sync
+#[allow(unconditional_recursion)] fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
+#[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
 
 impl Equeue {
     /// Number of bits of precision to use for scheduling events, this is limits
@@ -434,6 +435,19 @@ impl Equeue {
     ///
     const PRECISION: u8 = 6;
 
+    pub fn with_size(size: usize) -> Equeue {
+        let size = aligndown(size, align_of::<Ebuf>());
+        let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
+        let buffer = unsafe { alloc(layout) };
+
+        let mut q = Equeue::with_buffer(unsafe {
+            slice::from_raw_parts_mut(buffer, size)
+        }).unwrap();
+
+        q.alloced = true;
+        q
+    }
+
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
         // align buffer
         let align = alignup(buffer.as_ptr() as usize, align_of::<Ebuf>())
@@ -452,6 +466,7 @@ impl Equeue {
             slab: buffer,
             slab_front: Atomic::new(0),
             slab_back: Atomic::new(buffer.len()),
+            alloced: false,
 
             queue: Atomic::new(MarkedEptr::null()),
 
@@ -460,7 +475,36 @@ impl Equeue {
             sema: DefaultSema::new(),
         })
     }
+}
 
+impl Drop for Equeue {
+    fn drop(&mut self) {
+        // make sure we call drop on any events still pending
+        for head in iter::successors(
+            self.queue.load().as_ref(self),
+            |head| head.next.load().as_ref(self)
+        ) {
+            for sibling in iter::successors(
+                Some(head),
+                |sibling| sibling.sibling.load().as_ref(self)
+                    .filter(|&sibling| sibling as *const _ != head as *const _)
+            ) {
+                if let Some(drop) = sibling.drop {
+                    let sibling = unsafe { sibling.claim() };
+                    drop(sibling.data_mut_ptr());
+                }
+            }
+        }
+
+        // free allocated buffer?
+        if self.alloced {
+            let layout = Layout::from_size_align(self.slab.len(), align_of::<Ebuf>()).unwrap();
+            unsafe { dealloc(self.slab.as_ptr() as *mut u8, layout) };
+        }
+    }
+}
+
+impl Equeue {
     pub fn now(&self) -> utick {
         self.clock.now()
     }
@@ -1531,7 +1575,6 @@ impl<T> Event<'_, T> {
     }
 }
 
-// TODO we also need to implement drop for Equeue
 impl<T> Drop for Event<'_, T> {
     fn drop(&mut self) {
         // make sure we clean up if the event isn't dispatched

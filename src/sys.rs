@@ -23,6 +23,12 @@ use std::sync::Condvar;
 // - allow mutex/disable_irq impls?
 // - allow type overriding?
 
+
+// Memory allocation, this is optional
+pub(crate) use std::alloc::alloc;
+pub(crate) use std::alloc::dealloc;
+
+
 // Time primitives
 #[allow(non_camel_case_types)]
 pub(crate) type utick = u64;

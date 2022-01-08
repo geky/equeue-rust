@@ -1,16 +1,12 @@
 
 use equeue::Equeue;
 
-use std::mem::transmute;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
 #[test]
 fn test_cancel() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let id = q.call(|| {
@@ -26,10 +22,7 @@ fn test_cancel() {
 
 #[test]
 fn test_cancel_dont() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let id = q.call(|| {
@@ -45,10 +38,7 @@ fn test_cancel_dont() {
 
 #[test]
 fn test_cancel_many() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -69,10 +59,7 @@ fn test_cancel_many() {
 
 #[test]
 fn test_cancel_many_reversed() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -93,10 +80,7 @@ fn test_cancel_many_reversed() {
 
 #[test]
 fn test_cancel_many_delay() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -119,10 +103,7 @@ fn test_cancel_many_delay() {
 
 #[test]
 fn test_cancel_many_delay_reversed() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -145,10 +126,7 @@ fn test_cancel_many_delay_reversed() {
 
 #[test]
 fn test_cancel_many_periodic() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];

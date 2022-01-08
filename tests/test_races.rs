@@ -4,7 +4,6 @@ use equeue::Error;
 use equeue::PostStatic;
 use equeue::Event;
 
-use std::mem::transmute;
 use std::alloc::Layout;
 use std::thread;
 use std::sync::Mutex;
@@ -17,10 +16,7 @@ use std::mem::forget;
 
 #[test]
 fn test_race_alloc_unique() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let set = Arc::new(Mutex::new(HashSet::new()));
 
@@ -55,10 +51,7 @@ fn test_race_alloc_unique() {
 
 #[test]
 fn test_race_alloc_multiple() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let mut threads = vec![];
     for _ in 0..100 {
@@ -82,10 +75,7 @@ fn test_race_alloc_multiple() {
 
 #[test]
 fn test_race_alloc_many() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let mut threads = vec![];
     for i in 0..100 {
@@ -109,10 +99,7 @@ fn test_race_alloc_many() {
 
 #[test]
 fn test_race_post() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -163,10 +150,7 @@ fn test_race_post() {
 
 #[test]
 fn test_race_post_order() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let counts = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
@@ -224,10 +208,7 @@ fn test_race_post_order() {
 
 #[test]
 fn test_race_delay() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -280,10 +261,7 @@ fn test_race_delay() {
 
 #[test]
 fn test_race_cancel() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
 
@@ -322,10 +300,7 @@ fn test_race_cancel() {
 
 #[test]
 fn test_race_cancel_enqueue() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
 
@@ -357,10 +332,7 @@ fn test_race_cancel_enqueue() {
 
 #[test]
 fn test_race_cancel_dispatch() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -410,10 +382,7 @@ fn test_race_cancel_dispatch() {
 
 #[test]
 fn test_race_cancel_periodic() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -476,10 +445,7 @@ impl PostStatic for StaticIncrement {
 
 #[test]
 fn test_race_repost() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
     let done = Arc::new(AtomicBool::new(false));

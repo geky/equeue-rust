@@ -2,17 +2,13 @@
 use equeue::Equeue;
 use equeue::Error;
 
-use std::mem::transmute;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[test]
 fn test_async() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     q.run(async {
@@ -26,10 +22,7 @@ fn test_async() {
 
 #[test]
 fn test_async_several() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     q.run(async {
@@ -49,10 +42,7 @@ fn test_async_several() {
 
 #[test]
 fn test_async_multiple() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     for _ in 0..100 {
@@ -74,10 +64,7 @@ fn test_async_multiple() {
 
 #[test]
 fn test_async_multiple_async_std_sleep() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     for _ in 0..100 {
@@ -103,10 +90,7 @@ fn test_async_multiple_async_std_sleep() {
 
 #[test]
 fn test_async_multiple_sleep() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     for _ in 0..100 {
@@ -132,10 +116,7 @@ fn test_async_multiple_sleep() {
 
 #[test]
 fn test_async_multiple_timeout() {
-    let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap();
+    let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
     for _ in 0..100 {
