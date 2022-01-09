@@ -755,7 +755,21 @@ impl Equeue {
                 match info.pending() {
                     Pending::Alloced => {},
                     Pending::Pending => return Some(Some(false)),
-                    Pending::Dispatching | Pending::Nested if dispatching => {},
+                    Pending::Nested if dispatching => {
+                        // nested can only be marked for immediate execuction, but
+                        // we can end up here if we are marked nested while trying
+                        // to enqueue a periodic/delayed event
+                        //
+                        // we need to update our target and restart
+
+                        // TODO is this the right place to load clock.now()?
+                        let now = self.clock.now();
+                        if scmp(e.target, now).is_gt() {
+                            e.target = now;
+                            return Some(None);
+                        }
+                    }
+                    Pending::Dispatching if dispatching => {},
                     Pending::Dispatching if info.static_() => {
                         // we can't enqueue now, but we can mark as nested
                         e.info.store(info.set_pending(Pending::Nested));
@@ -907,7 +921,7 @@ impl Equeue {
                     if cancel {
                         e.info.store(info.set_pending(Pending::Canceled));
                     }
-                    (info.static_() || e.period >= 0, None)
+                    (info.static_(), None)
                 }
                 Pending::Canceled => {
                     (false, None)
@@ -918,6 +932,11 @@ impl Equeue {
 
     // Central post function
     fn post(&self, e: &mut Ebuf, target: utick) {
+        // all periodic events are static events
+        if e.period >= 0 {
+            e.info.store(e.info.load().set_static(true));
+        }
+
         let delta_changed = self.enqueue_ebuf(e, target, false).unwrap();
 
         // signal queue has changed
@@ -1628,7 +1647,7 @@ impl Equeue {
 
         fn cb_thunk<T: Future<Output=()>>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
-            assert!(e.info.load().static_());
+            debug_assert!(e.info.load().static_());
             let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
 
             // setup waker
@@ -1675,6 +1694,13 @@ impl<'a, T> Event<'a, T> {
         // can't set period for PostOnce events 
         assert!(!self.once);
         self.e.period = period;
+        self
+    }
+
+    pub fn static_(self, static_: bool) -> Self {
+        // can't make PostOnce events static
+        assert!(!self.once);
+        self.e.info.store(self.e.info.load().set_static(static_));
         self
     }
 
