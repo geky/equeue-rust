@@ -483,21 +483,27 @@ impl Equeue {
 
 impl Drop for Equeue {
     fn drop(&mut self) {
-        // make sure we call drop on any events still pending
-        for head in iter::successors(
-            self.queue.load().as_ref(self),
-            |head| head.next.load().as_ref(self)
-        ) {
-            for sibling in iter::successors(
-                Some(head),
-                |sibling| sibling.sibling.load().as_ref(self)
-                    .filter(|&sibling| sibling as *const _ != head as *const _)
-            ) {
-                if let Some(drop) = sibling.drop {
-                    let sibling = unsafe { sibling.claim() };
-                    drop(sibling.data_mut_ptr());
-                }
+        // make sure we call drop on any pending events
+        //
+        // we can't just traverse the queue here, because alloced but unpended
+        // events aren't there until trigger is called, this includes
+        // intermediary states for static events/futures.
+        //
+        // it's up to dealloc_ebuf to make sure drop is cleared after called
+        let mut i = self.slab_back.load();
+        while let Some(e) = self.slab.get(i) {
+            let e = unsafe { &*(e as *const _ as *const Ebuf) };
+            let e = unsafe { e.claim() };
+
+            if let Some(drop) = e.drop {
+                drop(e.data_mut_ptr());
             }
+            e.drop = None;
+
+            // just some extra precautions against poorly written wakers
+            e.info.store(e.info.load().inc_id());
+
+            i = i.saturating_add(size_of::<Ebuf>() + e.size());
         }
 
         // free allocated buffer?
@@ -640,6 +646,13 @@ impl Equeue {
 
     fn dealloc_ebuf(&self, e: &mut Ebuf) {
         debug_assert!(self.contains_ebuf(e));
+
+        // make sure to run destructors if assigned, and clear destructors
+        // so we don't double-drop if the equeue is itself dropped
+        if let Some(drop) = e.drop {
+            drop(e.data_mut_ptr());
+        }
+        e.drop = None;
 
         // we can load buckets here because it can never shrink
         let bucket = &self.buckets()[e.npw2() as usize];
@@ -946,9 +959,6 @@ impl Equeue {
 
         if let Some(e) = e {
             // make sure to clean up memory
-            if let Some(drop) = e.drop {
-                drop(e.data_mut_ptr());
-            }
             self.dealloc_ebuf(e);
         }
 
@@ -1019,9 +1029,6 @@ impl Equeue {
                         Err(e) => {
                             // surprisingly enough, this can fail here,
                             // if we're canceled as we enqueue
-                            if let Some(drop) = e.drop {
-                                drop(e.data_mut_ptr());
-                            }
                             self.dealloc_ebuf(e);
                             return false;
                         }
@@ -1217,9 +1224,6 @@ impl Equeue {
                 // release memory?
                 if let Some(e) = e { 
                     // call drop, return event to memory pool
-                    if let Some(drop) = e.drop {
-                        drop(e.data_mut_ptr());
-                    }
                     self.dealloc_ebuf(e);
                 }
             }
@@ -1290,12 +1294,7 @@ impl Equeue {
             None => return, // do nothing
         };
 
-        // make sure we call drop!
-        if let Some(drop) = e.drop {
-            drop(e.data_mut_ptr());
-        }
-
-        // if we don't post, we need to increment our generation here
+        // clean up ebuf
         self.dealloc_ebuf(e);
     }
 
@@ -1523,11 +1522,21 @@ impl Equeue {
 
         // cb/drop thunks
         fn cb_thunk<T: PostOnce>(e: *mut u8) {
-            unsafe { (e as *mut T).read() }.post_once();
+            // because we're post once, posting implicitly drops the callback,
+            // however we still want to drop the callback correctly if we're
+            // explicitly dropped and never called, we manage this by clearing
+            // our destructor when called
+            let t = unsafe { (e as *mut T).read()};
+            unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap().drop = None;
+            t.post_once();
+        }
+
+        fn drop_thunk<T: PostOnce>(e: *mut u8) {
+            unsafe { drop_in_place(e as *mut T) };
         }
 
         e.cb = Some(cb_thunk::<T>);
-        e.drop = None; // e will already be dropped
+        e.drop = Some(drop_thunk::<T>);
 
         // mark as a one-time event so we panic if we try to enqueue
         // multiple times
@@ -1568,6 +1577,7 @@ impl Equeue {
             assert!(e.info.load().static_());
             let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
 
+            // setup waker
             let waker = unsafe {
                 Waker::from_raw(event_waker_clone(
                     e.deref() as *const T as *const ()
@@ -1634,10 +1644,7 @@ impl<T> Event<'_, T> {
 
 impl<T> Drop for Event<'_, T> {
     fn drop(&mut self) {
-        // make sure we clean up if the event isn't dispatched
-        unsafe { drop_in_place(self.e.data_mut_ptr::<T>()) };
-
-        // have to work around our own Emut lifetime here
+        // clean up ebuf, note this runs the destructor internally
         self.q.dealloc_ebuf(self.e);
     }
 }
@@ -1936,14 +1943,12 @@ impl Equeue {
         let slab_unused = slab_back - slab_front;
 
         let mut total = 0usize;
-        let mut p = self.slab.get(slab_back)
-            .map(|p| p as *const u8)
-            .unwrap_or(ptr::null());
-        while self.slab.as_ptr_range().contains(&p) {
-            let e = unsafe { &*(p as *const Ebuf) };
+        let mut i = slab_back;
+        while let Some(e) = self.slab.get(i) {
+            let e = unsafe { &*(e as *const _ as *const Ebuf) };
 
             total += 1;
-            p = p.wrapping_add(size_of::<Ebuf>() + e.size());
+            i = i.saturating_add(size_of::<Ebuf>() + e.size());
         }
 
         // find pending usage

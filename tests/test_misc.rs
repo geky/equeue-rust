@@ -113,6 +113,7 @@ fn test_nested_async_dispatch() {
             assert_eq!(count.load(Ordering::SeqCst), i+1);
             q2.dispatch_async(100).await;
         }
+        q2.dispatch_async(100).await;
     }).unwrap();
 
     q1.dispatch(50);
