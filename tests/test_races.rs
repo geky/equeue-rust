@@ -472,7 +472,7 @@ fn test_race_repost() {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             for _ in 0..100 {
-                q.trigger(id);
+                q.pend(id);
             }
         }));
     }

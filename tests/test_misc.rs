@@ -127,3 +127,49 @@ fn test_nested_async_dispatch() {
     println!("usage: {:#?}", q1.usage());
     println!("usage: {:#?}", q2.usage());
 }
+
+#[test]
+fn test_handles() {
+    let q = Equeue::with_size(1024*1024);
+
+    let count = AtomicU32::new(0);
+    let mut handles = vec![];
+    for _ in 0..100 {
+        handles.push(
+            q.alloc(|| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }).unwrap()
+            .period(0)
+            .into_handle()
+        );
+    }
+
+    // cancel half, pend the other half
+    for (i, handle) in handles.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(handle.pend());
+        } else {
+            assert!(handle.cancel());
+        }
+    }
+
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    q.dispatch(0);
+    assert_eq!(count.load(Ordering::SeqCst), 50);
+
+    // no drop another half
+    handles.truncate(50);
+
+    assert_eq!(count.load(Ordering::SeqCst), 50);
+    q.dispatch(0);
+    assert_eq!(count.load(Ordering::SeqCst), 75);
+
+    // and release the rest
+    drop(handles);
+
+    assert_eq!(count.load(Ordering::SeqCst), 75);
+    q.dispatch(0);
+    assert_eq!(count.load(Ordering::SeqCst), 75);
+
+    println!("usage: {:#?}", q.usage());
+}

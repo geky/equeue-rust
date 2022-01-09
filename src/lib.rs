@@ -290,6 +290,8 @@ impl Einfo {
     }
 
     fn set_pending(self, pending: Pending) -> Einfo {
+        // there is one incompatible state here
+        debug_assert!(pending != Pending::Nested || self.static_());
         Einfo(
             (self.0 & !(0x6 << (8*size_of::<ugen>()-3)))
             | (pending.as_ueptr() << (8*size_of::<ugen>()-3))
@@ -486,7 +488,7 @@ impl Drop for Equeue {
         // make sure we call drop on any pending events
         //
         // we can't just traverse the queue here, because alloced but unpended
-        // events aren't there until trigger is called, this includes
+        // events aren't there until pend is called, this includes
         // intermediary states for static events/futures.
         //
         // it's up to dealloc_ebuf to make sure drop is cleared after called
@@ -754,12 +756,12 @@ impl Equeue {
                     Pending::Alloced => {},
                     Pending::Pending => return Some(Some(false)),
                     Pending::Dispatching | Pending::Nested if dispatching => {},
-                    Pending::Dispatching => {
+                    Pending::Dispatching if info.static_() => {
                         // we can't enqueue now, but we can mark as nested
                         e.info.store(info.set_pending(Pending::Nested));
                         return Some(Some(false));
                     }
-                    Pending::Nested => return Some(Some(false)),
+                    Pending::Dispatching | Pending::Nested => return Some(Some(false)),
                     Pending::Canceled => return None,
                 }
 
@@ -881,15 +883,25 @@ impl Equeue {
                     e.info.store(e.info.load().set_pending(if cancel {
                         Pending::Canceled
                     } else {
-                        Pending::Alloced
+                        Pending::Dispatching
                     }));
                     
                     // note we are responsible for the memory now
-                    let e = unsafe { e.claim() };
-
-                    (true, Some(e))
+                    (true, Some(unsafe { e.claim() }))
                 }
-                Pending::Alloced | Pending::Dispatching | Pending::Nested => {
+                Pending::Alloced => {
+                    // alloced is a weird one, if we end up here, we just need
+                    // to claim the event, and since we ensure no ids coexist
+                    // mutable references to events at the type-level, we can
+                    // be sure we have exclusive access
+                    e.info.store(info.set_pending(if cancel {
+                        Pending::Canceled
+                    } else {
+                        Pending::Dispatching
+                    }));
+                    (true, Some(unsafe { e.claim() }))
+                }
+                Pending::Dispatching | Pending::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
                     if cancel {
@@ -966,7 +978,7 @@ impl Equeue {
     }
 
     // repost an static event which may already be pending
-    pub fn trigger(&self, id: Id) -> bool {
+    pub fn pend(&self, id: Id) -> bool {
         let e = match id.as_ref(self) {
             Some(e) => e,
             None => return false,
@@ -978,8 +990,8 @@ impl Equeue {
         }
 
         loop {
-            // The main difference between trigger and post is that we may
-            // be triggering an event that's already pending. This means several
+            // The main difference between pend and post is that we may
+            // be pending an event that's already pending. This means several
             // more corner cases to handle.
             let now = self.clock.now();
             match self.lock.lock(|| {
@@ -993,7 +1005,7 @@ impl Equeue {
                     Pending::Alloced => {
                         // if we're alloced we can just enqueue, make sure to mark
                         // and claim the event first
-                        e.info.store(info.set_pending(Pending::Nested));
+                        e.info.store(info.set_pending(Pending::Dispatching));
                         Ok(Ok(unsafe { e.claim() }))
                     }
                     Pending::Pending if scmp(now, e.target).is_lt() => {
@@ -1001,13 +1013,13 @@ impl Equeue {
                         // to execute immediately
                         Ok(Err(e))
                     }
-                    Pending::Dispatching => {
+                    Pending::Dispatching if info.static_() => {
                         // someone else is dispatching, just make sure we mark that
-                        // we are interested in the event being retriggered
+                        // we are interested in the event being repended
                         e.info.store(info.set_pending(Pending::Nested));
                         Err(true)
                     }
-                    Pending::Pending | Pending::Nested => {
+                    Pending::Pending | Pending::Dispatching | Pending::Nested => {
                         // do nothing, the event is already pending
                         Err(true)
                     }
@@ -1371,7 +1383,7 @@ pub trait PostStatic: Sized + Send {
 
 
 /// An id we can use to try to cancel an event
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Id {
     id: ugen,
     eptr: Eptr,
@@ -1401,6 +1413,48 @@ impl Id {
 impl Default for Id {
     fn default() -> Id {
         Id::null()
+    }
+}
+
+/// A strongly-typed alternative to Id which implicitly cancels the
+/// event when dropped
+#[derive(Debug)]
+pub struct Handle<'a> {
+    q: &'a Equeue,
+    id: Id,
+}
+
+impl<'a> Handle<'a> {
+    fn new(q: &'a Equeue, id: Id) -> Handle {
+        Handle {
+            q: q,
+            id: id,
+        }
+    }
+
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
+    // Some other convenience functions, which can
+    // normally be done with Ids
+    pub fn delta(&self) -> Option<itick> {
+        self.q.delta(self.id)
+    }
+
+    pub fn pend(&self) -> bool {
+        self.q.pend(self.id)
+    }
+
+    // Explicitly cancel the event
+    pub fn cancel(&self) -> bool {
+        self.q.cancel(self.id)
+    }
+}
+
+impl Drop for Handle<'_> {
+    fn drop(&mut self) {
+        self.q.cancel(self.id);
     }
 }
 
@@ -1480,9 +1534,9 @@ unsafe fn event_waker_wake(e: *const ()) {
         return;
     }
 
-    // trigger
+    // pend
     let q = e.q.as_ref().unwrap();
-    q.trigger(Id::new(q, id, e));
+    q.pend(Id::new(q, id, e));
 }
 
 unsafe fn event_waker_drop(e: *const ()) {
@@ -1610,7 +1664,7 @@ impl Equeue {
     }
 }
 
-impl<T> Event<'_, T> {
+impl<'a, T> Event<'a, T> {
     pub fn delay(mut self, delay: itick) -> Self {
         debug_assert!(delay >= 0);
         self.e.target = delay as utick;
@@ -1625,11 +1679,15 @@ impl<T> Event<'_, T> {
     }
 
     // note this consumes the Event, otherwise we'd risk multiple access
-    // if the id is triggered while we still have a mutable reference
+    // if the id is pended while we still have a mutable reference
     pub fn into_id(self) -> Id {
         let id = Id::new(self.q, self.e.info.load().id(), self.e);
         forget(self);
         id
+    }
+
+    pub fn into_handle(self) -> Handle<'a> {
+        Handle::new(self.q, self.into_id())
     }
 
     pub fn post(self) -> Id {
@@ -1639,6 +1697,10 @@ impl<T> Event<'_, T> {
         self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
         forget(self);
         id
+    }
+
+    pub fn post_handle(self) -> Handle<'a> {
+        Handle::new(self.q, self.post())
     }
 }
 
@@ -1684,12 +1746,20 @@ impl Equeue {
         )
     }
 
+    pub fn call_handle<'a, F: PostOnce>(&'a self, cb: F) -> Result<Handle<'a>, Error> {
+        self.call(cb).map(|id| Handle::new(self, id))
+    }
+
     pub fn call_in<F: PostOnce>(&self, delay: itick, cb: F) -> Result<Id, Error> {
         Ok(
             self.alloc_once(cb)?
                 .delay(delay)
                 .post()
         )
+    }
+
+    pub fn call_in_handle<'a, F: PostOnce>(&'a self, delay: itick, cb: F) -> Result<Handle<'a>, Error> {
+        self.call_in(delay, cb).map(|id| Handle::new(self, id))
     }
 
     pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
@@ -1701,11 +1771,19 @@ impl Equeue {
         )
     }
 
+    pub fn call_every_handle<'a, F: Post>(&'a self, period: itick, cb: F) -> Result<Handle<'a>, Error> {
+        self.call_every(period, cb).map(|id| Handle::new(self, id))
+    }
+
     pub fn run<F: Future<Output=()>>(&self, cb: F) -> Result<Id, Error> {
         Ok(
             self.alloc_future(cb)?
                 .post()
         )
+    }
+
+    pub fn run_handle<'a, F: Future<Output=()>>(&'a self, cb: F) -> Result<Handle<'a>, Error> {
+        self.run(cb).map(|id| Handle::new(self, id))
     }
 }
 

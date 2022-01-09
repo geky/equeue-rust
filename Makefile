@@ -7,6 +7,10 @@ all build:
 test:
 	cargo test --tests
 
+.PHONY: docs
+docs:
+	cargo doc --no-deps
+
 .PHONY: clean
 clean:
 	cargo clean
