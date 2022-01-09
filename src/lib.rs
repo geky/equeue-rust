@@ -397,10 +397,10 @@ pub struct Equeue {
     slab_front: Atomic<usize, AtomicUsize>,
     slab_back: Atomic<usize, AtomicUsize>,
     alloced: bool,
-    break_: Atomic<bool, AtomicUeptr>,
 
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
+    break_: Atomic<bool, AtomicUeptr>,
 
     // other things
     clock: DefaultClock,
@@ -470,9 +470,9 @@ impl Equeue {
             slab_front: Atomic::new(0),
             slab_back: Atomic::new(buffer.len()),
             alloced: false,
-            break_: Atomic::new(false),
 
             queue: Atomic::new(MarkedEptr::null()),
+            break_: Atomic::new(false),
 
             clock: DefaultClock::new(),
             lock: DefaultLock::new(),
@@ -671,7 +671,7 @@ impl Equeue {
         e: &'a mut Ebuf,
         target: utick,
         dispatching: bool
-    ) -> Result<(), &'a mut Ebuf> {
+    ) -> Result<bool, &'a mut Ebuf> {
         let mut e = e;
         debug_assert!(e.cb.is_some());
         e.target = target;
@@ -739,30 +739,32 @@ impl Equeue {
                 let info = e.info.load();
                 match info.pending() {
                     Pending::Alloced => {},
-                    Pending::Pending => return Some(true),
+                    Pending::Pending => return Some(Some(false)),
                     Pending::Dispatching | Pending::Nested if dispatching => {},
                     Pending::Dispatching => {
                         // we can't enqueue now, but we can mark as nested
                         e.info.store(info.set_pending(Pending::Nested));
-                        return Some(true);
+                        return Some(Some(false));
                     }
-                    Pending::Nested => return Some(true),
+                    Pending::Nested => return Some(Some(false)),
                     Pending::Canceled => return None,
                 }
 
                 // did someone already change our headsrc? restart
                 if headsrc.load() != headptr {
-                    return Some(false);
+                    return Some(None);
                 }
 
                 // found our insertion point, now lets try to insert
-                match sibling {
+                let delta_changed = match sibling {
                     None => {
                         // insert a new slice
                         headsrc.store_marked(headptr, e.as_marked_eptr(self));
                         if let Some(next) = headptr.as_ref(self) {
                             next.next_back.store(e.as_eptr(self));
                         }
+
+                        headsrc as *const _ == &self.queue as *const _
                     }
                     Some(sibling) => {
                         // push onto existing slice
@@ -775,15 +777,17 @@ impl Equeue {
                         
                         sibling_back.sibling.store(e.as_eptr(self));
                         e.sibling_back.store(sibling_back.as_eptr(self));
+
+                        false
                     }
-                }
+                };
 
                 // mark as pending here, enabling removals
                 e.info.store(info.set_pending(Pending::Pending));
-                Some(true)
+                Some(Some(delta_changed))
             }) {
-                Some(true) => return Ok(()),
-                Some(false) => continue 'retry,
+                Some(Some(delta_changed)) => return Ok(delta_changed),
+                Some(None) => continue 'retry,
                 None => return Err(e),
             }
         }
@@ -872,7 +876,7 @@ impl Equeue {
 
                     (true, Some(e))
                 }
-                Pending::Dispatching | Pending::Nested => {
+                Pending::Alloced | Pending::Dispatching | Pending::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
                     if cancel {
@@ -880,7 +884,7 @@ impl Equeue {
                     }
                     (info.static_() || e.period >= 0, None)
                 }
-                Pending::Alloced | Pending::Canceled => {
+                Pending::Canceled => {
                     (false, None)
                 }
             }
@@ -889,43 +893,56 @@ impl Equeue {
 
     // Central post function
     fn post(&self, e: &mut Ebuf, target: utick) {
-        self.enqueue_ebuf(e, target, false).unwrap();
+        let delta_changed = self.enqueue_ebuf(e, target, false).unwrap();
 
         // signal queue has changed
-        self.sema.signal();
+        if delta_changed {
+            self.sema.signal();
+        }
     }
 
-    // Is the event pending?
-    pub fn pending(&self, id: Id) -> bool {
+    // How long until event executes?
+    pub fn delta(&self, id: Id) -> Option<itick> {
         let e = match id.as_ref(self) {
             Some(e) => e,
-            None => return false,
+            None => return None,
         };
 
+        // load target/period first so we can be sure these
+        // don't change after we read id
+        let target = e.target;
+        let period = e.period;
         let info = e.info.load();
         if info.id() != id.id {
-            return false;
+            return None;
         }
 
         // note that periodic events are always pending, we load period
         // first since it is not necessarily atomic
         match info.pending() {
-            Pending::Alloced => false,
-            Pending::Pending => true,
-            Pending::Dispatching => info.static_() || e.period >= 0,
-            Pending::Nested => true,
-            Pending::Canceled => false,
+            Pending::Alloced => None,
+            Pending::Pending => Some(max(sdiff(target, self.clock.now()), 0)),
+            Pending::Dispatching if period >= 0 => Some(period),
+            Pending::Dispatching => None,
+            Pending::Nested => Some(0),
+            Pending::Canceled => None,
         }
     }
 
     // Central cancel function
     pub fn cancel(&self, id: Id) -> bool {
         // check to see if we need to bother locking
-        if !self.pending(id) {
+        let e = match id.as_ref(self) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let info = e.info.load();
+        if info.id() != id.id || info.pending() == Pending::Canceled {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_ebuf(id.as_ref(self).unwrap(), id.id, true);
+        let (canceled, e) = self.unqueue_ebuf(e, id.id, true);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -992,7 +1009,13 @@ impl Equeue {
                 Ok(Ok(e)) => {
                     // reenqueue
                     match self.enqueue_ebuf(e, now, true) {
-                        Ok(()) => return true,
+                        Ok(delta_changed) => {
+                            // signal queue has changed
+                            if delta_changed {
+                                self.sema.signal();
+                            }
+                            return true;
+                        }
                         Err(e) => {
                             // surprisingly enough, this can fail here,
                             // if we're canceled as we enqueue
@@ -1016,8 +1039,16 @@ impl Equeue {
     }
 
     // find time until next event without locking
-    fn delta(&self, now: utick) -> Option<itick> {
+    //
+    // note this is clamped to 0 at minimum
+    fn dequeue_delta(&self, now: utick) -> Option<itick> {
         'retry: loop {
+            // wait, if break is requested we need to process
+            // it immediately
+            if self.break_.load() {
+                return Some(0);
+            }
+
             let headptr = self.queue.load();
             let target = match headptr.as_ref(self) {
                 Some(head) => head.target,
@@ -1029,8 +1060,12 @@ impl Equeue {
                 continue 'retry;
             }
 
-            return Some(sdiff(target, now));
+            return Some(max(sdiff(target, now), 0));
         }
+    }
+
+    pub fn next_delta(&self) -> Option<itick> {
+        self.dequeue_delta(self.clock.now())
     }
 
     fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
@@ -1044,7 +1079,7 @@ impl Equeue {
 
         loop {
             // check if we need to bother locking first
-            if self.delta(now).filter(|&delta| delta <= 0).is_none() {
+            if self.dequeue_delta(now).filter(|&delta| delta <= 0).is_none() {
                 break;
             }
 
@@ -1189,6 +1224,20 @@ impl Equeue {
                 }
             }
 
+            // was break requested?
+            if self.break_.load() {
+                if self.lock.lock(|| {
+                    if self.break_.load() {
+                        self.break_.store(false);
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    return Error::Break;
+                }
+            }
+
             // should we stop dispatching?
             //
             // note that time could have changed _significantly_
@@ -1204,10 +1253,7 @@ impl Equeue {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let mut delta = match self.delta(now) {
-                Some(delta) => max(delta, 0),
-                None => -1,
-            };
+            let mut delta = self.dequeue_delta(now).unwrap_or(-1);
 
             if (delta as utick) > (timeout_left as utick) {
                 delta = timeout_left;
@@ -1215,21 +1261,6 @@ impl Equeue {
 
             self.sema.wait(delta);
 
-            // was break requested?
-            if self.break_.load() {
-                if self.lock.lock(|| {
-                    if self.break_.load() {
-                        self.break_.store(false);
-                        true
-                    } else {
-                        false
-                    }
-                }) {
-                    return Error::Break;
-                }
-            }
-
-            // update current time
             now = self.clock.now();
         }
     }
@@ -1832,6 +1863,50 @@ impl Equeue {
             timeout: self.clock.now().wrapping_add(ticks as utick),
             id: Id::null(),
         }.await
+    }
+}
+
+impl Equeue {
+    pub async fn dispatch_async(&self, ticks: itick) -> Error {
+        // note that some of this is ungracefull copy-pasted from non-async dispatch
+
+        // get the current time
+        let now = self.clock.now();
+        let timeout = now.wrapping_add(ticks as utick);
+
+        loop {
+            // Note that we assume:
+            // 1. dispatch does not block
+            // 2. dispatch never enters self.sema.wait() 
+            match self.dispatch(0) {
+                Error::Timeout => {},
+                Error::Break => return Error::Break,
+                _ => unreachable!(),
+            }
+
+            // should we stop dispatching?
+            //
+            // note that time could have changed _significantly_
+            let now = self.clock.now();
+            let timeout_left = sdiff(timeout, now);
+            if ticks >= 0 && timeout_left <= 0 {
+                return Error::Timeout;
+            }
+
+            // ok how long should we sleep for
+            //
+            // Note that we always try to sleep between slices, this is
+            // just to behave nicely in case the system's semaphore implementation
+            // does something "clever". Note we also never enter here if
+            // ticks is 0 for similar reasons.
+            let mut delta = self.dequeue_delta(now).unwrap_or(-1);
+
+            if (delta as utick) > (timeout_left as utick) {
+                delta = timeout_left;
+            }
+
+            self.sema.wait_async(delta).await;
+        }
     }
 }
 

@@ -11,11 +11,19 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use core::cmp::Ordering;
 use core::fmt::Debug;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::Poll;
+use core::task::Context;
+use core::task::Waker;
+use core::mem::transmute;
 
 use std::time::Instant;
 use std::time::Duration;
 use std::sync::Mutex;
 use std::sync::Condvar;
+
+use async_io::Timer;
 
 
 // TODO these should be wrapped more flexbily
@@ -192,17 +200,24 @@ pub(crate) trait Sema: Send + Sync + Debug {
     fn wait(&self, ticks: itick);
 }
 
+pub(crate) trait AsyncSema: Sema {
+    type AsyncWait: Future<Output=()>;
+    fn wait_async(&self, ticks: itick) -> Self::AsyncWait;
+}
+
 #[derive(Debug)]
 pub(crate) struct DefaultSema {
     mutex: Mutex<()>,
     cond: Condvar,
+    waker: Mutex<Option<Waker>>,
 }
 
 impl Sema for DefaultSema {
     fn new() -> Self {
         Self {
             mutex: Mutex::new(()),
-            cond: Condvar::new()
+            cond: Condvar::new(),
+            waker: Mutex::new(None),
         }
     }
 
@@ -223,3 +238,67 @@ impl Sema for DefaultSema {
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct DefaultSemaAsyncWait<'a> {
+    sema: &'a DefaultSema,
+    timer: Option<Timer>,
+}
+
+impl Future for DefaultSemaAsyncWait<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // we're ok with spurious wakeups, so we can return as soon as we get
+        // any wakeup, though this does mean we need to poll at least once
+        let mut waker = self.sema.waker.lock().unwrap();
+        if waker.is_some() {
+            *waker = None;
+            drop(waker);
+
+            Poll::Ready(())
+        } else {
+            // save waker for signalling
+            *waker = Some(cx.waker().clone());
+            drop(waker);
+
+            if let Some(ref mut timer) = self.timer {
+                // wait on timer
+                unsafe { Pin::new_unchecked(timer) }
+                    .poll(cx)
+                    .map(|_| ())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for DefaultSemaAsyncWait<'_> {
+    fn drop(&mut self) {
+        // make sure waker is cleared
+        *self.sema.waker.lock().unwrap() = None;
+    }
+}
+
+impl AsyncSema for DefaultSema {
+    type AsyncWait = DefaultSemaAsyncWait<'static>;
+
+    fn wait_async(&self, ticks: itick) -> Self::AsyncWait {
+        // only allow one async wait at a time
+        debug_assert!(self.waker.lock().unwrap().is_none());
+
+        let wait = DefaultSemaAsyncWait {
+            sema: self,
+            timer: if ticks < 0 {
+                None
+            } else {
+                Some(Timer::after(Duration::from_millis(ticks as u64)))
+            }
+        };
+
+        // strip lifetime
+        unsafe { transmute(wait) }
+    }
+}
+
