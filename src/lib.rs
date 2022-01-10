@@ -228,11 +228,11 @@ impl Debug for Einfo {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Pending {
-    Alloced     = 0,
-    Pending     = 2,
-    Dispatching = 4,
-    Nested      = 6,
-    Canceled    = 7,
+    Alloced  = 0,
+    Pending  = 2,
+    InFlight = 4,
+    Nested   = 6,
+    Canceled = 7,
 }
 
 impl Pending {
@@ -240,7 +240,7 @@ impl Pending {
         match pending {
             0 | 1 => Pending::Alloced,
             2 | 3 => Pending::Pending,
-            4 | 5 => Pending::Dispatching,
+            4 | 5 => Pending::InFlight,
             6     => Pending::Nested,
             7     => Pending::Canceled,
             _ => unreachable!(),
@@ -249,11 +249,11 @@ impl Pending {
 
     fn as_ueptr(&self) -> ueptr {
         match self {
-            Pending::Alloced     => 0,
-            Pending::Pending     => 2,
-            Pending::Dispatching => 4,
-            Pending::Nested      => 6,
-            Pending::Canceled    => 7,
+            Pending::Alloced  => 0,
+            Pending::Pending  => 2,
+            Pending::InFlight => 4,
+            Pending::Nested   => 6,
+            Pending::Canceled => 7,
         }
     }
 }
@@ -633,7 +633,7 @@ impl Equeue {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Einfo::new(0, Pending::Alloced, false, npw2)),
+                info: Atomic::new(Einfo::new(0, Pending::InFlight, false, npw2)),
 
                 cb: None,
                 drop: None,
@@ -667,7 +667,7 @@ impl Equeue {
             debug_assert_ne!(info.pending(), Pending::Pending);
             e.info.store(
                 info.inc_id()
-                    .set_pending(Pending::Alloced)
+                    .set_pending(Pending::InFlight)
                     .set_static(false)
             );
 
@@ -684,8 +684,7 @@ impl Equeue {
     fn enqueue_ebuf<'a>(
         &self,
         e: &'a mut Ebuf,
-        target: utick,
-        dispatching: bool
+        target: utick
     ) -> Result<bool, &'a mut Ebuf> {
         let mut e = e;
         debug_assert!(e.cb.is_some());
@@ -755,7 +754,8 @@ impl Equeue {
                 match info.pending() {
                     Pending::Alloced => {},
                     Pending::Pending => return Some(Some(false)),
-                    Pending::Nested if dispatching => {
+                    Pending::InFlight => {},
+                    Pending::Nested => {
                         // nested can only be marked for immediate execuction, but
                         // we can end up here if we are marked nested while trying
                         // to enqueue a periodic/delayed event
@@ -769,13 +769,6 @@ impl Equeue {
                             return Some(None);
                         }
                     }
-                    Pending::Dispatching if dispatching => {},
-                    Pending::Dispatching if info.static_() => {
-                        // we can't enqueue now, but we can mark as nested
-                        e.info.store(info.set_pending(Pending::Nested));
-                        return Some(Some(false));
-                    }
-                    Pending::Dispatching | Pending::Nested => return Some(Some(false)),
                     Pending::Canceled => return None,
                 }
 
@@ -826,7 +819,7 @@ impl Equeue {
         &'a self,
         e: &'a Ebuf,
         id: ugen,
-        cancel: bool,
+        npending: Pending
     ) -> (bool, Option<&'a mut Ebuf>) {
         self.lock.lock(|| {
             // still the same event?
@@ -894,11 +887,7 @@ impl Equeue {
                     // mark as removed
                     e.next.store_inc_marked(nextptr, MarkedEptr::null());
                     // mark as not-pending
-                    e.info.store(e.info.load().set_pending(if cancel {
-                        Pending::Canceled
-                    } else {
-                        Pending::Dispatching
-                    }));
+                    e.info.store(e.info.load().set_pending(npending));
                     
                     // note we are responsible for the memory now
                     (true, Some(unsafe { e.claim() }))
@@ -908,19 +897,13 @@ impl Equeue {
                     // to claim the event, and since we ensure no ids coexist
                     // mutable references to events at the type-level, we can
                     // be sure we have exclusive access
-                    e.info.store(info.set_pending(if cancel {
-                        Pending::Canceled
-                    } else {
-                        Pending::Dispatching
-                    }));
+                    e.info.store(e.info.load().set_pending(npending));
                     (true, Some(unsafe { e.claim() }))
                 }
-                Pending::Dispatching | Pending::Nested => {
+                Pending::InFlight | Pending::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
-                    if cancel {
-                        e.info.store(info.set_pending(Pending::Canceled));
-                    }
+                    e.info.store(e.info.load().set_pending(npending));
                     (info.static_(), None)
                 }
                 Pending::Canceled => {
@@ -937,7 +920,7 @@ impl Equeue {
             e.info.store(e.info.load().set_static(true));
         }
 
-        let delta_changed = self.enqueue_ebuf(e, target, false).unwrap();
+        let delta_changed = self.enqueue_ebuf(e, target).unwrap();
 
         // signal queue has changed
         if delta_changed {
@@ -966,8 +949,8 @@ impl Equeue {
         match info.pending() {
             Pending::Alloced => None,
             Pending::Pending => Some(max(sdiff(target, self.clock.now()), 0)),
-            Pending::Dispatching if period >= 0 => Some(period),
-            Pending::Dispatching => None,
+            Pending::InFlight if period >= 0 => Some(period),
+            Pending::InFlight => None,
             Pending::Nested => Some(0),
             Pending::Canceled => None,
         }
@@ -986,7 +969,7 @@ impl Equeue {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_ebuf(e, id.id, true);
+        let (canceled, e) = self.unqueue_ebuf(e, id.id, Pending::Canceled);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -1024,7 +1007,7 @@ impl Equeue {
                     Pending::Alloced => {
                         // if we're alloced we can just enqueue, make sure to mark
                         // and claim the event first
-                        e.info.store(info.set_pending(Pending::Dispatching));
+                        e.info.store(info.set_pending(Pending::InFlight));
                         Ok(Ok(unsafe { e.claim() }))
                     }
                     Pending::Pending if scmp(now, e.target).is_lt() => {
@@ -1032,24 +1015,24 @@ impl Equeue {
                         // to execute immediately
                         Ok(Err(e))
                     }
-                    Pending::Dispatching if info.static_() => {
+                    Pending::InFlight if info.static_() => {
                         // someone else is dispatching, just make sure we mark that
                         // we are interested in the event being repended
                         e.info.store(info.set_pending(Pending::Nested));
                         Err(true)
                     }
-                    Pending::Pending | Pending::Dispatching | Pending::Nested => {
+                    Pending::Pending | Pending::Nested => {
                         // do nothing, the event is already pending
                         Err(true)
                     }
-                    Pending::Canceled => {
+                    Pending::InFlight | Pending::Canceled => {
                         Err(false)
                     }
                 }
             }) {
                 Ok(Ok(e)) => {
                     // reenqueue
-                    match self.enqueue_ebuf(e, now, true) {
+                    match self.enqueue_ebuf(e, now) {
                         Ok(delta_changed) => {
                             // signal queue has changed
                             if delta_changed {
@@ -1067,7 +1050,7 @@ impl Equeue {
                 }
                 Ok(Err(e)) => {
                     // try to unqueue and continue the loop to reenqueue sooner
-                    self.unqueue_ebuf(e, id.id, false);
+                    self.unqueue_ebuf(e, id.id, Pending::InFlight);
                 }
                 Err(success) => {
                     return success;
@@ -1143,7 +1126,7 @@ impl Equeue {
                                 // canceled we're suddenly pointing to garbage, so we go ahead 
                                 // and mark the head as executing, since that's the very next
                                 // thing we're going to do
-                                head.info.store(head.info.load().set_pending(Pending::Dispatching));
+                                head.info.store(head.info.load().set_pending(Pending::InFlight));
                                 dequeued = Some(head);
                             }
                             Some(dequeued) => {
@@ -1194,7 +1177,7 @@ impl Equeue {
                         slice = None;
                     } else {
                         // mark the next event as executing
-                        sibling.info.store(sibling.info.load().set_pending(Pending::Dispatching));
+                        sibling.info.store(sibling.info.load().set_pending(Pending::InFlight));
 
                         sibling.sibling_back.store(sibling_back.as_eptr(self));
                         sibling_back.sibling.store(sibling.as_eptr(self));
@@ -1220,8 +1203,7 @@ impl Equeue {
                     // if periodic, reenqueue, unless we get canceled
                     self.enqueue_ebuf(
                         e,
-                        self.imprecise_add(self.clock.now(), e.period),
-                        true
+                        self.imprecise_add(self.clock.now(), e.period)
                     ).err()
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
@@ -1229,7 +1211,7 @@ impl Equeue {
                     let (reenqueue, e) = self.lock.lock(|| {
                         let info = e.info.load();
                         match info.pending() {
-                            Pending::Dispatching => {
+                            Pending::InFlight => {
                                 e.info.store(info.set_pending(Pending::Alloced));
                                 (None, None)
                             }
@@ -1244,7 +1226,7 @@ impl Equeue {
                     });
 
                     if let Some(e) = reenqueue {
-                        self.enqueue_ebuf(e, self.clock.now(), true).err()
+                        self.enqueue_ebuf(e, self.clock.now()).err()
                     } else {
                         e
                     }
@@ -1707,6 +1689,9 @@ impl<'a, T> Event<'a, T> {
     // note this consumes the Event, otherwise we'd risk multiple access
     // if the id is pended while we still have a mutable reference
     pub fn into_id(self) -> Id {
+        // mark as no longer in use, allowing external pends
+        self.e.info.store(self.e.info.load().set_pending(Pending::Alloced));
+
         let id = Id::new(self.q, self.e.info.load().id(), self.e);
         forget(self);
         id
