@@ -10,6 +10,7 @@ debug-assertions = true
 
 [dependencies]
 async-io = "1.6.0"
+either = "1.6.1"
 
 [dev-dependencies]
 rand = "0.8.4"

@@ -36,6 +36,10 @@ use core::task::Waker;
 use core::task::RawWaker;
 use core::task::RawWakerVTable;
 
+use either::Either;
+use either::Left;
+use either::Right;
+
 mod util;
 mod sys;
 use util::*;
@@ -402,6 +406,7 @@ pub struct Equeue {
 
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
+    dequeue: Atomic<MarkedEptr, AtomicUdeptr>,
     break_: Atomic<bool, AtomicUeptr>,
 
     // other things
@@ -474,6 +479,7 @@ impl Equeue {
             alloced: false,
 
             queue: Atomic::new(MarkedEptr::null()),
+            dequeue: Atomic::new(MarkedEptr::null()),
             break_: Atomic::new(false),
 
             clock: DefaultClock::new(),
@@ -817,17 +823,40 @@ impl Equeue {
 
     fn unqueue_ebuf<'a>(
         &'a self,
-        e: &'a Ebuf,
-        id: ugen,
+        e: Either<(&'a Ebuf, ugen), ugen>,
         npending: Pending
     ) -> (bool, Option<&'a mut Ebuf>) {
         self.lock.lock(|| {
-            // still the same event?
-            let info = e.info.load();
-            if info.id() != id {
-                return (false, None);
-            }
-            
+            // Either unqueue a known event, with specific id, or the head of
+            // the dequeue. This looks innocent, but it's important we do both
+            // of these checks while locked, since that protects against:
+            //
+            // 1. Canceling while dispatching
+            // 2. Canceling while canceling
+            // 3. Multiple dispatchers
+            //
+            let (e, info) = match e {
+                Left((e, id)) => {
+                    // still the same event?
+                    let info = e.info.load();
+                    if info.id() != id {
+                        return (false, None);
+                    }
+
+                    (e, info)
+                }
+                Right(mark) => {
+                    // no event specified, pop from dequeue if our mark matches
+                    let dequeueptr = self.dequeue.load();
+                    let e = match dequeueptr.as_ref(self) {
+                        Some(e) if dequeueptr.gen == mark => e,
+                        _ => return (false, None),
+                    };
+
+                    (e, e.info.load())
+                }
+            };
+
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
             match info.pending() {
@@ -838,18 +867,26 @@ impl Equeue {
                     let next_back = e.next_back.load().as_ref(self);
                     let sibling = e.sibling.load().as_ref(self).unwrap();
                     let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
+
                     // we also need to remove the queue if we are the head, we can't
                     // just point to queue here with next_back because eptrs are
                     // limited to in-slab events
                     let headptr = self.queue.load();
+                    let deheadptr = self.dequeue.load();
 
-                    if next_back.is_some() || headptr.as_ptr(self) == e as *const _ {
+                    if next_back.is_some()
+                        || headptr.as_ptr(self) == e as *const _
+                        || deheadptr.as_ptr(self) == e as *const _
+                    {
                         if sibling as *const _ == e as *const _ {
                             // just remove the slice
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(MarkedEptr::null(), nextptr);
+                                self.queue.store_marked(headptr, nextptr);
+                            }
+                            if deheadptr.as_ptr(self) == e as *const _ {
+                                self.dequeue.store_marked(deheadptr, nextptr);
                             }
                             if let Some(next_back) = next_back {
                                 next_back.next.store_marked(next_back.next.load(), nextptr);
@@ -870,7 +907,10 @@ impl Equeue {
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(MarkedEptr::null(), sibling.as_marked_eptr(self));
+                                self.queue.store_marked(headptr, sibling.as_marked_eptr(self));
+                            }
+                            if deheadptr.as_ptr(self) == e as *const _ {
+                                self.dequeue.store_marked(deheadptr, sibling.as_marked_eptr(self));
                             }
                             if let Some(next_back) = next_back {
                                 next_back.next.store_marked(next_back.next.load(), sibling.as_marked_eptr(self));
@@ -911,6 +951,79 @@ impl Equeue {
                 }
             }
         })
+    }
+
+    fn dequeue_ebufs<'a>(&'a self, now: utick) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
+        let mark = 'retry: loop {
+            // dispatch already in progress? let's try to help out
+            let deheadptr = self.dequeue.load();
+            if deheadptr.as_ref(self).is_some() {
+                break deheadptr.gen;
+            }
+
+            // find all events ready to execute
+            let headptr = self.queue.load();
+            let mut back = None;
+
+            let mut tailptr = headptr;
+            let mut tailsrc = &self.queue;
+            while let Some(tail) = tailptr.as_ref(self) {
+                // not ready?
+                if scmp(tail.target, now).is_gt() {
+                    break;
+                }
+
+                back = Some(tail);
+                let nextptr = tail.next.load();
+
+                // check that the previous next pointer hasn't changed on us, if
+                // so the node we were traversing could have been removed which
+                // means we need to restart
+                if tailsrc.load() != tailptr {
+                    continue 'retry;
+                }
+
+                tailptr = nextptr;
+                tailsrc = &tail.next;
+            }
+
+            // no events ready?
+            if tailsrc as *const _ == &self.queue as *const _ {
+                return Left(iter::empty());
+            }
+
+            // try to unroll events
+            match self.lock.lock(|| {
+                // did someone already change our tailsrc? dequeue? queue? restart
+                if tailsrc.load() != tailptr
+                    || self.dequeue.load() != deheadptr
+                    || self.queue.load() != headptr
+                {
+                    return None;
+                }
+
+                // point dequeue to the head of ready events
+                self.dequeue.store_inc_marked(deheadptr, headptr);
+                // point queue to the tail of ready events
+                self.queue.store_marked(headptr, tailptr);
+
+                // cut our unrolled queue
+                back.unwrap().next.store_inc_marked(tailptr, MarkedEptr::null());
+                if let Some(tail) = tailptr.as_ref(self) {
+                    tail.next_back.store(Eptr::null());
+                }
+
+                Some(deheadptr.inc_mark().gen)
+            }) {
+                Some(mark) => break mark,
+                None => continue 'retry,
+            }
+        };
+
+        // unqueue from the dequeue list an event at a time
+        Right(iter::from_fn(move || {
+            self.unqueue_ebuf(Right(mark), Pending::InFlight).1
+        }))
     }
 
     // Central post function
@@ -969,7 +1082,7 @@ impl Equeue {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_ebuf(e, id.id, Pending::Canceled);
+        let (canceled, e) = self.unqueue_ebuf(Left((e, id.id)), Pending::Canceled);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -1050,7 +1163,7 @@ impl Equeue {
                 }
                 Ok(Err(e)) => {
                     // try to unqueue and continue the loop to reenqueue sooner
-                    self.unqueue_ebuf(e, id.id, Pending::InFlight);
+                    self.unqueue_ebuf(Left((e, id.id)), Pending::InFlight);
                 }
                 Err(success) => {
                     return success;
@@ -1089,74 +1202,6 @@ impl Equeue {
         self.dequeue_delta(self.clock.now())
     }
 
-    fn dequeue_ebufs<'a>(&'a self, now: utick) -> Option<&'a Ebuf> {
-        // after several implementations, this turned out rather simple,
-        // we just need to lock, remove the head of each slice, and make sure
-        // all back-references/generation counts are correct
-        //
-        // note we grab every slice that is available to run, which may
-        // be several
-        let mut dequeued = None;
-
-        loop {
-            // check if we need to bother locking first
-            if self.dequeue_delta(now).filter(|&delta| delta <= 0).is_none() {
-                break;
-            }
-
-            if !self.lock.lock(|| {
-                match self.queue.load().as_ref(self) {
-                    // is this slice ready to dispatch?
-                    Some(head) if scmp(head.target, now).is_le() => {
-                        // remove slice from queue
-                        let nextptr = head.next.load();
-                        // make sure we update queue first to not get any readers stuck
-                        self.queue.store(nextptr);
-                        head.next.store_inc_marked(nextptr, MarkedEptr::null());
-                        head.next_back.store(Eptr::null());
-
-                        // make sure back-references are updated
-                        if let Some(next) = nextptr.as_ref(self) {
-                            next.next_back.store(Eptr::null());
-                        }
-
-                        match dequeued {
-                            None => {
-                                // before we unlock, head is in a weird state where if it's
-                                // canceled we're suddenly pointing to garbage, so we go ahead 
-                                // and mark the head as executing, since that's the very next
-                                // thing we're going to do
-                                head.info.store(head.info.load().set_pending(Pending::InFlight));
-                                dequeued = Some(head);
-                            }
-                            Some(dequeued) => {
-                                // append slice to what's already been dequeued
-                                let dequeued_back = dequeued.sibling_back.load()
-                                    .as_ref(self).unwrap();
-                                let head_back = head.sibling_back.load()
-                                    .as_ref(self).unwrap();
-
-                                dequeued_back.sibling.store(head.as_eptr(self));
-                                head.sibling_back.store(dequeued_back.as_eptr(self));
-
-                                head_back.sibling.store(dequeued.as_eptr(self));
-                                dequeued.sibling_back.store(head_back.as_eptr(self));
-                            }
-                        }
-                        true
-                    }
-                    _ => {
-                        false
-                    }
-                }
-            }) {
-                break;
-            }
-        }
-
-        dequeued
-    }
-
     // Central dispatch function
     pub fn dispatch(&self, ticks: itick) -> Error {
         // get the current time
@@ -1165,29 +1210,7 @@ impl Equeue {
 
         loop {
             // get a slice to dispatch
-            let mut slice = self.dequeue_ebufs(now);
-
-            while let Some(e) = slice {
-                // last chance to cancel
-                self.lock.lock(|| {
-                    // remove from sibling list
-                    let sibling = e.sibling.load().as_ref(self).unwrap();
-                    let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
-                    if sibling as *const _ == e as *const _ {
-                        slice = None;
-                    } else {
-                        // mark the next event as executing
-                        sibling.info.store(sibling.info.load().set_pending(Pending::InFlight));
-
-                        sibling.sibling_back.store(sibling_back.as_eptr(self));
-                        sibling_back.sibling.store(sibling.as_eptr(self));
-                        slice = Some(sibling);
-                    }
-                });
-
-                // we now have exclusive access
-                let e = unsafe { e.claim() };
-
+            for e in self.dequeue_ebufs(now) {
                 // load id here so we can tell if it changes (which happens if the
                 // event is reclaimed in dispatch)
                 let id = e.info.load().id();
