@@ -575,14 +575,15 @@ impl Equeue {
         // want to starve larger events with smaller events
         if let Some(bucket) = self.buckets().get(npw2 as usize) {
             // try to take an event from a bucket
-            let e = self.lock.lock(|| {
+            let e = {
+                let guard = self.lock.lock();
                 if let Some(e) = bucket.load().as_ref(self) {
                     bucket.store(e.sibling.load());
                     Some(e)
                 } else {
                     None
                 }
-            });
+            };
 
             if let Some(e) = e {
                 let mut e = unsafe { e.claim() };
@@ -597,7 +598,9 @@ impl Equeue {
             }
         }
 
-        let new_slab_back = match self.lock.lock(|| {
+        let new_slab_back = {
+            let guard = self.lock.lock();
+
             // check if we even have enough memory available, we allocate both
             // an event and maybe some buckets if we don't have enough
             let slab_front = self.slab_front.load();
@@ -624,11 +627,7 @@ impl Equeue {
 
             debug_assert!(new_slab_back < slab_back);
             self.slab_back.store(new_slab_back);
-
-            Ok(new_slab_back)
-        }) {
-            Ok(new_slab_back) => new_slab_back,
-            Err(err) => return Err(err),
+            new_slab_back
         };
 
         unsafe {
@@ -667,7 +666,8 @@ impl Equeue {
 
         // add our event to a bucket, while also incrementing our
         // generation count
-        self.lock.lock(|| {
+        {   let guard = self.lock.lock();
+
             // give our event a new id
             let info = e.info.load();
             debug_assert_ne!(info.pending(), Pending::Pending);
@@ -682,7 +682,7 @@ impl Equeue {
             debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
             e.sibling.store(siblingptr);
             bucket.store(e.as_eptr(self));
-        })
+        }
     }
 
     // Queue management
@@ -751,7 +751,8 @@ impl Equeue {
             }
 
             // try to insert
-            match self.lock.lock(|| {
+            {   let guard = self.lock.lock();
+
                 // are we trying to enqueue an event that's already been canceled?
                 //
                 // this may seem seem like a weird place for this check, but
@@ -759,7 +760,7 @@ impl Equeue {
                 let info = e.info.load();
                 match info.pending() {
                     Pending::Alloced => {},
-                    Pending::Pending => return Some(Some(false)),
+                    Pending::Pending => return Ok(false),
                     Pending::InFlight => {},
                     Pending::Nested => {
                         // nested can only be marked for immediate execuction, but
@@ -772,19 +773,19 @@ impl Equeue {
                         let now = self.clock.now();
                         if scmp(e.target, now).is_gt() {
                             e.target = now;
-                            return Some(None);
+                            continue 'retry;
                         }
                     }
-                    Pending::Canceled => return None,
+                    Pending::Canceled => return Err(e),
                 }
 
                 // did someone already change our headsrc? restart
                 if headsrc.load() != headptr {
-                    return Some(None);
+                    continue 'retry;
                 }
 
                 // found our insertion point, now lets try to insert
-                let delta_changed = match sibling {
+                let change = match sibling {
                     None => {
                         // insert a new slice
                         headsrc.store_marked(headptr, e.as_marked_eptr(self));
@@ -812,11 +813,7 @@ impl Equeue {
 
                 // mark as pending here, enabling removals
                 e.info.store(info.set_pending(Pending::Pending));
-                Some(Some(delta_changed))
-            }) {
-                Some(Some(delta_changed)) => return Ok(delta_changed),
-                Some(None) => continue 'retry,
-                None => return Err(e),
+                return Ok(change)
             }
         }
     }
@@ -826,7 +823,8 @@ impl Equeue {
         e: Either<(&'a Ebuf, ugen), ugen>,
         npending: Pending
     ) -> (bool, Option<&'a mut Ebuf>) {
-        self.lock.lock(|| {
+        {   let guard = self.lock.lock();
+
             // Either unqueue a known event, with specific id, or the head of
             // the dequeue. This looks innocent, but it's important we do both
             // of these checks while locked, since that protects against:
@@ -950,7 +948,7 @@ impl Equeue {
                     (false, None)
                 }
             }
-        })
+        }
     }
 
     fn dequeue_ebufs<'a>(&'a self, now: utick) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
@@ -993,13 +991,14 @@ impl Equeue {
             }
 
             // try to unroll events
-            match self.lock.lock(|| {
+            {   let guard = self.lock.lock();
+
                 // did someone already change our tailsrc? dequeue? queue? restart
                 if tailsrc.load() != tailptr
                     || self.dequeue.load() != deheadptr
                     || self.queue.load() != headptr
                 {
-                    return None;
+                    continue 'retry;
                 }
 
                 // point dequeue to the head of ready events
@@ -1013,10 +1012,7 @@ impl Equeue {
                     tail.next_back.store(Eptr::null());
                 }
 
-                Some(deheadptr.inc_mark().gen)
-            }) {
-                Some(mark) => break mark,
-                None => continue 'retry,
+                break deheadptr.inc_mark().gen;
             }
         };
 
@@ -1109,11 +1105,13 @@ impl Equeue {
             // be pending an event that's already pending. This means several
             // more corner cases to handle.
             let now = self.clock.now();
-            match self.lock.lock(|| {
+            let reenqueue = {
+                let guard = self.lock.lock();
+
                 // still the same event?
                 let info = e.info.load();
                 if info.id() != id.id {
-                    return Err(false);
+                    return false;
                 }
 
                 match info.pending() {
@@ -1121,29 +1119,31 @@ impl Equeue {
                         // if we're alloced we can just enqueue, make sure to mark
                         // and claim the event first
                         e.info.store(info.set_pending(Pending::InFlight));
-                        Ok(Ok(unsafe { e.claim() }))
+                        Left(unsafe { e.claim() })
                     }
                     Pending::Pending if scmp(now, e.target).is_lt() => {
                         // we're pending, but in the future, we want to move this
                         // to execute immediately
-                        Ok(Err(e))
+                        Right(e)
                     }
                     Pending::InFlight if info.static_() => {
                         // someone else is dispatching, just make sure we mark that
                         // we are interested in the event being repended
                         e.info.store(info.set_pending(Pending::Nested));
-                        Err(true)
+                        return true;
                     }
                     Pending::Pending | Pending::Nested => {
                         // do nothing, the event is already pending
-                        Err(true)
+                        return true;
                     }
                     Pending::InFlight | Pending::Canceled => {
-                        Err(false)
+                        return false;
                     }
                 }
-            }) {
-                Ok(Ok(e)) => {
+            };
+
+            match reenqueue {
+                Left(e) => {
                     // reenqueue
                     match self.enqueue_ebuf(e, now) {
                         Ok(delta_changed) => {
@@ -1161,12 +1161,9 @@ impl Equeue {
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Right(e) => {
                     // try to unqueue and continue the loop to reenqueue sooner
                     self.unqueue_ebuf(Left((e, id.id)), Pending::InFlight);
-                }
-                Err(success) => {
-                    return success;
                 }
             }
         }
@@ -1231,7 +1228,8 @@ impl Equeue {
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
                     // note we could be canceled or recursively pended
-                    let (reenqueue, e) = self.lock.lock(|| {
+                    let (reenqueue, e) = {
+                        let guard = self.lock.lock();
                         let info = e.info.load();
                         match info.pending() {
                             Pending::InFlight => {
@@ -1246,7 +1244,7 @@ impl Equeue {
                             }
                             _ => unreachable!(),
                         }
-                    });
+                    };
 
                     if let Some(e) = reenqueue {
                         self.enqueue_ebuf(e, self.clock.now()).err()
@@ -1266,15 +1264,12 @@ impl Equeue {
 
             // was break requested?
             if self.break_.load() {
-                if self.lock.lock(|| {
+                {   let guard = self.lock.lock();
+
                     if self.break_.load() {
                         self.break_.store(false);
-                        true
-                    } else {
-                        false
+                        return Error::Break;
                     }
-                }) {
-                    return Error::Break;
                 }
             }
 
@@ -1307,9 +1302,10 @@ impl Equeue {
 
     // request dispatch to exit once done dispatching events
     pub fn break_(&self) {
-        self.lock.lock(|| {
+        {   let guard = self.lock.lock();
             self.break_.store(true);
-        });
+        }
+
         self.sema.signal();
     }
 }

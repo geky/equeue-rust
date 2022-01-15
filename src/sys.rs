@@ -21,6 +21,7 @@ use core::mem::transmute;
 use std::time::Instant;
 use std::time::Duration;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::Condvar;
 
 use async_io::Timer;
@@ -174,21 +175,30 @@ impl AtomicU for AtomicUeptr {
 
 // Locking primitive
 pub(crate) trait Lock: Send + Sync + Debug {
+    type Guard;
+
     fn new() -> Self;
-    fn lock<R, F: FnOnce()->R>(&self, f: F) -> R;
+    fn lock(&self) -> Self::Guard;
 }
 
 #[derive(Debug)]
 pub(crate) struct DefaultLock(Mutex<()>);
 
 impl Lock for DefaultLock {
+    // unfortunately we can't define types with lifetimes
+    // in traits, the best we can do is unsafely strip the
+    // lifetime and leave it up to the caller to drop the
+    // types in the correct order
+    type Guard = MutexGuard<'static, ()>;
+
     fn new() -> Self {
         DefaultLock(Mutex::new(()))
     }
 
-    fn lock<R, F: FnOnce() -> R>(&self, f: F) -> R {
+    fn lock(&self) -> Self::Guard {
+        // strip lifetime
         let guard = self.0.lock().unwrap();
-        f()
+        unsafe { transmute(guard) }
     }
 }
 
@@ -202,6 +212,7 @@ pub(crate) trait Sema: Send + Sync + Debug {
 
 pub(crate) trait AsyncSema: Sema {
     type AsyncWait: Future<Output=()>;
+
     fn wait_async(&self, ticks: itick) -> Self::AsyncWait;
 }
 
@@ -282,6 +293,10 @@ impl Drop for DefaultSemaAsyncWait<'_> {
 }
 
 impl AsyncSema for DefaultSema {
+    // unfortunately we can't define types with lifetimes
+    // in traits, the best we can do is unsafely strip the
+    // lifetime and leave it up to the caller to drop the
+    // types in the correct order
     type AsyncWait = DefaultSemaAsyncWait<'static>;
 
     fn wait_async(&self, ticks: itick) -> Self::AsyncWait {
