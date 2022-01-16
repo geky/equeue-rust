@@ -781,9 +781,17 @@ impl Equeue {
                     Pending::Canceled => return Err(e),
                 }
 
-                // did someone already change our tailsrc? dequeue iteration? restart
+                // did someone already change our tailsrc? restart
                 if tailsrc.load() != tailptr
-                    || self.dequeue.load().gen != dequeue_mark
+                    // if the dequeue was updated it's possible we ended up on the
+                    // dequeue list, we don't want to invalidate every event in this
+                    // case so double check that the head is expiring sooner than us
+                    || (
+                        self.dequeue.load().gen != dequeue_mark
+                        && self.queue.load().as_ref(self)
+                            .filter(|head| scmp(head.target, target).is_ge())
+                            .is_some()
+                    )
                 {
                     continue 'retry;
                 }
