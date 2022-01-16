@@ -697,21 +697,23 @@ impl Equeue {
         e.target = target;
 
         'retry: loop {
+            let dequeue_mark = self.dequeue.load().gen;
+
             // find insertion point
             let mut back = None;
             let mut sibling = None;
 
-            let mut headptr = self.queue.load();
-            let mut headsrc = &self.queue;
-            while let Some(head) = headptr.as_ref(self) {
+            let mut tailptr = self.queue.load();
+            let mut tailsrc = &self.queue;
+            while let Some(tail) = tailptr.as_ref(self) {
                 // compare targets
-                match scmp(head.target, target) {
+                match scmp(tail.target, target) {
                     Ordering::Greater => {
                         sibling = None;
                         break;
                     }
                     Ordering::Equal => {
-                        sibling = Some(head);
+                        sibling = Some(tail);
                         break;
                     }
                     Ordering::Less => {
@@ -719,25 +721,25 @@ impl Equeue {
                     }
                 }
 
-                back = Some(head);
-                let nextptr = head.next.load();
+                back = Some(tail);
+                let nextptr = tail.next.load();
 
                 // check that the previous next pointer hasn't changed on us, if
                 // so the node we were traversing could have been removed which
                 // means we need to restart
-                if headsrc.load() != headptr {
+                if tailsrc.load() != tailptr {
                     continue 'retry;
                 }
 
-                headptr = nextptr;
-                headsrc = &head.next;
+                tailptr = nextptr;
+                tailsrc = &tail.next;
             }
 
             // prepare event before locking
             match sibling {
                 None => {
                     // insert a new slice
-                    e.next.store_marked(e.next.load(), headptr);
+                    e.next.store_marked(e.next.load(), tailptr);
                     e.next_back.store(back.as_eptr(self));
                     e.sibling.store(e.as_eptr(self));
                     e.sibling_back.store(e.as_eptr(self));
@@ -779,8 +781,10 @@ impl Equeue {
                     Pending::Canceled => return Err(e),
                 }
 
-                // did someone already change our headsrc? restart
-                if headsrc.load() != headptr {
+                // did someone already change our tailsrc? dequeue iteration? restart
+                if tailsrc.load() != tailptr
+                    || self.dequeue.load().gen != dequeue_mark
+                {
                     continue 'retry;
                 }
 
@@ -788,12 +792,12 @@ impl Equeue {
                 let change = match sibling {
                     None => {
                         // insert a new slice
-                        headsrc.store_marked(headptr, e.as_marked_eptr(self));
-                        if let Some(next) = headptr.as_ref(self) {
+                        tailsrc.store_marked(tailptr, e.as_marked_eptr(self));
+                        if let Some(next) = tailptr.as_ref(self) {
                             next.next_back.store(e.as_eptr(self));
                         }
 
-                        headsrc as *const _ == &self.queue as *const _
+                        tailsrc as *const _ == &self.queue as *const _
                     }
                     Some(sibling) => {
                         // push onto existing slice
