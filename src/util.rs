@@ -4,12 +4,8 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic;
 use core::marker::PhantomData;
 use core::mem::size_of;
+use core::mem::transmute;
 use core::cmp::Ordering;
-
-use std::time::Instant;
-use std::time::Duration;
-use std::sync::Mutex;
-use std::sync::Condvar;
 
 
 // min/max
@@ -141,5 +137,4 @@ pub(crate) fn sdiff<T: Scmp>(a: T, b: T) -> <T as Scmp>::Output {
 pub(crate) fn scmp<T: Scmp>(a: T, b: T) -> Ordering {
     a.scmp(b)
 }
-
 

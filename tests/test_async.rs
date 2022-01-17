@@ -14,7 +14,7 @@ fn test_async() {
     q.run(async {
         count.fetch_add(1, Ordering::SeqCst);
     }).unwrap();
-    q.dispatch(0);
+    q.dispatch(Some(Duration::from_millis(0)));
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
     println!("usage: {:#?}", q.usage());
@@ -33,7 +33,7 @@ fn test_async_several() {
     }).unwrap();
 
     for i in 0..100 {
-        q.dispatch(0);
+        q.dispatch(Some(Duration::from_millis(0)));
         assert_eq!(count.load(Ordering::SeqCst), i+1);
     }
 
@@ -55,7 +55,7 @@ fn test_async_multiple() {
     }
 
     for i in 0..100 {
-        q.dispatch(0);
+        q.dispatch(Some(Duration::from_millis(0)));
         assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
     }
 
@@ -67,7 +67,7 @@ fn test_async_multiple_async_std_sleep() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
-    for _ in 0..100 {
+    for _ in 0..10 {
         q.run(async {
             for _ in 0..10 {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -77,14 +77,14 @@ fn test_async_multiple_async_std_sleep() {
     }
 
     for i in 0..10 {
-        q.dispatch(50);
-        assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
-        q.dispatch(50);
+        q.dispatch(Some(Duration::from_millis(50)));
+        assert_eq!(count.load(Ordering::SeqCst), (i+1)*10);
+        q.dispatch(Some(Duration::from_millis(50)));
     }
 
     // a bit of extra time so all futures are collected
-    q.dispatch(100);
-    assert_eq!(count.load(Ordering::SeqCst), 10*100);
+    q.dispatch(Some(Duration::from_millis(100)));
+    assert_eq!(count.load(Ordering::SeqCst), 10*10);
     println!("usage: {:#?}", q.usage());
 }
 
@@ -93,24 +93,24 @@ fn test_async_multiple_sleep() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
-    for _ in 0..100 {
+    for _ in 0..10 {
         q.run(async {
             for _ in 0..10 {
                 count.fetch_add(1, Ordering::SeqCst);
-                q.sleep(100).await.unwrap();
+                q.sleep(Duration::from_millis(100)).await.unwrap();
             }
         }).unwrap();
     }
 
     for i in 0..10 {
-        q.dispatch(50);
-        assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
-        q.dispatch(50);
+        q.dispatch(Some(Duration::from_millis(50)));
+        assert_eq!(count.load(Ordering::SeqCst), (i+1)*10);
+        q.dispatch(Some(Duration::from_millis(50)));
     }
 
     // a bit of extra time so all futures are collected
-    q.dispatch(100);
-    assert_eq!(count.load(Ordering::SeqCst), 10*100);
+    q.dispatch(Some(Duration::from_millis(100)));
+    assert_eq!(count.load(Ordering::SeqCst), 10*10);
     println!("usage: {:#?}", q.usage());
 }
 
@@ -124,12 +124,18 @@ fn test_async_multiple_timeout() {
             for _ in 0..10 {
                 count.fetch_add(1, Ordering::SeqCst);
                 // timeout without timing out
-                match q.timeout(100, q.yield_()).await {
+                match q.timeout(
+                    Duration::from_millis(100),
+                    q.yield_()
+                ).await {
                     Ok(()) => {},
                     Err(err) => panic!("timeout failed? {:?}", err),
                 }
                 // timeout with timing out
-                match q.timeout(100, q.sleep(1000)).await {
+                match q.timeout(
+                    Duration::from_millis(100),
+                    q.sleep(Duration::from_millis(1000))
+                ).await {
                     Ok(_) => panic!("timeout didn't time out?"),
                     Err(Error::Timeout) => {},
                     Err(err) => panic!("timeout failed? {:?}", err),
@@ -139,13 +145,13 @@ fn test_async_multiple_timeout() {
     }
 
     for i in 0..10 {
-        q.dispatch(50);
+        q.dispatch(Some(Duration::from_millis(50)));
         assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
-        q.dispatch(50);
+        q.dispatch(Some(Duration::from_millis(50)));
     }
 
     // a bit of extra time so all futures are collected
-    q.dispatch(100);
+    q.dispatch(Some(Duration::from_millis(100)));
     assert_eq!(count.load(Ordering::SeqCst), 10*100);
     println!("usage: {:#?}", q.usage());
 }

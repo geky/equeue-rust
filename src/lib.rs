@@ -35,6 +35,8 @@ use core::task::Context;
 use core::task::Waker;
 use core::task::RawWaker;
 use core::task::RawWakerVTable;
+use core::ops::Add;
+use core::ops::Sub;
 
 use either::Either;
 use either::Left;
@@ -45,28 +47,178 @@ mod sys;
 use util::*;
 use sys::*;
 
+mod traits;
+pub use traits::*;
 
-// TODO we should clean these up, maybe separate into distinct error types?
+
 /// Event queue errors
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
     NoMem,
-    Overflow,
     Timeout,
-    Break,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NoMem    => write!(f, "Out of memory"),
-            Error::Overflow => write!(f, "Value could not fit in type"),
             Error::Timeout  => write!(f, "A timeout occured"),
-            Error::Break    => write!(f, "Break requested"),
         }
     }
 }
+
+
+/// Reasons why dispatch could exit
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Dispatch {
+    Timeout,
+    Break,
+}
+
+
+/// An Instant-like tick wrapper with better memory footprint
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[repr(transparent)]
+struct Tick(utick);
+
+impl Tick {
+    const fn new(t: utick) -> Tick {
+        Self(t)
+    }
+
+    const fn ticks(&self) -> utick {
+        self.0
+    }
+
+    // we store some deltas as ticks to reuse memory, so we need this,
+    // it's not worth the noise to create a union
+    const fn as_delta(self) -> Option<Delta> {
+        Delta::new(self.ticks() as itick)
+    }
+}
+
+impl PartialOrd for Tick {
+    fn partial_cmp(&self, other: &Tick) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Tick {
+    fn cmp(&self, other: &Tick) -> Ordering {
+        scmp(self.ticks(), other.ticks())
+    }
+}
+
+// Note our Tick class is a bit odd, as it's behavior is specialized
+//
+// - Sub saturates to zero, allowing no negative deltas
+// - Add ignores wrapping, which allows Tick to ignore overflows
+
+impl Sub for Tick {
+    type Output = Delta;
+
+    fn sub(self, other: Tick) -> Delta {
+        let delta = max(sdiff(self.ticks(), other.ticks()), 0);
+        unsafe { Delta::new_unchecked(delta) }
+    }
+}
+
+impl Add<Delta> for Tick {
+    type Output = Tick;
+
+    fn add(self, other: Delta) -> Tick {
+        Tick::new(self.ticks().wrapping_add(other.ticks() as utick))
+    }
+}
+
+impl Tick {
+    fn imprecise_add(self, other: Delta, precision: u8) -> Tick {
+        // In order to limit precision (which leads to more efficient data
+        // structures and fewer wakeups/power consumption), we round up to
+        // latest deadline in the configured precision. This just means
+        // oring any bits lower than the precision with 1.
+        //
+        // Note that this always ensures a later deadline.
+        let mask = (1 << (
+            (8*size_of::<utick>() as u8).saturating_sub(
+                other.ticks().leading_zeros() as u8 + Equeue::PRECISION
+            )
+        )) - 1;
+
+        Tick::new(self.ticks().wrapping_add(other.ticks() as utick) | mask)
+    }
+}
+
+/// An Duration-like tick wrapper with better memory footprint
+///
+/// We store this inverted to take advantage of zero niches
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct Delta(NonZeroItick);
+
+impl Debug for Delta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Delta")
+            .field(&self.ticks())
+            .finish()
+    }
+}
+
+impl Delta {
+    pub const fn zero() -> Delta {
+        Self(unsafe { NonZeroItick::new_unchecked(!0) })
+    }
+
+    pub const fn new(t: itick) -> Option<Delta> {
+        if t >= 0 {
+            Some(unsafe { Self::new_unchecked(t) })
+        } else {
+            None
+        }
+    }
+
+    pub const unsafe fn new_unchecked(t: itick) -> Delta {
+        Self(NonZeroItick::new_unchecked(!t))
+    }
+
+    pub const fn ticks(self) -> itick {
+        !self.0.get()
+    }
+
+    // we store some deltas as ticks to reuse memory, so we need this,
+    // it's not worth the noise to create a union
+    const fn as_tick(self) -> Tick {
+        Tick::new(self.ticks() as utick)
+    }
+}
+
+impl PartialOrd for Delta {
+    fn partial_cmp(&self, other: &Delta) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Delta {
+    fn cmp(&self, other: &Delta) -> Ordering {
+        self.ticks().cmp(&other.ticks())
+    }
+}
+
+
+// TODO for testing
+//impl From<itick> for Delta {
+//    fn from(t: itick) -> Delta {
+//        Delta::new(t).unwrap()
+//    }
+//}
+//
+//impl From<Delta> for itick {
+//    fn from(t: Delta) -> itick {
+//        t.ticks()
+//    }
+//}
+
 
 
 /// Small wrapper to generalize atomics to any <= udeptr sized type
@@ -324,8 +476,8 @@ struct Ebuf {
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
-    target: utick,
-    period: itick,
+    target: Tick,
+    period: Option<Delta>,
     q: *const Equeue,
 }
 
@@ -459,6 +611,9 @@ impl Equeue {
     }
 
     pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
+        // some sanity checks
+        debug_assert_eq!(size_of::<Option<Delta>>(), size_of::<itick>());
+
         // align buffer
         let align = alignup(buffer.as_ptr() as usize, align_of::<Ebuf>())
             - buffer.as_ptr() as usize;
@@ -497,7 +652,7 @@ impl Drop for Equeue {
         // events aren't there until pend is called, this includes
         // intermediary states for static events/futures.
         //
-        // it's up to dealloc_ebuf to make sure drop is cleared after called
+        // it's up to dealloc_ to make sure drop is cleared after called
         let mut i = self.slab_back.load();
         while let Some(e) = self.slab.get(i) {
             let e = unsafe { &*(e as *const _ as *const Ebuf) };
@@ -523,27 +678,7 @@ impl Drop for Equeue {
 }
 
 impl Equeue {
-    pub fn now(&self) -> utick {
-        self.clock.now()
-    }
-
-    fn imprecise_add(&self, a: utick, b: itick) -> utick {
-        // In order to limit precision (which leads to more efficient data
-        // structures and fewer wakeups/power consumption), we round up to
-        // latest deadline in the configured precision. This just means
-        // oring any bits lower than the precision with 1.
-        //
-        // Note that this always ensures a later deadline.
-        let mask = (1 << (
-            (8*size_of::<utick>() as u8).saturating_sub(
-                b.leading_zeros() as u8 + Equeue::PRECISION
-            )
-        )) - 1;
-
-        a.wrapping_add(b as utick) | mask
-    }
-
-    fn contains_ebuf(&self, e: &Ebuf) -> bool {
+    fn contains(&self, e: &Ebuf) -> bool {
         self.slab.as_ptr_range()
             .contains(&(e.deref() as *const _ as *const u8))
     }
@@ -559,7 +694,7 @@ impl Equeue {
     }
 
     // Memory management
-    fn alloc_ebuf<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
+    fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
         // this looks arbitrary, but Ebuf should have a pretty reasonable
         // alignment since it contains both function pointers and AtomicUdeptrs
         assert!(layout.align() <= align_of::<Ebuf>());
@@ -591,8 +726,8 @@ impl Equeue {
                 // zero certain fields
                 e.cb = None;
                 e.drop = None;
-                e.target = 0;
-                e.period = -1;
+                e.target = Tick::new(0);
+                e.period = None;
                 e.q = ptr::null();
                 return Ok(e);
             }
@@ -642,8 +777,8 @@ impl Equeue {
 
                 cb: None,
                 drop: None,
-                target: 0,
-                period: -1,
+                target: Tick::new(0),
+                period: None,
                 q: ptr::null(),
             });
 
@@ -651,8 +786,8 @@ impl Equeue {
         }
     }
 
-    fn dealloc_ebuf(&self, e: &mut Ebuf) {
-        debug_assert!(self.contains_ebuf(e));
+    fn dealloc_(&self, e: &mut Ebuf) {
+        debug_assert!(self.contains(e));
 
         // make sure to run destructors if assigned, and clear destructors
         // so we don't double-drop if the equeue is itself dropped
@@ -686,11 +821,15 @@ impl Equeue {
     }
 
     // Queue management
+    fn now(&self) -> Tick {
+        Tick::new(self.clock.now())
+    }
+
     #[must_use]
-    fn enqueue_ebuf<'a>(
+    fn enqueue_<'a>(
         &self,
         e: &'a mut Ebuf,
-        target: utick
+        target: Tick
     ) -> Result<bool, &'a mut Ebuf> {
         let mut e = e;
         debug_assert!(e.cb.is_some());
@@ -707,7 +846,7 @@ impl Equeue {
             let mut tailsrc = &self.queue;
             while let Some(tail) = tailptr.as_ref(self) {
                 // compare targets
-                match scmp(tail.target, target) {
+                match tail.target.cmp(&target) {
                     Ordering::Greater => {
                         sibling = None;
                         break;
@@ -772,8 +911,8 @@ impl Equeue {
                         // we need to update our target and restart
 
                         // TODO is this the right place to load clock.now()?
-                        let now = self.clock.now();
-                        if scmp(e.target, now).is_gt() {
+                        let now = self.now();
+                        if e.target > now {
                             e.target = now;
                             continue 'retry;
                         }
@@ -822,7 +961,7 @@ impl Equeue {
         }
     }
 
-    fn unqueue_ebuf<'a>(
+    fn unqueue_<'a>(
         &'a self,
         e: Either<(&'a Ebuf, ugen), ugen>,
         npending: Pending
@@ -955,7 +1094,7 @@ impl Equeue {
         }
     }
 
-    fn dequeue_ebufs<'a>(&'a self, now: utick) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
+    fn dequeue_<'a>(&'a self, now: Tick) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
         let mark = 'retry: loop {
             // dispatch already in progress? let's try to help out
             let deheadptr = self.dequeue.load();
@@ -971,7 +1110,7 @@ impl Equeue {
             let mut tailsrc = &self.queue;
             while let Some(tail) = tailptr.as_ref(self) {
                 // not ready?
-                if scmp(tail.target, now).is_gt() {
+                if tail.target > now {
                     break;
                 }
 
@@ -1022,18 +1161,21 @@ impl Equeue {
 
         // unqueue from the dequeue list an event at a time
         Right(iter::from_fn(move || {
-            self.unqueue_ebuf(Right(mark), Pending::InFlight).1
+            self.unqueue_(Right(mark), Pending::InFlight).1
         }))
     }
 
     // Central post function
-    fn post(&self, e: &mut Ebuf, target: utick) {
+    fn post_(&self, e: &mut Ebuf, delta: Delta) {
+        // calculate target
+        let target = self.now().imprecise_add(delta, Equeue::PRECISION);
+
         // all periodic events are static events
-        if e.period >= 0 {
+        if e.period.is_some() {
             e.info.store(e.info.load().set_static(true));
         }
 
-        let delta_changed = self.enqueue_ebuf(e, target).unwrap();
+        let delta_changed = self.enqueue_(e, target).unwrap();
 
         // signal queue has changed
         if delta_changed {
@@ -1042,7 +1184,7 @@ impl Equeue {
     }
 
     // How long until event executes?
-    pub fn delta(&self, id: Id) -> Option<itick> {
+    fn delta_(&self, id: Id) -> Option<Delta> {
         let e = match id.as_ref(self) {
             Some(e) => e,
             None => return None,
@@ -1061,12 +1203,15 @@ impl Equeue {
         // first since it is not necessarily atomic
         match info.pending() {
             Pending::Alloced => None,
-            Pending::Pending => Some(max(sdiff(target, self.clock.now()), 0)),
-            Pending::InFlight if period >= 0 => Some(period),
-            Pending::InFlight => None,
-            Pending::Nested => Some(0),
+            Pending::Pending => Some(target - self.now()),
+            Pending::InFlight => period,
+            Pending::Nested => Some(Delta::zero()),
             Pending::Canceled => None,
         }
+    }
+
+    pub fn delta<Δ: From<Delta>>(&self, id: Id) -> Option<Δ> {
+        self.delta_(id).map(Δ::from)
     }
 
     // Central cancel function
@@ -1082,11 +1227,11 @@ impl Equeue {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_ebuf(Left((e, id.id)), Pending::Canceled);
+        let (canceled, e) = self.unqueue_(Left((e, id.id)), Pending::Canceled);
 
         if let Some(e) = e {
             // make sure to clean up memory
-            self.dealloc_ebuf(e);
+            self.dealloc_(e);
         }
 
         canceled
@@ -1108,7 +1253,7 @@ impl Equeue {
             // The main difference between pend and post is that we may
             // be pending an event that's already pending. This means several
             // more corner cases to handle.
-            let now = self.clock.now();
+            let now = self.now();
             let reenqueue = {
                 let guard = self.lock.lock();
 
@@ -1125,7 +1270,7 @@ impl Equeue {
                         e.info.store(info.set_pending(Pending::InFlight));
                         Left(unsafe { e.claim() })
                     }
-                    Pending::Pending if scmp(now, e.target).is_lt() => {
+                    Pending::Pending if now < e.target => {
                         // we're pending, but in the future, we want to move this
                         // to execute immediately
                         Right(e)
@@ -1149,7 +1294,7 @@ impl Equeue {
             match reenqueue {
                 Left(e) => {
                     // reenqueue
-                    match self.enqueue_ebuf(e, now) {
+                    match self.enqueue_(e, now) {
                         Ok(delta_changed) => {
                             // signal queue has changed
                             if delta_changed {
@@ -1160,14 +1305,14 @@ impl Equeue {
                         Err(e) => {
                             // surprisingly enough, this can fail here,
                             // if we're canceled as we enqueue
-                            self.dealloc_ebuf(e);
+                            self.dealloc_(e);
                             return false;
                         }
                     }
                 }
                 Right(e) => {
                     // try to unqueue and continue the loop to reenqueue sooner
-                    self.unqueue_ebuf(Left((e, id.id)), Pending::InFlight);
+                    self.unqueue_(Left((e, id.id)), Pending::InFlight);
                 }
             }
         }
@@ -1176,12 +1321,12 @@ impl Equeue {
     // find time until next event without locking
     //
     // note this is clamped to 0 at minimum
-    fn dequeue_delta(&self, now: utick) -> Option<itick> {
+    fn next_delta_(&self, now: Tick) -> Option<Delta> {
         'retry: loop {
             // wait, if break is requested we need to process
             // it immediately
             if self.break_.load() {
-                return Some(0);
+                return Some(Delta::zero());
             }
 
             let headptr = self.queue.load();
@@ -1195,23 +1340,24 @@ impl Equeue {
                 continue 'retry;
             }
 
-            return Some(max(sdiff(target, now), 0));
+            break Some(target - now);
         }
     }
 
-    pub fn next_delta(&self) -> Option<itick> {
-        self.dequeue_delta(self.clock.now())
+    pub fn next_delta<Δ: From<Delta>>(&self) -> Option<Δ> {
+        self.next_delta_(self.now())
+            .map(Δ::from)
     }
 
     // Central dispatch function
-    pub fn dispatch(&self, ticks: itick) -> Error {
+    fn dispatch_(&self, delta: Option<Delta>) -> Dispatch {
         // get the current time
-        let mut now = self.clock.now();
-        let timeout = now.wrapping_add(ticks as utick);
+        let mut now = self.now();
+        let timeout = delta.map(|delta| now + delta);
 
         loop {
             // get a slice to dispatch
-            for e in self.dequeue_ebufs(now) {
+            for e in self.dequeue_(now) {
                 // load id here so we can tell if it changes (which happens if the
                 // event is reclaimed in dispatch)
                 let id = e.info.load().id();
@@ -1223,12 +1369,12 @@ impl Equeue {
                 let e = if id != info.id() {
                     // deallocated while dispatching?
                     None
-                } else if e.period >= 0 {
+                } else if let Some(period) = e.period {
                     // if periodic, reenqueue, unless we get canceled
-                    self.enqueue_ebuf(
-                        e,
-                        self.imprecise_add(self.clock.now(), e.period)
-                    ).err()
+                    self.enqueue_(e, self.now().imprecise_add(
+                        period,
+                        Equeue::PRECISION
+                    )).err()
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
                     // note we could be canceled or recursively pended
@@ -1250,8 +1396,9 @@ impl Equeue {
                         }
                     };
 
+                    // TODO restructure this?
                     if let Some(e) = reenqueue {
-                        self.enqueue_ebuf(e, self.clock.now()).err()
+                        self.enqueue_(e, self.now()).err()
                     } else {
                         e
                     }
@@ -1262,7 +1409,7 @@ impl Equeue {
                 // release memory?
                 if let Some(e) = e { 
                     // call drop, return event to memory pool
-                    self.dealloc_ebuf(e);
+                    self.dealloc_(e);
                 }
             }
 
@@ -1272,7 +1419,7 @@ impl Equeue {
 
                     if self.break_.load() {
                         self.break_.store(false);
-                        return Error::Break;
+                        return Dispatch::Break;
                     }
                 }
             }
@@ -1280,10 +1427,12 @@ impl Equeue {
             // should we stop dispatching?
             //
             // note that time could have changed _significantly_
-            now = self.clock.now();
-            let timeout_left = sdiff(timeout, now);
-            if ticks >= 0 && timeout_left <= 0 {
-                return Error::Timeout;
+            now = self.now();
+            let timeout_left = timeout.map(|timeout| timeout - now);
+            if let Some(timeout_left) = timeout_left {
+                if timeout_left <= Delta::zero() {
+                    return Dispatch::Timeout;
+                }
             }
 
             // ok how long should we sleep for
@@ -1292,16 +1441,23 @@ impl Equeue {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let mut delta = self.dequeue_delta(now).unwrap_or(-1);
-
-            if (delta as utick) > (timeout_left as utick) {
-                delta = timeout_left;
-            }
+            let delta = self.next_delta_(now)
+                .into_iter().chain(timeout_left)
+                .min();
 
             self.sema.wait(delta);
 
-            now = self.clock.now();
+            now = self.now();
         }
+    }
+
+    pub fn dispatch<Δ: TryInto<Delta>>(&self, delta: Option<Δ>) -> Dispatch {
+        self.dispatch_(
+            delta.map(|delta|
+                delta.try_into().ok()
+                    .expect("delta overflow in equeue")
+            )
+        )
     }
 
     // request dispatch to exit once done dispatching events
@@ -1317,7 +1473,7 @@ impl Equeue {
 impl Equeue {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
-        match self.alloc_ebuf(layout) {
+        match self.alloc_(layout) {
             Ok(e) => e.data_mut_ptr(),
             Err(_) => ptr::null_mut(),
         }
@@ -1331,27 +1487,31 @@ impl Equeue {
         };
 
         // clean up ebuf
-        self.dealloc_ebuf(e);
+        self.dealloc_(e);
     }
 
     pub fn contains_raw(&self, e: *mut u8) -> bool {
         match unsafe { Ebuf::from_data_mut_ptr(e) } {
-            Some(e) => self.contains_ebuf(e),
+            Some(e) => self.contains(e),
             None => false,
         }
     }
 
-    pub unsafe fn set_raw_delay(&self, e: *mut u8, delay: itick) {
+    pub unsafe fn set_raw_delay<Δ: TryInto<Delta>>(&self, e: *mut u8, delay: Δ) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        debug_assert!(delay >= 0);
-        e.target = delay as utick;
+        e.target = delay.try_into().ok()
+            .expect("delta overflow in equeue")
+            .as_tick();
     }
 
-    pub unsafe fn set_raw_period(&self, e: *mut u8, period: itick) {
+    pub unsafe fn set_raw_period<Δ: TryInto<Delta>>(&self, e: *mut u8, period: Option<Δ>) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.period = period;
+        e.period = period.map(|period|
+            period.try_into().ok()
+                .expect("delta overflow in equeue")
+        );
     }
 
     pub unsafe fn set_raw_static(&self, e: *mut u8, static_: bool) {
@@ -1372,37 +1532,9 @@ impl Equeue {
         e.cb = Some(cb);
 
         let id = Id::new(self, e.info.load().id(), e);
-        self.post(e, self.imprecise_add(self.clock.now(), e.target as itick));
+        self.post_(e, e.target.as_delta().unwrap());
         id
     }
-}
-
-
-/// Post trait
-pub trait Post: Send {
-    fn post(&mut self);
-}
-
-impl<F: FnMut() + Send> Post for F {
-    fn post(&mut self) {
-        self()
-    }
-}
-
-/// Post-once trait, a special case
-pub trait PostOnce: Send {
-    fn post_once(self);
-}
-
-impl<F: FnOnce() + Send> PostOnce for F {
-    fn post_once(self) {
-        self()
-    }
-}
-
-/// Post-static trait, a post that does not reclaim memory
-pub trait PostStatic: Sized + Send {
-    fn post_static(self_: Event<'_, Self>);
 }
 
 
@@ -1462,7 +1594,7 @@ impl<'a> Handle<'a> {
 
     // Some other convenience functions, which can
     // normally be done with Ids
-    pub fn delta(&self) -> Option<itick> {
+    pub fn delta<Δ: From<Delta>>(&self) -> Option<Δ> {
         self.q.delta(self.id)
     }
 
@@ -1483,12 +1615,14 @@ impl Drop for Handle<'_> {
 }
 
 
+// TODO can we make Event accept ?Sized? The issue is not the allocation, 
+// the issue is that we'd need to store a fat pointer somehow
 /// Event handle
 pub struct Event<'a, T> {
     q: &'a Equeue,
     e: &'a mut Ebuf,
     once: bool,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomData<&'a mut T>,
 }
 
 impl<T: Debug> Debug for Event<'_, T> {
@@ -1575,8 +1709,8 @@ const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 impl Equeue {
-    pub fn alloc<'a, T: Post>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
+    pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
 
         // cb/drop thunks
@@ -1594,8 +1728,8 @@ impl Equeue {
         Ok(Event::new(self, e, false))
     }
 
-    pub fn alloc_once<'a, T: PostOnce>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
+    pub fn alloc_once<'a, T: PostOnce + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
 
         // cb/drop thunks
@@ -1621,8 +1755,8 @@ impl Equeue {
         Ok(Event::new(self, e, true))
     }
 
-    pub fn alloc_static<'a, T: PostStatic>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
+    pub fn alloc_static<'a, T: PostStatic + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
         e.q = self as *const Equeue;
 
@@ -1645,8 +1779,8 @@ impl Equeue {
         Ok(Event::new(self, e, false))
     }
 
-    pub fn alloc_future<'a, T: Future<Output=()>>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
-        let e = self.alloc_ebuf(Layout::new::<T>())?;
+    pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+        let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
         e.q = self as *const Equeue;
 
@@ -1689,16 +1823,20 @@ impl Equeue {
 }
 
 impl<'a, T> Event<'a, T> {
-    pub fn delay(mut self, delay: itick) -> Self {
-        debug_assert!(delay >= 0);
-        self.e.target = delay as utick;
+    pub fn delay<Δ: TryInto<Delta>>(mut self, delay: Δ) -> Self {
+        self.e.target = delay.try_into().ok()
+            .expect("delta overflow in equeue")
+            .as_tick();
         self
     }
 
-    pub fn period(mut self, period: itick) -> Self {
+    pub fn period<Δ: TryInto<Delta>>(mut self, period: Option<Δ>) -> Self {
         // can't set period for PostOnce events 
         assert!(!self.once);
-        self.e.period = period;
+        self.e.period = period.map(|period|
+            period.try_into().ok()
+                .expect("delta overflow in equeue")
+        );
         self
     }
 
@@ -1728,7 +1866,7 @@ impl<'a, T> Event<'a, T> {
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
         let id = Id::new(self.q, self.e.info.load().id(), self.e);
-        self.q.post(self.e, self.q.imprecise_add(self.q.now(), self.e.target as itick));
+        self.q.post_(self.e, self.e.target.as_delta().unwrap());
         forget(self);
         id
     }
@@ -1741,7 +1879,7 @@ impl<'a, T> Event<'a, T> {
 impl<T> Drop for Event<'_, T> {
     fn drop(&mut self) {
         // clean up ebuf, note this runs the destructor internally
-        self.q.dealloc_ebuf(self.e);
+        self.q.dealloc_(self.e);
     }
 }
 
@@ -1773,18 +1911,21 @@ impl<T> AsMut<T> for Event<'_, T> {
 
 // convenience functions
 impl Equeue {
-    pub fn call<F: PostOnce>(&self, cb: F) -> Result<Id, Error>{
+    pub fn call<F: PostOnce + Send>(
+        &self,
+        cb: F
+    ) -> Result<Id, Error>{
         Ok(
             self.alloc_once(cb)?
                 .post()
         )
     }
 
-    pub fn call_handle<'a, F: PostOnce>(&'a self, cb: F) -> Result<Handle<'a>, Error> {
-        self.call(cb).map(|id| Handle::new(self, id))
-    }
-
-    pub fn call_in<F: PostOnce>(&self, delay: itick, cb: F) -> Result<Id, Error> {
+    pub fn call_in<Δ: TryInto<Delta>, F: PostOnce + Send>(
+        &self,
+        delay: Δ,
+        cb: F
+    ) -> Result<Id, Error> {
         Ok(
             self.alloc_once(cb)?
                 .delay(delay)
@@ -1792,31 +1933,58 @@ impl Equeue {
         )
     }
 
-    pub fn call_in_handle<'a, F: PostOnce>(&'a self, delay: itick, cb: F) -> Result<Handle<'a>, Error> {
-        self.call_in(delay, cb).map(|id| Handle::new(self, id))
-    }
-
-    pub fn call_every<F: Post>(&self, period: itick, cb: F) -> Result<Id, Error> {
+    pub fn call_every<Δ: TryInto<Delta>, F: Post + Send>(
+        &self,
+        period: Δ,
+        cb: F
+    ) -> Result<Id, Error> {
+        let period = period.try_into().ok()
+            .expect("delta overflow in equeue");
         Ok(
             self.alloc(cb)?
                 .delay(period)
-                .period(period)
+                .period(Some(period))
                 .post()
         )
     }
 
-    pub fn call_every_handle<'a, F: Post>(&'a self, period: itick, cb: F) -> Result<Handle<'a>, Error> {
-        self.call_every(period, cb).map(|id| Handle::new(self, id))
-    }
-
-    pub fn run<F: Future<Output=()>>(&self, cb: F) -> Result<Id, Error> {
+    pub fn run<F: Future<Output=()> + Send>(
+        &self,
+        cb: F
+    ) -> Result<Id, Error> {
         Ok(
             self.alloc_future(cb)?
                 .post()
         )
     }
 
-    pub fn run_handle<'a, F: Future<Output=()>>(&'a self, cb: F) -> Result<Handle<'a>, Error> {
+    pub fn call_handle<'a, F: PostOnce + Send>(
+        &'a self,
+        cb: F
+    ) -> Result<Handle<'a>, Error> {
+        self.call(cb).map(|id| Handle::new(self, id))
+    }
+
+    pub fn call_in_handle<'a, Δ: TryInto<Delta>, F: PostOnce + Send>(
+        &'a self,
+        delay: Δ,
+        cb: F
+    ) -> Result<Handle<'a>, Error> {
+        self.call_in(delay, cb).map(|id| Handle::new(self, id))
+    }
+
+    pub fn call_every_handle<'a, Δ: TryInto<Delta>, F: Post + Send>(
+        &'a self,
+        period: Δ,
+        cb: F
+    ) -> Result<Handle<'a>, Error> {
+        self.call_every(period, cb).map(|id| Handle::new(self, id))
+    }
+
+    pub fn run_handle<'a, F: Future<Output=()> + Send>(
+        &'a self,
+        cb: F
+    ) -> Result<Handle<'a>, Error> {
         self.run(cb).map(|id| Handle::new(self, id))
     }
 }
@@ -1862,7 +2030,7 @@ impl Future for AsyncYield<'_> {
 struct AsyncSleep<'a> {
     q: &'a Equeue,
     yielded: bool,
-    timeout: utick,
+    timeout: Tick,
     id: Id,
 }
 
@@ -1871,8 +2039,8 @@ impl Future for AsyncSleep<'_> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // expired?
-        let delta = sdiff(self.timeout, self.q.clock.now());
-        if delta <= 0 {
+        let delta = self.timeout - self.q.now();
+        if delta <= Delta::zero() {
             if self.yielded {
                 Poll::Ready(Ok(()))
             } else {
@@ -1910,7 +2078,7 @@ impl Drop for AsyncSleep<'_> {
 struct AsyncTimeout<'a, F> {
     q: &'a Equeue,
     f: F,
-    timeout: utick,
+    timeout: Tick,
     id: Id,
 }
 
@@ -1928,8 +2096,8 @@ impl<F: Future> Future for AsyncTimeout<'_, F> {
         }
 
         // expired?
-        let delta = sdiff(self_.timeout, self_.q.clock.now());
-        if delta <= 0 {
+        let delta = self_.timeout - self_.q.now();
+        if delta <= Delta::zero() {
             Poll::Ready(Err(Error::Timeout))
         } else {
             self_.q.cancel(self_.id);
@@ -1963,53 +2131,58 @@ impl Equeue {
         }.await
     }
 
-    pub async fn sleep(&self, ticks: itick) -> Result<(), Error> {
+    pub async fn sleep<Δ: TryInto<Delta>>(&self, delta: Δ) -> Result<(), Error> {
+        let delta = delta.try_into().ok()
+            .expect("delta overflow in equeue");
         AsyncSleep {
             q: self,
             yielded: false,
-            timeout: self.clock.now().wrapping_add(ticks as utick),
+            timeout: self.now() + delta,
             id: Id::null(),
         }.await
     }
 
-    pub async fn timeout<F, R> (&self, ticks: itick, f: F) -> Result<R, Error>
+    pub async fn timeout<Δ: TryInto<Delta>, R, F> (&self, delta: Δ, f: F) -> Result<R, Error>
     where
         F: Future<Output=R>
     {
+        let delta = delta.try_into().ok()
+            .expect("delta overflow in equeue");
         AsyncTimeout {
             q: self,
             f: f,
-            timeout: self.clock.now().wrapping_add(ticks as utick),
+            timeout: self.now() + delta,
             id: Id::null(),
         }.await
     }
 }
 
 impl Equeue {
-    pub async fn dispatch_async(&self, ticks: itick) -> Error {
+    async fn dispatch_async_(&self, delta: Option<Delta>) -> Dispatch {
         // note that some of this is ungracefull copy-pasted from non-async dispatch
 
         // get the current time
-        let now = self.clock.now();
-        let timeout = now.wrapping_add(ticks as utick);
+        let mut now = self.now();
+        let timeout = delta.map(|delta| now + delta);
 
         loop {
             // Note that we assume:
             // 1. dispatch does not block
             // 2. dispatch never enters self.sema.wait() 
-            match self.dispatch(0) {
-                Error::Timeout => {},
-                Error::Break => return Error::Break,
-                _ => unreachable!(),
+            match self.dispatch(Some(Delta::zero())) {
+                Dispatch::Timeout => {},
+                Dispatch::Break => return Dispatch::Break,
             }
 
             // should we stop dispatching?
             //
             // note that time could have changed _significantly_
-            let now = self.clock.now();
-            let timeout_left = sdiff(timeout, now);
-            if ticks >= 0 && timeout_left <= 0 {
-                return Error::Timeout;
+            now = self.now();
+            let timeout_left = timeout.map(|timeout| timeout - now);
+            if let Some(timeout_left) = timeout_left {
+                if timeout_left <= Delta::zero() {
+                    return Dispatch::Timeout;
+                }
             }
 
             // ok how long should we sleep for
@@ -2018,14 +2191,21 @@ impl Equeue {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let mut delta = self.dequeue_delta(now).unwrap_or(-1);
-
-            if (delta as utick) > (timeout_left as utick) {
-                delta = timeout_left;
-            }
+            let delta = self.next_delta_(now)
+                .into_iter().chain(timeout_left)
+                .min();
 
             self.sema.wait_async(delta).await;
         }
+    }
+
+    pub async fn dispatch_async<Δ: TryInto<Delta>>(&self, delta: Option<Δ>) -> Dispatch {
+        self.dispatch_async_(
+            delta.map(|delta|
+                delta.try_into().ok()
+                    .expect("delta overflow in equeue")
+            )
+        ).await
     }
 }
 

@@ -1,5 +1,6 @@
 
 use equeue::Equeue;
+use equeue::Delta;
 
 use std::thread;
 use std::alloc::Layout;
@@ -40,7 +41,7 @@ fn main() {
     {
         let q = q.clone();
         threads.push(thread::spawn(move || {
-            q.dispatch(-1);
+            q.dispatch(None::<Delta>);
             unreachable!();
         }));
     }
@@ -68,7 +69,7 @@ fn main() {
 
                 // choose a random delay
                 let delay = rng.gen_range(0..max(2000*opt.scale/1000_000, 10));
-                unsafe { q.set_raw_delay(e, delay as i64) };
+                unsafe { q.set_raw_delay(e, Duration::from_millis(delay)) };
 
                 unsafe { q.post_raw(cb, e); }
             }

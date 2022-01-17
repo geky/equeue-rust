@@ -5,6 +5,7 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU16;
 use core::sync::atomic::AtomicBool;
 use core::num::NonZeroU32;
+use core::num::NonZeroI64;
 use core::sync::atomic::fence;
 use core::sync::atomic;
 use core::marker::PhantomData;
@@ -17,14 +18,18 @@ use core::task::Poll;
 use core::task::Context;
 use core::task::Waker;
 use core::mem::transmute;
+use core::time::Duration;
 
 use std::time::Instant;
-use std::time::Duration;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::Condvar;
 
 use async_io::Timer;
+
+use crate::traits::*;
+use crate::Error;
+use crate::Delta;
 
 
 // TODO these should be wrapped more flexbily
@@ -44,19 +49,35 @@ pub(crate) type utick = u64;
 #[allow(non_camel_case_types)]
 pub(crate) type itick = i64;
 
-pub(crate) trait Clock: Send + Sync {
-    fn new() -> Self;
-    fn now(&self) -> utick;
+pub(crate) type NonZeroItick = NonZeroI64;
+
+impl TryFrom<Duration> for Delta {
+    type Error = ();
+    fn try_from(d: Duration) -> Result<Delta, ()> {
+        itick::try_from(d.as_millis()).ok()
+            .and_then(|ticks| Delta::new(ticks))
+            .ok_or(())
+    }
 }
 
+impl From<Delta> for Duration {
+    fn from(d: Delta) -> Duration {
+        Duration::from_millis(d.ticks() as u64)
+    }
+}
+
+
+// Some way to get the time
 #[derive(Debug)]
 pub(crate) struct DefaultClock(Instant);
 
-impl Clock for DefaultClock {
-    fn new() -> Self {
+impl DefaultClock {
+    pub(crate) fn new() -> Self {
         Self(Instant::now())
     }
+}
 
+impl Clock for DefaultClock {
     fn now(&self) -> utick {
         Instant::now()
             .duration_since(self.0)
@@ -174,15 +195,14 @@ impl AtomicU for AtomicUeptr {
 
 
 // Locking primitive
-pub(crate) trait Lock: Send + Sync + Debug {
-    type Guard;
-
-    fn new() -> Self;
-    fn lock(&self) -> Self::Guard;
-}
-
 #[derive(Debug)]
 pub(crate) struct DefaultLock(Mutex<()>);
+
+impl DefaultLock {
+    pub(crate) fn new() -> Self {
+        DefaultLock(Mutex::new(()))
+    }
+}
 
 impl Lock for DefaultLock {
     // unfortunately we can't define types with lifetimes
@@ -191,31 +211,15 @@ impl Lock for DefaultLock {
     // types in the correct order
     type Guard = MutexGuard<'static, ()>;
 
-    fn new() -> Self {
-        DefaultLock(Mutex::new(()))
-    }
-
     fn lock(&self) -> Self::Guard {
         // strip lifetime
         let guard = self.0.lock().unwrap();
-        unsafe { transmute(guard) }
+        unsafe { transmute::<MutexGuard<'_, ()>, _>(guard) }
     }
 }
 
 
 // Semaphore primitive
-pub(crate) trait Sema: Send + Sync + Debug {
-    fn new() -> Self;
-    fn signal(&self);
-    fn wait(&self, ticks: itick);
-}
-
-pub(crate) trait AsyncSema: Sema {
-    type AsyncWait: Future<Output=()>;
-
-    fn wait_async(&self, ticks: itick) -> Self::AsyncWait;
-}
-
 #[derive(Debug)]
 pub(crate) struct DefaultSema {
     mutex: Mutex<()>,
@@ -223,28 +227,30 @@ pub(crate) struct DefaultSema {
     waker: Mutex<Option<Waker>>,
 }
 
-impl Sema for DefaultSema {
-    fn new() -> Self {
+impl DefaultSema {
+    pub(crate) fn new() -> Self {
         Self {
             mutex: Mutex::new(()),
             cond: Condvar::new(),
             waker: Mutex::new(None),
         }
     }
+}
 
+impl Sema for DefaultSema {
     fn signal(&self) {
         self.cond.notify_one();
     }
 
-    fn wait(&self, ticks: itick) {
+    fn wait(&self, delta: Option<Delta>) {
         let guard = self.mutex.lock().unwrap();
-        if ticks < 0 {
+        if let Some(delta) = delta {
             let _ = self.cond
-                .wait(guard)
+                .wait_timeout(guard, Duration::from_millis(delta.ticks() as u64))
                 .unwrap();
         } else {
             let _ = self.cond
-                .wait_timeout(guard, Duration::from_millis(ticks as u64))
+                .wait(guard)
                 .unwrap();
         }
     }
@@ -299,21 +305,17 @@ impl AsyncSema for DefaultSema {
     // types in the correct order
     type AsyncWait = DefaultSemaAsyncWait<'static>;
 
-    fn wait_async(&self, ticks: itick) -> Self::AsyncWait {
+    fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
         // only allow one async wait at a time
         debug_assert!(self.waker.lock().unwrap().is_none());
 
         let wait = DefaultSemaAsyncWait {
             sema: self,
-            timer: if ticks < 0 {
-                None
-            } else {
-                Some(Timer::after(Duration::from_millis(ticks as u64)))
-            }
+            timer: delta.map(|delta| Timer::after(Duration::from_millis(delta.ticks() as u64))),
         };
 
         // strip lifetime
-        unsafe { transmute(wait) }
+        unsafe { transmute::<DefaultSemaAsyncWait<'_>, _>(wait) }
     }
 }
 

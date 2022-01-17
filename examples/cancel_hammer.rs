@@ -61,7 +61,7 @@ fn main() {
 
                 // choose a random delay
                 let delay = rng.gen_range(0..max(2000*opt.scale/1000_000, 10));
-                unsafe { q.set_raw_delay(e, delay as i64) };
+                unsafe { q.set_raw_delay(e, Duration::from_millis(delay)) };
 
                 let id = unsafe { q.post_raw(cb, e) };
 

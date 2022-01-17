@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::mem::forget;
+use std::time::Duration;
 
 #[test]
 fn test_race_alloc_unique() {
@@ -109,11 +110,11 @@ fn test_race_post() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(0);
+            q.dispatch(Some(Duration::from_millis(0)));
         })
     };
 
@@ -160,11 +161,11 @@ fn test_race_post_order() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(0);
+            q.dispatch(Some(Duration::from_millis(0)));
         })
     };
 
@@ -218,11 +219,11 @@ fn test_race_delay() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(1100);
+            q.dispatch(Some(Duration::from_millis(1100)));
         })
     };
 
@@ -238,7 +239,7 @@ fn test_race_delay() {
                         count.fetch_add(1, Ordering::SeqCst);
                     };
                     loop {
-                        match q.call_in(i*100, cb.clone()) {
+                        match q.call_in(Duration::from_millis(i*100), cb.clone()) {
                             Ok(_) => break,
                             Err(Error::NoMem) => { thread::yield_now(); continue },
                             Err(err) => panic!("{:?}", err),
@@ -271,7 +272,7 @@ fn test_race_cancel() {
         for _ in 0..10 {
             for i in 0..10 {
                 let count = count.clone();
-                let id = q.call_in(i*100, move || {
+                let id = q.call_in(Duration::from_millis(i*100), move || {
                     count.fetch_add(1, Ordering::SeqCst);
                 }).unwrap();
                 ids.push(id);
@@ -293,7 +294,7 @@ fn test_race_cancel() {
         thread.join().unwrap();
     }
 
-    q.dispatch(1100);
+    q.dispatch(Some(Duration::from_millis(1100)));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     println!("usage: {:#?}", q.usage());
 }
@@ -312,7 +313,7 @@ fn test_race_cancel_enqueue() {
             for _ in 0..100 {
                 for i in 0..10 {
                     let count = count.clone();
-                    let id = q.call_in(i*100, move || {
+                    let id = q.call_in(Duration::from_millis(i*100), move || {
                         count.fetch_add(1, Ordering::SeqCst);
                     }).unwrap();
                     assert_eq!(q.cancel(id), true);
@@ -325,7 +326,7 @@ fn test_race_cancel_enqueue() {
         thread.join().unwrap();
     }
 
-    q.dispatch(1100);
+    q.dispatch(Some(Duration::from_millis(1100)));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     println!("usage: {:#?}", q.usage());
 }
@@ -342,11 +343,11 @@ fn test_race_cancel_dispatch() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(1100);
+            q.dispatch(Some(Duration::from_millis(1100)));
         })
     };
 
@@ -358,7 +359,7 @@ fn test_race_cancel_dispatch() {
             for _ in 0..100 {
                 for i in 0..10 {
                     let count = count.clone();
-                    let id = q.call_in(i*100, move || {
+                    let id = q.call_in(Duration::from_millis(i*100), move || {
                         count.fetch_add(1, Ordering::SeqCst);
                     }).unwrap();
                     q.cancel(id);
@@ -392,11 +393,11 @@ fn test_race_cancel_periodic() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(0);
+            q.dispatch(Some(Duration::from_millis(0)));
         })
     };
 
@@ -408,7 +409,7 @@ fn test_race_cancel_periodic() {
             let mut ids = vec![];
             for _ in 0..100 {
                 let count = count.clone();
-                let id = q.call_every(0, move || {
+                let id = q.call_every(Duration::from_millis(0), move || {
                     count.fetch_add(1, Ordering::SeqCst);
                 }).unwrap();
                 ids.push(id);
@@ -438,7 +439,7 @@ struct StaticIncrement(Arc<AtomicU32>);
 impl PostStatic for StaticIncrement {
     fn post_static(self_: Event<'_, Self>) {
         self_.0.fetch_add(1, Ordering::SeqCst);
-        forget(self_); // TODO should we try to avoid this?
+        forget(self_);
     }
 }
 
@@ -455,11 +456,11 @@ fn test_race_repost() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(0);
+            q.dispatch(Some(Duration::from_millis(0)));
         })
     };
 
@@ -506,11 +507,11 @@ fn test_race_dispatch_multiple() {
         let done = done.clone();
         dispatch_threads.push(thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(0);
+                q.dispatch(Some(Duration::from_millis(0)));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(0);
+            q.dispatch(Some(Duration::from_millis(0)));
         }));
     }
 
