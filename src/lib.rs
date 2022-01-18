@@ -38,13 +38,14 @@ use core::task::RawWaker;
 use core::task::RawWakerVTable;
 use core::ops::Add;
 use core::ops::Sub;
+use core::convert::Infallible;
 
 use either::Either;
 use either::Left;
 use either::Right;
 
 mod util;
-mod sys;
+pub mod sys;
 use util::*;
 use sys::*;
 
@@ -143,7 +144,7 @@ impl Tick {
         // Note that this always ensures a later deadline.
         let mask = (1 << (
             (8*size_of::<utick>() as u8).saturating_sub(
-                other.ticks().leading_zeros() as u8 + Equeue::PRECISION
+                other.ticks().leading_zeros() as u8 + precision
             )
         )) - 1;
 
@@ -203,6 +204,19 @@ impl PartialOrd for Delta {
 impl Ord for Delta {
     fn cmp(&self, other: &Delta) -> cmp::Ordering {
         self.ticks().cmp(&other.ticks())
+    }
+}
+
+impl<C> TryIntoDelta<C> for Delta {
+    type Error = Infallible;
+    fn try_into_delta(self, _: &C) -> Result<Delta, Self::Error> {
+        Ok(self)
+    }
+}
+
+impl<C> FromDelta<C> for Delta {
+    fn from_delta(_: &C, delta: Delta) -> Delta {
+        delta
     }
 }
 
@@ -297,7 +311,7 @@ impl Eptr {
         Eptr(0)
     }
 
-    fn from_ebuf(q: &Equeue, e: &Ebuf) -> Eptr {
+    fn from_ebuf<C>(q: &Equeue<C>, e: &Ebuf) -> Eptr {
         Eptr(unsafe {
             ((e as *const Ebuf as *const u8)
                 .offset_from(q.slab.as_ptr())
@@ -307,7 +321,7 @@ impl Eptr {
         })
     }
 
-    fn as_ptr(&self, q: &Equeue) -> *const Ebuf {
+    fn as_ptr<C>(&self, q: &Equeue<C>) -> *const Ebuf {
         match self.0 {
             0 => ptr::null(),
             _ => (
@@ -317,7 +331,7 @@ impl Eptr {
         }
     }
 
-    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
         unsafe { self.as_ptr(q).as_ref() }
     }
 }
@@ -348,18 +362,18 @@ impl MarkedEptr {
         }
     }
 
-    fn from_ebuf(q: &Equeue, e: &mut Ebuf) -> MarkedEptr {
+    fn from_ebuf<C>(q: &Equeue<C>, e: &mut Ebuf) -> MarkedEptr {
         MarkedEptr {
             gen: 0,
             eptr: Eptr::from_ebuf(q, e),
         }
     }
 
-    fn as_ptr(&self, q: &Equeue) -> *const Ebuf {
+    fn as_ptr<C>(&self, q: &Equeue<C>) -> *const Ebuf {
         self.eptr.as_ptr(q)
     }
 
-    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
         self.eptr.as_ref(q)
     }
 
@@ -504,15 +518,16 @@ struct Ebuf {
     drop: Option<fn(*mut u8)>,
     target: Tick,
     period: Option<Delta>,
+    // TODO can we store this somewhere else?
     q: *const Equeue,
 }
 
 impl Ebuf {
-    fn as_eptr(&self, q: &Equeue) -> Eptr {
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr {
         Eptr::from_ebuf(q, self)
     }
 
-    fn as_marked_eptr(&mut self, q: &Equeue) -> MarkedEptr {
+    fn as_marked_eptr<C>(&mut self, q: &Equeue<C>) -> MarkedEptr {
         MarkedEptr::from_ebuf(q, self)
     }
 
@@ -560,11 +575,11 @@ impl Ebuf {
 
 // some convenience extensions to Option<&Ebuf>
 trait OptionEbuf<'a> {
-    fn as_eptr(&self, q: &Equeue) -> Eptr;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr;
 }
 
 impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
-    fn as_eptr(&self, q: &Equeue) -> Eptr {
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr {
         match self {
             Some(e) => e.as_eptr(q),
             None => Eptr::null(),
@@ -575,7 +590,7 @@ impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
 
 /// Event queue struct
 #[derive(Debug)]
-pub struct Equeue {
+pub struct Equeue<C=SysClock> {
     // memory management
     slab: &'static [u8],
     slab_front: Atomic<ueptr, AtomicUeptr>,
@@ -586,21 +601,36 @@ pub struct Equeue {
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
     dequeue: Atomic<MarkedEptr, AtomicUdeptr>,
     break_: Atomic<bool, AtomicUeptr>,
+    precision: u8,
 
     // other things
-    clock: DefaultClock,
-    lock: DefaultLock,
-    sema: DefaultSema,
+    clock: C,
+    lock: SysLock,
+}
+
+/// Event queue configuration
+#[derive(Debug)]
+pub struct Config<C=SysClock> {
+    pub clock: C,
+    pub precision: Option<u8>,
+
+    pub buffer: Buffer,
+}
+
+#[derive(Debug)]
+pub enum Buffer {
+    Alloc(usize),
+    Static(&'static mut [u8]),
 }
 
 // assert that we implement Send + Sync
 #[allow(unconditional_recursion)] fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
 #[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
 
-impl Equeue {
-    /// Number of bits of precision to use for scheduling events, this is limits
-    /// the number of significant digits used in long-term events in order to
-    /// create better bucketing and power consumption
+impl<C> Equeue<C> {
+    /// Default number of bits of precision to use for scheduling events, this
+    /// limits the number of significant digits used in long-term events in order
+    /// to create better bucketing and power consumption
     ///
     /// So if you needed to schedule an event in 20 minutes, aka 1200000
     /// milliseconds, aka 0b000100100100111110000000 if equeue is running
@@ -623,23 +653,25 @@ impl Equeue {
     ///
     const PRECISION: u8 = 6;
 
-    pub fn with_size(size: usize) -> Equeue {
-        let size = aligndown(size, align_of::<Ebuf>());
-        let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
-        let buffer = unsafe { alloc(layout) };
-
-        let mut q = Equeue::with_buffer(unsafe {
-            slice::from_raw_parts_mut(buffer, size)
-        });
-
-        q.alloced = true;
-        q
-    }
-
-    pub fn with_buffer(buffer: &'static mut [u8]) -> Equeue {
+    pub fn with_config(config: Config<C>) -> Equeue<C> {
         // some sanity checks
         debug_assert!(align_of::<Ebuf>() >= align_of::<usize>());
         debug_assert_eq!(size_of::<Option<Delta>>(), size_of::<itick>());
+
+        let (buffer, alloced) = match config.buffer {
+            Buffer::Alloc(size) => {
+                let size = aligndown(size, align_of::<Ebuf>());
+                let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
+                let buffer = unsafe { alloc(layout) };
+                assert!(!buffer.is_null());
+
+                let buffer = unsafe { slice::from_raw_parts_mut(buffer, size) };
+                (buffer, true)
+            }
+            Buffer::Static(buffer) => {
+                (buffer, false)
+            }
+        };
 
         // align buffer
         let range = buffer.as_ptr_range();
@@ -653,7 +685,7 @@ impl Equeue {
 
         Equeue {
             slab: buffer,
-            alloced: false,
+            alloced: alloced,
             // there's already a bit of finagling here to fit sizes in ueptrs,
             // slab_front is used for bytes, but should never exceed ~log2(width)
             // while slab_back is used for ebufs, which have a larger alignment
@@ -665,15 +697,33 @@ impl Equeue {
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
             break_: Atomic::new(false),
+            precision: config.precision.unwrap_or(Equeue::<C>::PRECISION),
 
-            clock: DefaultClock::new(),
-            lock: DefaultLock::new(),
-            sema: DefaultSema::new(),
+            clock: config.clock,
+            lock: SysLock::new(),
         }
     }
 }
 
-impl Drop for Equeue {
+impl Equeue {
+    pub fn with_size(size: usize) -> Equeue {
+        Equeue::with_config(Config {
+            clock: SysClock::new(),
+            precision: None,
+            buffer: Buffer::Alloc(size),
+        })
+    }
+
+    pub fn with_buffer(buffer: &'static mut [u8]) -> Equeue {
+        Equeue::with_config(Config {
+            clock: SysClock::new(),
+            precision: None,
+            buffer: Buffer::Static(buffer),
+        })
+    }
+}
+
+impl<C> Drop for Equeue<C> {
     fn drop(&mut self) {
         // make sure we call drop on any pending events
         //
@@ -706,7 +756,7 @@ impl Drop for Equeue {
     }
 }
 
-impl Equeue {
+impl<C> Equeue<C> {
     fn contains(&self, e: &Ebuf) -> bool {
         self.slab.as_ptr_range()
             .contains(&(e.deref() as *const _ as *const u8))
@@ -849,16 +899,15 @@ impl Equeue {
             bucket.store(e.as_eptr(self));
         }
     }
+}
 
-    // Queue management
-    fn now(&self) -> Tick {
-        Tick::new(self.clock.now())
-    }
-
+// Queue management
+impl<C> Equeue<C> {
     #[must_use]
     fn enqueue_<'a>(
         &self,
         e: &'a mut Ebuf,
+        now: Tick,
         target: Tick
     ) -> Result<bool, &'a mut Ebuf> {
         let mut e = e;
@@ -939,9 +988,6 @@ impl Equeue {
                         // to enqueue a periodic/delayed event
                         //
                         // we need to update our target and restart
-
-                        // TODO is this the right place to load clock.now()?
-                        let now = self.now();
                         if e.target > now {
                             e.target = now;
                             continue 'retry;
@@ -1124,7 +1170,10 @@ impl Equeue {
         }
     }
 
-    fn dequeue_<'a>(&'a self, now: Tick) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
+    fn dequeue_<'a>(
+        &'a self,
+        now: Tick
+    ) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
         let mark = 'retry: loop {
             // dispatch already in progress? let's try to help out
             let deheadptr = self.dequeue.load();
@@ -1194,23 +1243,11 @@ impl Equeue {
             self.unqueue_(Right(mark), Pending::InFlight).1
         }))
     }
+}
 
-    // Central post function
-    fn post_(&self, e: &mut Ebuf, delta: Delta) {
-        // calculate target
-        let target = self.now().imprecise_add(delta, Equeue::PRECISION);
-
-        // all periodic events are static events
-        if e.period.is_some() {
-            e.info.store(e.info.load().set_static(true));
-        }
-
-        let delta_changed = self.enqueue_(e, target).unwrap();
-
-        // signal queue has changed
-        if delta_changed {
-            self.sema.signal();
-        }
+impl<C: Clock> Equeue<C> {
+    fn now(&self) -> Tick {
+        Tick::new(self.clock.now())
     }
 
     // How long until event executes?
@@ -1240,10 +1277,13 @@ impl Equeue {
         }
     }
 
-    pub fn delta<Δ: From<Delta>>(&self, id: Id) -> Option<Δ> {
-        self.delta_(id).map(Δ::from)
+    pub fn delta<Δ: FromDelta<C>>(&self, id: Id) -> Option<Δ> {
+        self.delta_(id)
+            .map(|delta| Δ::from_delta(&self.clock, delta))
     }
+}
 
+impl<C> Equeue<C> {
     // Central cancel function
     pub fn cancel(&self, id: Id) -> bool {
         // check to see if we need to bother locking
@@ -1265,6 +1305,27 @@ impl Equeue {
         }
 
         canceled
+    }
+}
+
+impl<C: Clock+Sema> Equeue<C> {
+    // Central post function
+    fn post_(&self, e: &mut Ebuf, delta: Delta) {
+        // calculate target
+        let now = self.now();
+        let target = now.imprecise_add(delta, self.precision);
+
+        // all periodic events are static events
+        if e.period.is_some() {
+            e.info.store(e.info.load().set_static(true));
+        }
+
+        let delta_changed = self.enqueue_(e, now, target).unwrap();
+
+        // signal queue has changed
+        if delta_changed {
+            self.clock.signal();
+        }
     }
 
     // repost an static event which may already be pending
@@ -1324,11 +1385,11 @@ impl Equeue {
             match reenqueue {
                 Left(e) => {
                     // reenqueue
-                    match self.enqueue_(e, now) {
+                    match self.enqueue_(e, now, now) {
                         Ok(delta_changed) => {
                             // signal queue has changed
                             if delta_changed {
-                                self.sema.signal();
+                                self.clock.signal();
                             }
                             return true;
                         }
@@ -1347,7 +1408,9 @@ impl Equeue {
             }
         }
     }
+}
 
+impl<C: Clock> Equeue<C> {
     // find time until next event without locking
     //
     // note this is clamped to 0 at minimum
@@ -1374,11 +1437,13 @@ impl Equeue {
         }
     }
 
-    pub fn next_delta<Δ: From<Delta>>(&self) -> Option<Δ> {
+    pub fn next_delta<Δ: FromDelta<C>>(&self) -> Option<Δ> {
         self.next_delta_(self.now())
-            .map(Δ::from)
+            .map(|delta| Δ::from_delta(&self.clock, delta))
     }
+}
 
+impl<C: Clock+Sema> Equeue<C> {
     // Central dispatch function
     fn dispatch_(&self, delta: Option<Delta>) -> Dispatch {
         // get the current time
@@ -1401,9 +1466,10 @@ impl Equeue {
                     None
                 } else if let Some(period) = e.period {
                     // if periodic, reenqueue, unless we get canceled
-                    self.enqueue_(e, self.now().imprecise_add(
+                    let now = self.now();
+                    self.enqueue_(e, now, now.imprecise_add(
                         period,
-                        Equeue::PRECISION
+                        self.precision
                     )).err()
                 } else if info.static_() {
                     // if static, try to mark as no-longer pending, but
@@ -1428,7 +1494,8 @@ impl Equeue {
 
                     // TODO restructure this?
                     if let Some(e) = reenqueue {
-                        self.enqueue_(e, self.now()).err()
+                        let now = self.now();
+                        self.enqueue_(e, now, now).err()
                     } else {
                         e
                     }
@@ -1475,16 +1542,16 @@ impl Equeue {
                 .into_iter().chain(timeout_left)
                 .min();
 
-            self.sema.wait(delta);
+            self.clock.wait(delta);
 
             now = self.now();
         }
     }
 
-    pub fn dispatch<Δ: TryInto<Delta>>(&self, delta: Option<Δ>) -> Dispatch {
+    pub fn dispatch<Δ: TryIntoDelta<C>>(&self, delta: Option<Δ>) -> Dispatch {
         self.dispatch_(
             delta.map(|delta|
-                delta.try_into().ok()
+                delta.try_into_delta(&self.clock).ok()
                     .expect("delta overflow in equeue")
             )
         )
@@ -1496,11 +1563,11 @@ impl Equeue {
             self.break_.store(true);
         }
 
-        self.sema.signal();
+        self.clock.signal();
     }
 }
 
-impl Equeue {
+impl<C: Clock+Sema> Equeue<C> {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_(layout) {
@@ -1527,19 +1594,19 @@ impl Equeue {
         }
     }
 
-    pub unsafe fn set_raw_delay<Δ: TryInto<Delta>>(&self, e: *mut u8, delay: Δ) {
+    pub unsafe fn set_raw_delay<Δ: TryIntoDelta<C>>(&self, e: *mut u8, delay: Δ) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.target = delay.try_into().ok()
+        e.target = delay.try_into_delta(&self.clock).ok()
             .expect("delta overflow in equeue")
             .as_tick();
     }
 
-    pub unsafe fn set_raw_period<Δ: TryInto<Delta>>(&self, e: *mut u8, period: Option<Δ>) {
+    pub unsafe fn set_raw_period<Δ: TryIntoDelta<C>>(&self, e: *mut u8, period: Option<Δ>) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.period = period.map(|period|
-            period.try_into().ok()
+            period.try_into_delta(&self.clock).ok()
                 .expect("delta overflow in equeue")
         );
     }
@@ -1584,14 +1651,14 @@ impl Id {
         }
     }
 
-    fn new(q: &Equeue, id: ugen, e: &mut Ebuf) -> Id {
+    fn new<C>(q: &Equeue<C>, id: ugen, e: &mut Ebuf) -> Id {
         Id {
             id: id,
             eptr: e.as_eptr(q),
         }
     }
 
-    fn as_ref<'a>(&self, q: &'a Equeue) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
         self.eptr.as_ref(q)
     }
 }
@@ -1605,13 +1672,13 @@ impl Default for Id {
 /// A strongly-typed alternative to Id which implicitly cancels the
 /// event when dropped
 #[derive(Debug)]
-pub struct Handle<'a> {
-    q: &'a Equeue,
+pub struct Handle<'a, C=SysClock> {
+    q: &'a Equeue<C>,
     id: Id,
 }
 
-impl<'a> Handle<'a> {
-    fn new(q: &'a Equeue, id: Id) -> Handle {
+impl<'a, C> Handle<'a, C> {
+    fn new(q: &'a Equeue<C>, id: Id) -> Handle<'a, C> {
         Handle {
             q: q,
             id: id,
@@ -1622,23 +1689,27 @@ impl<'a> Handle<'a> {
         self.id
     }
 
-    // Some other convenience functions, which can
-    // normally be done with Ids
-    pub fn delta<Δ: From<Delta>>(&self) -> Option<Δ> {
-        self.q.delta(self.id)
-    }
-
-    pub fn pend(&self) -> bool {
-        self.q.pend(self.id)
-    }
-
     // Explicitly cancel the event
     pub fn cancel(&self) -> bool {
         self.q.cancel(self.id)
     }
 }
 
-impl Drop for Handle<'_> {
+impl<'a, C: Clock> Handle<'a, C> {
+    // Some other convenience functions, which can
+    // normally be done with Ids
+    pub fn delta<Δ: FromDelta<C>>(&self) -> Option<Δ> {
+        self.q.delta(self.id)
+    }
+}
+
+impl<'a, C: Clock+Sema> Handle<'a, C> {
+    pub fn pend(&self) -> bool {
+        self.q.pend(self.id)
+    }
+}
+
+impl<C> Drop for Handle<'_, C> {
     fn drop(&mut self) {
         self.q.cancel(self.id);
     }
@@ -1648,14 +1719,14 @@ impl Drop for Handle<'_> {
 // TODO can we make Event accept ?Sized? The issue is not the allocation, 
 // the issue is that we'd need to store a fat pointer somehow
 /// Event handle
-pub struct Event<'a, T> {
-    q: &'a Equeue,
+pub struct Event<'a, T, C=SysClock> {
+    q: &'a Equeue<C>,
     e: &'a mut Ebuf,
     once: bool,
     _phantom: PhantomData<&'a mut T>,
 }
 
-impl<T: Debug> Debug for Event<'_, T> {
+impl<T: Debug, C> Debug for Event<'_, T, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Event")
             .field(&self.e)
@@ -1664,8 +1735,8 @@ impl<T: Debug> Debug for Event<'_, T> {
     }
 }
 
-impl<'a, T> Event<'a, T> {
-    fn new(q: &'a Equeue, e: &'a mut Ebuf, once: bool) -> Event<'a, T> {
+impl<'a, T, C> Event<'a, T, C> {
+    fn new(q: &'a Equeue<C>, e: &'a mut Ebuf, once: bool) -> Event<'a, T, C> {
         Event {
             q: q,
             e: e,
@@ -1738,8 +1809,8 @@ const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     event_waker_drop,
 );
 
-impl Equeue {
-    pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+impl<C> Equeue<C> {
+    pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
 
@@ -1758,7 +1829,7 @@ impl Equeue {
         Ok(Event::new(self, e, false))
     }
 
-    pub fn alloc_once<'a, T: PostOnce + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+    pub fn alloc_once<'a, T: PostOnce + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
 
@@ -1785,15 +1856,15 @@ impl Equeue {
         Ok(Event::new(self, e, true))
     }
 
-    pub fn alloc_static<'a, T: PostStatic + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+    pub fn alloc_static<'a, T: PostStatic + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
-        e.q = self as *const Equeue;
+        e.q = self as *const Equeue<C> as *const Equeue;
 
         // cb/drop thunks
-        fn cb_thunk<T: PostStatic>(e: *mut u8) {
+        fn cb_thunk<T: PostStatic, C>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
-            let e = Event::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
+            let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
             T::post_static(e);
         }
 
@@ -1801,7 +1872,7 @@ impl Equeue {
             unsafe { drop_in_place(e as *mut T) };
         }
 
-        e.cb = Some(cb_thunk::<T>);
+        e.cb = Some(cb_thunk::<T, C>);
         e.drop = Some(drop_thunk::<T>);
 
         // mark as static
@@ -1809,10 +1880,10 @@ impl Equeue {
         Ok(Event::new(self, e, false))
     }
 
-    pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T>, Error> {
+    pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
-        e.q = self as *const Equeue;
+        e.q = self as *const Equeue<C> as *const Equeue;
 
         fn cb_thunk<T: Future<Output=()>>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
@@ -1852,19 +1923,19 @@ impl Equeue {
     }
 }
 
-impl<'a, T> Event<'a, T> {
-    pub fn delay<Δ: TryInto<Delta>>(mut self, delay: Δ) -> Self {
-        self.e.target = delay.try_into().ok()
+impl<'a, T, C> Event<'a, T, C> {
+    pub fn delay<Δ: TryIntoDelta<C>>(mut self, delay: Δ) -> Self {
+        self.e.target = delay.try_into_delta(&self.q.clock).ok()
             .expect("delta overflow in equeue")
             .as_tick();
         self
     }
 
-    pub fn period<Δ: TryInto<Delta>>(mut self, period: Option<Δ>) -> Self {
+    pub fn period<Δ: TryIntoDelta<C>>(mut self, period: Option<Δ>) -> Self {
         // can't set period for PostOnce events 
         assert!(!self.once);
         self.e.period = period.map(|period|
-            period.try_into().ok()
+            period.try_into_delta(&self.q.clock).ok()
                 .expect("delta overflow in equeue")
         );
         self
@@ -1888,10 +1959,12 @@ impl<'a, T> Event<'a, T> {
         id
     }
 
-    pub fn into_handle(self) -> Handle<'a> {
+    pub fn into_handle(self) -> Handle<'a, C> {
         Handle::new(self.q, self.into_id())
     }
+}
 
+impl<'a, T, C: Clock+Sema> Event<'a, T, C> {
     pub fn post(self) -> Id {
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
@@ -1901,38 +1974,38 @@ impl<'a, T> Event<'a, T> {
         id
     }
 
-    pub fn post_handle(self) -> Handle<'a> {
+    pub fn post_handle(self) -> Handle<'a, C> {
         Handle::new(self.q, self.post())
     }
 }
 
-impl<T> Drop for Event<'_, T> {
+impl<T, C> Drop for Event<'_, T, C> {
     fn drop(&mut self) {
         // clean up ebuf, note this runs the destructor internally
         self.q.dealloc_(self.e);
     }
 }
 
-impl<T> Deref for Event<'_, T> {
+impl<T, C> Deref for Event<'_, T, C> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { self.e.data_ref() }
     }
 }
 
-impl<T> DerefMut for Event<'_, T> {
+impl<T, C> DerefMut for Event<'_, T, C> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { self.e.data_mut() }
     }
 }
 
-impl<T> AsRef<T> for Event<'_, T> {
+impl<T, C> AsRef<T> for Event<'_, T, C> {
     fn as_ref(&self) -> &T {
         unsafe { self.e.data_ref() }
     }
 }
 
-impl<T> AsMut<T> for Event<'_, T> {
+impl<T, C> AsMut<T> for Event<'_, T, C> {
     fn as_mut(&mut self) -> &mut T {
         unsafe { self.e.data_mut() }
     }
@@ -1940,18 +2013,18 @@ impl<T> AsMut<T> for Event<'_, T> {
 
 
 // convenience functions
-impl Equeue {
+impl<C: Clock+Sema> Equeue<C> {
     pub fn call<F: PostOnce + Send>(
         &self,
         cb: F
-    ) -> Result<Id, Error>{
+    ) -> Result<Id, Error> {
         Ok(
             self.alloc_once(cb)?
                 .post()
         )
     }
 
-    pub fn call_in<Δ: TryInto<Delta>, F: PostOnce + Send>(
+    pub fn call_in<Δ: TryIntoDelta<C>, F: PostOnce + Send>(
         &self,
         delay: Δ,
         cb: F
@@ -1963,12 +2036,12 @@ impl Equeue {
         )
     }
 
-    pub fn call_every<Δ: TryInto<Delta>, F: Post + Send>(
+    pub fn call_every<Δ: TryIntoDelta<C>, F: Post + Send>(
         &self,
         period: Δ,
         cb: F
     ) -> Result<Id, Error> {
-        let period = period.try_into().ok()
+        let period = period.try_into_delta(&self.clock).ok()
             .expect("delta overflow in equeue");
         Ok(
             self.alloc(cb)?
@@ -1991,30 +2064,30 @@ impl Equeue {
     pub fn call_handle<'a, F: PostOnce + Send>(
         &'a self,
         cb: F
-    ) -> Result<Handle<'a>, Error> {
+    ) -> Result<Handle<'a, C>, Error> {
         self.call(cb).map(|id| Handle::new(self, id))
     }
 
-    pub fn call_in_handle<'a, Δ: TryInto<Delta>, F: PostOnce + Send>(
+    pub fn call_in_handle<'a, Δ: TryIntoDelta<C>, F: PostOnce + Send>(
         &'a self,
         delay: Δ,
         cb: F
-    ) -> Result<Handle<'a>, Error> {
+    ) -> Result<Handle<'a, C>, Error> {
         self.call_in(delay, cb).map(|id| Handle::new(self, id))
     }
 
-    pub fn call_every_handle<'a, Δ: TryInto<Delta>, F: Post + Send>(
+    pub fn call_every_handle<'a, Δ: TryIntoDelta<C>, F: Post + Send>(
         &'a self,
         period: Δ,
         cb: F
-    ) -> Result<Handle<'a>, Error> {
+    ) -> Result<Handle<'a, C>, Error> {
         self.call_every(period, cb).map(|id| Handle::new(self, id))
     }
 
     pub fn run_handle<'a, F: Future<Output=()> + Send>(
         &'a self,
         cb: F
-    ) -> Result<Handle<'a>, Error> {
+    ) -> Result<Handle<'a, C>, Error> {
         self.run(cb).map(|id| Handle::new(self, id))
     }
 }
@@ -2036,12 +2109,12 @@ impl Equeue {
 // https://github.com/rust-lang/rfcs/issues/2900
 
 #[derive(Debug)]
-struct AsyncYield<'a> {
-    q: &'a Equeue,
+struct AsyncYield<'a, C=SysClock> {
+    q: &'a Equeue<C>,
     yielded: bool
 }
 
-impl Future for AsyncYield<'_> {
+impl<C> Future for AsyncYield<'_, C> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2057,14 +2130,14 @@ impl Future for AsyncYield<'_> {
 }
 
 #[derive(Debug)]
-struct AsyncSleep<'a> {
-    q: &'a Equeue,
+struct AsyncSleep<'a, C=SysClock> {
+    q: &'a Equeue<C>,
     yielded: bool,
     timeout: Tick,
     id: Id,
 }
 
-impl Future for AsyncSleep<'_> {
+impl<C: Clock+Sema> Future for AsyncSleep<'_, C> {
     type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2097,7 +2170,7 @@ impl Future for AsyncSleep<'_> {
     }
 }
 
-impl Drop for AsyncSleep<'_> {
+impl<C> Drop for AsyncSleep<'_, C> {
     fn drop(&mut self) {
         // make sure we cancel our timeout
         self.q.cancel(self.id);
@@ -2105,14 +2178,14 @@ impl Drop for AsyncSleep<'_> {
 }
 
 #[derive(Debug)]
-struct AsyncTimeout<'a, F> {
-    q: &'a Equeue,
+struct AsyncTimeout<'a, F, C=SysClock> {
+    q: &'a Equeue<C>,
     f: F,
     timeout: Tick,
     id: Id,
 }
 
-impl<F: Future> Future for AsyncTimeout<'_, F> {
+impl<F: Future, C: Clock+Sema> Future for AsyncTimeout<'_, F, C> {
     type Output = Result<F::Output, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2146,23 +2219,25 @@ impl<F: Future> Future for AsyncTimeout<'_, F> {
     }
 }
 
-impl<F> Drop for AsyncTimeout<'_, F> {
+impl<F, C> Drop for AsyncTimeout<'_, F, C> {
     fn drop(&mut self) {
         // make sure we cancel our timeout
         self.q.cancel(self.id);
     }
 }
 
-impl Equeue {
+impl<C> Equeue<C> {
     pub async fn yield_(&self) {
         AsyncYield {
             q: self,
             yielded: false
         }.await
     }
+}
 
-    pub async fn sleep<Δ: TryInto<Delta>>(&self, delta: Δ) -> Result<(), Error> {
-        let delta = delta.try_into().ok()
+impl<C: Clock+Sema> Equeue<C> {
+    pub async fn sleep<Δ: TryIntoDelta<C>>(&self, delta: Δ) -> Result<(), Error> {
+        let delta = delta.try_into_delta(&self.clock).ok()
             .expect("delta overflow in equeue");
         AsyncSleep {
             q: self,
@@ -2172,11 +2247,11 @@ impl Equeue {
         }.await
     }
 
-    pub async fn timeout<Δ: TryInto<Delta>, R, F> (&self, delta: Δ, f: F) -> Result<R, Error>
+    pub async fn timeout<Δ: TryIntoDelta<C>, R, F> (&self, delta: Δ, f: F) -> Result<R, Error>
     where
         F: Future<Output=R>
     {
-        let delta = delta.try_into().ok()
+        let delta = delta.try_into_delta(&self.clock).ok()
             .expect("delta overflow in equeue");
         AsyncTimeout {
             q: self,
@@ -2187,7 +2262,7 @@ impl Equeue {
     }
 }
 
-impl Equeue {
+impl<C: Clock+AsyncSema> Equeue<C> {
     async fn dispatch_async_(&self, delta: Option<Delta>) -> Dispatch {
         // note that some of this is ungracefull copy-pasted from non-async dispatch
 
@@ -2198,7 +2273,7 @@ impl Equeue {
         loop {
             // Note that we assume:
             // 1. dispatch does not block
-            // 2. dispatch never enters self.sema.wait() 
+            // 2. dispatch never enters self.clock.wait() 
             match self.dispatch(Some(Delta::zero())) {
                 Dispatch::Timeout => {},
                 Dispatch::Break => return Dispatch::Break,
@@ -2225,14 +2300,14 @@ impl Equeue {
                 .into_iter().chain(timeout_left)
                 .min();
 
-            self.sema.wait_async(delta).await;
+            self.clock.wait_async(delta).await;
         }
     }
 
-    pub async fn dispatch_async<Δ: TryInto<Delta>>(&self, delta: Option<Δ>) -> Dispatch {
+    pub async fn dispatch_async<Δ: TryIntoDelta<C>>(&self, delta: Option<Δ>) -> Dispatch {
         self.dispatch_async_(
             delta.map(|delta|
-                delta.try_into().ok()
+                delta.try_into_delta(&self.clock).ok()
                     .expect("delta overflow in equeue")
             )
         ).await
@@ -2241,6 +2316,7 @@ impl Equeue {
 
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Usage {
     pub pending: usize,
     pub pending_bytes: usize,
@@ -2256,7 +2332,7 @@ pub struct Usage {
     pub buckets: usize,
 }
 
-impl Equeue {
+impl<C> Equeue<C> {
     pub fn usage(&self) -> Usage {
         // find slab usage
         let slab_total = self.slab.len();

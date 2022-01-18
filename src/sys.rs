@@ -41,64 +41,34 @@ pub(crate) use std::alloc::dealloc;
 // Time primitives
 cfg_if! {
     if #[cfg(feature="utick-at-least-u128")] {
-        #[allow(non_camel_case_types)] pub(crate) type utick = u128;
-        #[allow(non_camel_case_types)] pub(crate) type itick = i128;
-        pub(crate) type NonZeroItick = core::num::NonZeroI128;
+        #[allow(non_camel_case_types)] pub type utick = u128;
+        #[allow(non_camel_case_types)] pub type itick = i128;
+        pub type NonZeroUtick = core::num::NonZeroI128;
+        pub type NonZeroItick = core::num::NonZeroI128;
 
     } else if #[cfg(feature="utick-at-least-u64")] {
-        #[allow(non_camel_case_types)] pub(crate) type utick = u64;
-        #[allow(non_camel_case_types)] pub(crate) type itick = i64;
-        pub(crate) type NonZeroItick = core::num::NonZeroI64;
+        #[allow(non_camel_case_types)] pub type utick = u64;
+        #[allow(non_camel_case_types)] pub type itick = i64;
+        pub type NonZeroUtick = core::num::NonZeroI64;
+        pub type NonZeroItick = core::num::NonZeroI64;
 
     } else if #[cfg(feature="utick-at-least-u32")] {
-        #[allow(non_camel_case_types)] pub(crate) type utick = u32;
-        #[allow(non_camel_case_types)] pub(crate) type itick = i32;
-        pub(crate) type NonZeroItick = core::num::NonZeroI32;
+        #[allow(non_camel_case_types)] pub type utick = u32;
+        #[allow(non_camel_case_types)] pub type itick = i32;
+        pub type NonZeroUtick = core::num::NonZeroI32;
+        pub type NonZeroItick = core::num::NonZeroI32;
 
     } else if #[cfg(feature="utick-at-least-u16")] {
-        #[allow(non_camel_case_types)] pub(crate) type utick = u16;
-        #[allow(non_camel_case_types)] pub(crate) type itick = i16;
-        pub(crate) type NonZeroItick = core::num::NonZeroI16;
+        #[allow(non_camel_case_types)] pub type utick = u16;
+        #[allow(non_camel_case_types)] pub type itick = i16;
+        pub type NonZeroUtick = core::num::NonZeroI16;
+        pub type NonZeroItick = core::num::NonZeroI16;
 
     } else if #[cfg(feature="utick-at-least-u8")] {
-        #[allow(non_camel_case_types)] pub(crate) type utick = u8;
-        #[allow(non_camel_case_types)] pub(crate) type itick = i8;
-        pub(crate) type NonZeroItick = core::num::NonZeroI8;
-    }
-}
-
-impl TryFrom<Duration> for Delta {
-    type Error = ();
-    fn try_from(d: Duration) -> Result<Delta, ()> {
-        itick::try_from(d.as_millis()).ok()
-            .and_then(|ticks| Delta::new(ticks))
-            .ok_or(())
-    }
-}
-
-impl From<Delta> for Duration {
-    fn from(d: Delta) -> Duration {
-        Duration::from_millis(d.ticks() as u64)
-    }
-}
-
-
-// Some way to get the time
-#[derive(Debug)]
-pub(crate) struct DefaultClock(Instant);
-
-impl DefaultClock {
-    pub(crate) fn new() -> Self {
-        Self(Instant::now())
-    }
-}
-
-impl Clock for DefaultClock {
-    fn now(&self) -> utick {
-        Instant::now()
-            .duration_since(self.0)
-            .as_millis()
-            as utick
+        #[allow(non_camel_case_types)] pub type utick = u8;
+        #[allow(non_camel_case_types)] pub type itick = i8;
+        pub type NonZeroUtick = core::num::NonZeroI8;
+        pub type NonZeroItick = core::num::NonZeroI8;
     }
 }
 
@@ -161,18 +131,17 @@ cfg_if! {
     }
 }
 
-
 // Locking primitive
 #[derive(Debug)]
-pub(crate) struct DefaultLock(Mutex<()>);
+pub(crate) struct SysLock(Mutex<()>);
 
-impl DefaultLock {
+impl SysLock {
     pub(crate) fn new() -> Self {
-        DefaultLock(Mutex::new(()))
+        SysLock(Mutex::new(()))
     }
 }
 
-impl Lock for DefaultLock {
+impl Lock for SysLock {
     // unfortunately we can't define types with lifetimes
     // in traits, the best we can do is unsafely strip the
     // lifetime and leave it up to the caller to drop the
@@ -187,17 +156,21 @@ impl Lock for DefaultLock {
 }
 
 
-// Semaphore primitive
+// Time/semaphore primitive
 #[derive(Debug)]
-pub(crate) struct DefaultSema {
+pub struct SysClock {
+    instant: Instant,
+
     mutex: Mutex<()>,
     cond: Condvar,
     waker: Mutex<Option<Waker>>,
 }
 
-impl DefaultSema {
-    pub(crate) fn new() -> Self {
+impl SysClock {
+    pub fn new() -> Self {
         Self {
+            instant: Instant::now(),
+
             mutex: Mutex::new(()),
             cond: Condvar::new(),
             waker: Mutex::new(None),
@@ -205,7 +178,31 @@ impl DefaultSema {
     }
 }
 
-impl Sema for DefaultSema {
+impl Clock for SysClock {
+    fn now(&self) -> utick {
+        self.instant
+            .elapsed()
+            .as_millis()
+            as utick
+    }
+}
+
+impl TryIntoDelta<SysClock> for Duration {
+    type Error = ();
+    fn try_into_delta(self, _: &SysClock) -> Result<Delta, Self::Error> {
+        itick::try_from(self.as_millis()).ok()
+            .and_then(|ticks| Delta::new(ticks))
+            .ok_or(())
+    }
+}
+
+impl FromDelta<SysClock> for Duration {
+    fn from_delta(_: &SysClock, delta: Delta) -> Self {
+        Duration::from_millis(delta.ticks() as u64)
+    }
+}
+
+impl Sema for SysClock {
     fn signal(&self) {
         self.cond.notify_one();
     }
@@ -225,12 +222,12 @@ impl Sema for DefaultSema {
 }
 
 #[derive(Debug)]
-pub(crate) struct DefaultSemaAsyncWait<'a> {
-    sema: &'a DefaultSema,
+pub struct SysClockAsyncWait<'a> {
+    sema: &'a SysClock,
     timer: Option<Timer>,
 }
 
-impl Future for DefaultSemaAsyncWait<'_> {
+impl Future for SysClockAsyncWait<'_> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -259,31 +256,31 @@ impl Future for DefaultSemaAsyncWait<'_> {
     }
 }
 
-impl Drop for DefaultSemaAsyncWait<'_> {
+impl Drop for SysClockAsyncWait<'_> {
     fn drop(&mut self) {
         // make sure waker is cleared
         *self.sema.waker.lock().unwrap() = None;
     }
 }
 
-impl AsyncSema for DefaultSema {
+impl AsyncSema for SysClock {
     // unfortunately we can't define types with lifetimes
     // in traits, the best we can do is unsafely strip the
     // lifetime and leave it up to the caller to drop the
     // types in the correct order
-    type AsyncWait = DefaultSemaAsyncWait<'static>;
+    type AsyncWait = SysClockAsyncWait<'static>;
 
     fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
         // only allow one async wait at a time
         debug_assert!(self.waker.lock().unwrap().is_none());
 
-        let wait = DefaultSemaAsyncWait {
+        let wait = SysClockAsyncWait {
             sema: self,
             timer: delta.map(|delta| Timer::after(Duration::from_millis(delta.ticks() as u64))),
         };
 
         // strip lifetime
-        unsafe { transmute::<DefaultSemaAsyncWait<'_>, _>(wait) }
+        unsafe { transmute::<SysClockAsyncWait<'_>, _>(wait) }
     }
 }
 

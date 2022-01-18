@@ -2,15 +2,105 @@
 use equeue::Equeue;
 use equeue::Delta;
 use equeue::Dispatch;
+use equeue::Config;
+use equeue::Buffer;
+use equeue::Clock;
+use equeue::Sema;
+use equeue::sys::SysClock;
+use equeue::sys::utick;
 
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::mem::transmute;
 
 use async_io::block_on;
 
+
 #[test]
-fn test_break() {
+fn test_misc_buffer() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_buffer(
+        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+    );
+
+    let count = AtomicU32::new(0);
+    for _ in 0..1000 {
+        q.call(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+    q.dispatch(Some(Duration::from_millis(0)));
+
+    assert_eq!(count.load(Ordering::SeqCst), 1000);
+    println!("usage: {:#?}", q.usage());
+}
+
+#[test]
+fn test_misc_config() {
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_config(Config {
+        clock: SysClock::new(),
+        precision: None,
+        buffer: Buffer::Static(
+            unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+        )
+    });
+
+    let count = AtomicU32::new(0);
+    for _ in 0..1000 {
+        q.call(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+    q.dispatch(Some(Duration::from_millis(0)));
+
+    assert_eq!(count.load(Ordering::SeqCst), 1000);
+    println!("usage: {:#?}", q.usage());
+}
+
+#[test]
+fn test_misc_custom_clock() {
+    // We're only going to do post on this, so we don't need it to be exhaustive
+    #[derive(Debug)]
+    struct MyClock();
+
+    impl Clock for MyClock {
+        fn now(&self) -> utick {
+            0
+        }
+    }
+
+    impl Sema for MyClock {
+        fn signal(&self) {}
+        fn wait(&self, _: Option<Delta>) {
+            unreachable!();
+        }
+    }
+
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_config(Config {
+        clock: MyClock(),
+        precision: None,
+        buffer: Buffer::Static(
+            unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
+        )
+    });
+
+    let count = AtomicU32::new(0);
+    for _ in 0..1000 {
+        q.call(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+    q.dispatch(Some(Delta::zero()));
+
+    assert_eq!(count.load(Ordering::SeqCst), 1000);
+    println!("usage: {:#?}", q.usage());
+}
+
+#[test]
+fn test_misc_break() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
@@ -50,7 +140,7 @@ fn test_break() {
 }
 
 #[test]
-fn test_break_busy() {
+fn test_misc_break_busy() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
@@ -74,7 +164,7 @@ fn test_break_busy() {
 }
 
 #[test]
-fn test_async_dispatch() {
+fn test_misc_async_dispatch() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
@@ -98,7 +188,7 @@ fn test_async_dispatch() {
 }
 
 #[test]
-fn test_nested_async_dispatch() {
+fn test_misc_nested_async_dispatch() {
     let q1 = Equeue::with_size(1024*1024);
     let q2 = Equeue::with_size(1024*1024);
 
@@ -131,7 +221,7 @@ fn test_nested_async_dispatch() {
 }
 
 #[test]
-fn test_handles() {
+fn test_misc_handles() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);

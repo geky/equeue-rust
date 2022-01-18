@@ -34,22 +34,20 @@ impl<F: FnOnce()> PostOnce for F {
 
 /// Post-static trait, a post that does not reclaim memory
 pub trait PostStatic: Sized {
-    fn post_static(self_: Event<'_, Self>);
+    fn post_static<C>(self_: Event<'_, Self, C>);
 }
-
 
 
 //// Into/From delta traits ////
 
-///// A trait for converting to a delta
-//pub trait TryIntoDelta {
-//    fn try_into_delta(self) -> Result<itick, Error>;
-//}
-//
-///// A trait for converting from a delta
-//pub trait FromDelta {
-//    fn from_delta(t: itick) -> Self;
-//}
+pub trait TryIntoDelta<C> {
+    type Error;
+    fn try_into_delta(self, clock: &C) -> Result<Delta, Self::Error>;
+}
+
+pub trait FromDelta<C> {
+    fn from_delta(clock: &C, delta: Delta) -> Self;
+}
 
 
 //// System level traits ////
@@ -72,7 +70,7 @@ pub trait Sema: Send + Sync + Debug {
 }
 
 /// An asynchronous binary semaphore, for waiting asynchronously
-pub trait AsyncSema: Send + Sync + Debug {
+pub trait AsyncSema: Sema + Send + Sync + Debug {
     type AsyncWait: Future<Output=()>;
     fn wait_async(&self, ticks: Option<Delta>) -> Self::AsyncWait;
 }

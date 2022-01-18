@@ -437,7 +437,7 @@ fn test_race_cancel_periodic() {
 struct StaticIncrement(Arc<AtomicU32>);
 
 impl PostStatic for StaticIncrement {
-    fn post_static(self_: Event<'_, Self>) {
+    fn post_static<C>(self_: Event<'_, Self, C>) {
         self_.0.fetch_add(1, Ordering::SeqCst);
         forget(self_);
     }
