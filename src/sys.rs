@@ -1,16 +1,10 @@
 
 // TODO feature gate this?
-use core::sync::atomic::AtomicU64;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::AtomicU16;
 use core::sync::atomic::AtomicBool;
-use core::num::NonZeroU32;
-use core::num::NonZeroI64;
 use core::sync::atomic::fence;
 use core::sync::atomic;
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::cmp::Ordering;
 use core::fmt::Debug;
 use core::future::Future;
 use core::pin::Pin;
@@ -26,6 +20,7 @@ use std::sync::MutexGuard;
 use std::sync::Condvar;
 
 use async_io::Timer;
+use cfg_if::cfg_if;
 
 use crate::traits::*;
 use crate::Error;
@@ -44,12 +39,33 @@ pub(crate) use std::alloc::dealloc;
 
 
 // Time primitives
-#[allow(non_camel_case_types)]
-pub(crate) type utick = u64;
-#[allow(non_camel_case_types)]
-pub(crate) type itick = i64;
+cfg_if! {
+    if #[cfg(feature="utick-at-least-u128")] {
+        #[allow(non_camel_case_types)] pub(crate) type utick = u128;
+        #[allow(non_camel_case_types)] pub(crate) type itick = i128;
+        pub(crate) type NonZeroItick = core::num::NonZeroI128;
 
-pub(crate) type NonZeroItick = NonZeroI64;
+    } else if #[cfg(feature="utick-at-least-u64")] {
+        #[allow(non_camel_case_types)] pub(crate) type utick = u64;
+        #[allow(non_camel_case_types)] pub(crate) type itick = i64;
+        pub(crate) type NonZeroItick = core::num::NonZeroI64;
+
+    } else if #[cfg(feature="utick-at-least-u32")] {
+        #[allow(non_camel_case_types)] pub(crate) type utick = u32;
+        #[allow(non_camel_case_types)] pub(crate) type itick = i32;
+        pub(crate) type NonZeroItick = core::num::NonZeroI32;
+
+    } else if #[cfg(feature="utick-at-least-u16")] {
+        #[allow(non_camel_case_types)] pub(crate) type utick = u16;
+        #[allow(non_camel_case_types)] pub(crate) type itick = i16;
+        pub(crate) type NonZeroItick = core::num::NonZeroI16;
+
+    } else if #[cfg(feature="utick-at-least-u8")] {
+        #[allow(non_camel_case_types)] pub(crate) type utick = u8;
+        #[allow(non_camel_case_types)] pub(crate) type itick = i8;
+        pub(crate) type NonZeroItick = core::num::NonZeroI8;
+    }
+}
 
 impl TryFrom<Duration> for Delta {
     type Error = ();
@@ -89,107 +105,59 @@ impl Clock for DefaultClock {
 
 // Atomic primitives
 
-// TODO actually adjust these based on target_width + feature flags
-/// The atomic double-word unit used in equeue
-#[allow(non_camel_case_types)]
-pub(crate) type udeptr = u64;
-#[allow(non_camel_case_types)]
-pub(crate) type ideptr = i64;
+pub(crate) use core::sync::atomic::Ordering;
 
-/// Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
-#[allow(non_camel_case_types)]
-pub(crate) type ueptr = u32;
-#[allow(non_camel_case_types)]
-pub(crate) type ieptr = i32;
+// The atomic double-word unit used in equeue
+cfg_if! {
+    if #[cfg(feature="udeptr-at-least-u128")] {
+        #[allow(non_camel_case_types)] pub(crate) type udeptr = u128;
+        #[allow(non_camel_case_types)] pub(crate) type ideptr = i128;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU128;
 
-pub(crate) type NonZeroUeptr = NonZeroU32;
+    } else if #[cfg(feature="udeptr-at-least-u64")] {
+        #[allow(non_camel_case_types)] pub(crate) type udeptr = u64;
+        #[allow(non_camel_case_types)] pub(crate) type ideptr = i64;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU64;
 
-/// Integer that fits a pointer generation count, should be 1/4 of a udeptr
-#[allow(non_camel_case_types)]
-pub(crate) type ugen = u16;
-#[allow(non_camel_case_types)]
-pub(crate) type igen = i32;
-
-
-// we really only need loads and stores, and modifications to any
-// shared variables always occur in critical sections (via Lock)
-pub(crate) trait AtomicU {
-    type U: Copy;
-    fn new(v: Self::U) -> Self;
-    fn load(&self) -> Self::U;
-    fn store(&self, v: Self::U);
-}
-
-pub(crate) use core::sync::atomic::AtomicUsize;
-
-impl AtomicU for AtomicUsize {
-    type U = usize;
-
-    #[inline]
-    fn new(v: usize) -> Self {
-        AtomicUsize::new(v)
-    }
-
-    /// Atomic load
-    #[inline]
-    fn load(&self) -> usize {
-        self.load(atomic::Ordering::SeqCst)
-    }
-
-    /// Atomic store, must always be inside a critical section
-    #[inline]
-    fn store(&self, v: usize) {
-        self.store(v, atomic::Ordering::SeqCst)
+    } else if #[cfg(feature="udeptr-at-least-u32")] {
+        #[allow(non_camel_case_types)] pub(crate) type udeptr = u32;
+        #[allow(non_camel_case_types)] pub(crate) type ideptr = i32;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU32;
     }
 }
 
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct AtomicUdeptr(AtomicU64);
+// Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
+cfg_if! {
+    if #[cfg(feature="udeptr-at-least-u128")] {
+        #[allow(non_camel_case_types)] pub(crate) type ueptr = u64;
+        #[allow(non_camel_case_types)] pub(crate) type ieptr = i64;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU64;
 
-impl AtomicU for AtomicUdeptr {
-    type U = udeptr;
+    } else if #[cfg(feature="udeptr-at-least-u64")] {
+        #[allow(non_camel_case_types)] pub(crate) type ueptr = u32;
+        #[allow(non_camel_case_types)] pub(crate) type ieptr = i32;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU32;
 
-    #[inline]
-    fn new(v: udeptr) -> Self {
-        Self(AtomicU64::new(v))
-    }
-
-    /// Atomic load
-    #[inline]
-    fn load(&self) -> udeptr {
-        self.0.load(atomic::Ordering::SeqCst)
-    }
-
-    /// Atomic store, must always be inside a critical section
-    #[inline]
-    fn store(&self, v: udeptr) {
-        self.0.store(v, atomic::Ordering::SeqCst)
+    } else if #[cfg(feature="udeptr-at-least-u32")] {
+        #[allow(non_camel_case_types)] pub(crate) type ueptr = u16;
+        #[allow(non_camel_case_types)] pub(crate) type ieptr = i16;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU16;
     }
 }
 
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct AtomicUeptr(AtomicU32);
+// Integer that fits a pointer generation count, should be 1/4 of a udeptr
+cfg_if! {
+    if #[cfg(feature="udeptr-at-least-u128")] {
+        #[allow(non_camel_case_types)] pub(crate) type ugen = u32;
+        #[allow(non_camel_case_types)] pub(crate) type igen = i32;
 
-impl AtomicU for AtomicUeptr {
-    type U = ueptr;
+    } else if #[cfg(feature="udeptr-at-least-u64")] {
+        #[allow(non_camel_case_types)] pub(crate) type ugen = u16;
+        #[allow(non_camel_case_types)] pub(crate) type igen = i16;
 
-    #[inline]
-    fn new(v: ueptr) -> Self {
-        Self(AtomicU32::new(v))
-    }
-
-    /// Atomic load
-    #[inline]
-    fn load(&self) -> ueptr {
-        self.0.load(atomic::Ordering::SeqCst)
-    }
-
-    /// Atomic store, must always be inside a critical section
-    #[inline]
-    fn store(&self, v: ueptr) {
-        self.0.store(v, atomic::Ordering::SeqCst)
+    } else if #[cfg(feature="udeptr-at-least-u32")] {
+        #[allow(non_camel_case_types)] pub(crate) type ugen = u8;
+        #[allow(non_camel_case_types)] pub(crate) type igen = i8;
     }
 }
 

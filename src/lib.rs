@@ -9,6 +9,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+
 use core::mem::size_of;
 use core::mem::align_of;
 use core::fmt;
@@ -23,7 +24,7 @@ use core::borrow::BorrowMut;
 use core::mem::forget;
 use core::ptr::drop_in_place;
 use core::mem::transmute;
-use core::cmp::Ordering;
+use core::cmp;
 use core::num::NonZeroUsize;
 use core::num::TryFromIntError;
 use core::fmt::Debug;
@@ -99,13 +100,13 @@ impl Tick {
 }
 
 impl PartialOrd for Tick {
-    fn partial_cmp(&self, other: &Tick) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Tick) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Tick {
-    fn cmp(&self, other: &Tick) -> Ordering {
+    fn cmp(&self, other: &Tick) -> cmp::Ordering {
         scmp(self.ticks(), other.ticks())
     }
 }
@@ -194,38 +195,63 @@ impl Delta {
 }
 
 impl PartialOrd for Delta {
-    fn partial_cmp(&self, other: &Delta) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Delta) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Delta {
-    fn cmp(&self, other: &Delta) -> Ordering {
+    fn cmp(&self, other: &Delta) -> cmp::Ordering {
         self.ticks().cmp(&other.ticks())
     }
 }
 
 
-// TODO for testing
-//impl From<itick> for Delta {
-//    fn from(t: itick) -> Delta {
-//        Delta::new(t).unwrap()
-//    }
-//}
-//
-//impl From<Delta> for itick {
-//    fn from(t: Delta) -> itick {
-//        t.ticks()
-//    }
-//}
+// Generic atomic storage
+trait AtomicStorage {
+    type U: Copy;
+    fn new(v: Self::U) -> Self;
+    fn load(&self) -> Self::U;
+    fn store(&self, v: Self::U);
+}
 
+impl AtomicStorage for AtomicUdeptr {
+    type U = udeptr;
 
+    fn new(v: udeptr) -> Self {
+        AtomicUdeptr::new(v)
+    }
+
+    fn load(&self) -> udeptr {
+        self.load(Ordering::SeqCst)
+    }
+
+    fn store(&self, v: udeptr) {
+        self.store(v, Ordering::SeqCst)
+    }
+}
+
+impl AtomicStorage for AtomicUeptr {
+    type U = ueptr;
+
+    fn new(v: ueptr) -> Self {
+        AtomicUeptr::new(v)
+    }
+
+    fn load(&self) -> ueptr {
+        self.load(Ordering::SeqCst)
+    }
+
+    fn store(&self, v: ueptr) {
+        self.store(v, Ordering::SeqCst)
+    }
+}
 
 /// Small wrapper to generalize atomics to any <= udeptr sized type
 #[repr(transparent)]
-struct Atomic<T, S: AtomicU>(S, PhantomData<T>);
+struct Atomic<T, S: AtomicStorage>(S, PhantomData<T>);
 
-impl<T: Copy + Debug, S: AtomicU> Debug for Atomic<T, S> {
+impl<T: Copy + Debug, S: AtomicStorage> Debug for Atomic<T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Atomic")
             .field(&self.load())
@@ -233,7 +259,7 @@ impl<T: Copy + Debug, S: AtomicU> Debug for Atomic<T, S> {
     }
 }
 
-impl<T, S: AtomicU> Atomic<T, S> {
+impl<T, S: AtomicStorage> Atomic<T, S> {
     fn new(t: T) -> Self {
         debug_assert!(size_of::<T>() <= size_of::<S::U>());
         Self(
@@ -354,7 +380,7 @@ impl MarkedEptr {
 }
 
 // interactions with atomics
-impl<S: AtomicU> Atomic<MarkedEptr, S> {
+impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
     fn store_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
         let eptr = new.cp_mark(src);
         self.store(eptr);
@@ -552,8 +578,8 @@ impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
 pub struct Equeue {
     // memory management
     slab: &'static [u8],
-    slab_front: Atomic<usize, AtomicUsize>,
-    slab_back: Atomic<usize, AtomicUsize>,
+    slab_front: Atomic<ueptr, AtomicUeptr>,
+    slab_back: Atomic<ueptr, AtomicUeptr>,
     alloced: bool,
 
     // queue management
@@ -604,34 +630,37 @@ impl Equeue {
 
         let mut q = Equeue::with_buffer(unsafe {
             slice::from_raw_parts_mut(buffer, size)
-        }).unwrap();
+        });
 
         q.alloced = true;
         q
     }
 
-    pub fn with_buffer(buffer: &'static mut [u8]) -> Result<Equeue, Error> {
+    pub fn with_buffer(buffer: &'static mut [u8]) -> Equeue {
         // some sanity checks
+        debug_assert!(align_of::<Ebuf>() >= align_of::<usize>());
         debug_assert_eq!(size_of::<Option<Delta>>(), size_of::<itick>());
 
         // align buffer
-        let align = alignup(buffer.as_ptr() as usize, align_of::<Ebuf>())
-            - buffer.as_ptr() as usize;
-        let buffer = match buffer.get_mut(align..) {
-            // already out of memory?
-            Some(buffer) => buffer,
-            None => return Err(Error::NoMem),
-        };
+        let range = buffer.as_ptr_range();
+        let start = alignup(range.start as usize, align_of::<Ebuf>()) - range.start as usize;
+        let end = aligndown(range.end as usize, align_of::<Ebuf>()) - range.start as usize;
+        let buffer = buffer.get_mut(start..end).unwrap();
 
         // go ahead and zero our buffer, this makes it easier to manage bucket
         // allocation, which needs to be null the moment a bucket is allocated
         buffer.fill(0);
 
-        Ok(Equeue {
+        Equeue {
             slab: buffer,
-            slab_front: Atomic::new(0),
-            slab_back: Atomic::new(buffer.len()),
             alloced: false,
+            // there's already a bit of finagling here to fit sizes in ueptrs,
+            // slab_front is used for bytes, but should never exceed ~log2(width)
+            // while slab_back is used for ebufs, which have a larger alignment
+            slab_front: Atomic::new(0),
+            slab_back: Atomic::new(
+                ueptr::try_from(buffer.len() / align_of::<Ebuf>()).unwrap()
+            ),
 
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
@@ -640,7 +669,7 @@ impl Equeue {
             clock: DefaultClock::new(),
             lock: DefaultLock::new(),
             sema: DefaultSema::new(),
-        })
+        }
     }
 }
 
@@ -653,7 +682,7 @@ impl Drop for Equeue {
         // intermediary states for static events/futures.
         //
         // it's up to dealloc_ to make sure drop is cleared after called
-        let mut i = self.slab_back.load();
+        let mut i = self.slab_back.load() as usize * align_of::<Ebuf>();
         while let Some(e) = self.slab.get(i) {
             let e = unsafe { &*(e as *const _ as *const Ebuf) };
             let e = unsafe { e.claim() };
@@ -688,7 +717,7 @@ impl Equeue {
         unsafe {
             slice::from_raw_parts(
                 self.slab.as_ptr() as *const Atomic<Eptr, AtomicUeptr>,
-                slab_front / size_of::<Eptr>()
+                slab_front / size_of::<Atomic<Eptr, AtomicUeptr>>()
             )
         }
     }
@@ -738,17 +767,14 @@ impl Equeue {
 
             // check if we even have enough memory available, we allocate both
             // an event and maybe some buckets if we don't have enough
-            let slab_front = self.slab_front.load();
-            let slab_back = self.slab_back.load();
+            let slab_front = self.slab_front.load() as usize;
+            let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
             let new_slab_front = max(
                 (npw2 as usize + 1)*size_of::<Eptr>(),
                 slab_front
             );
-            let new_slab_back = aligndown(
-                slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
-                ),
-                align_of::<Ebuf>()
+            let new_slab_back = slab_back.saturating_sub(
+                size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
             );
 
             if new_slab_front > new_slab_back {
@@ -757,16 +783,20 @@ impl Equeue {
 
             // actually commit our allocation
             if new_slab_front > slab_front {
-                self.slab_front.store(new_slab_front);
+                self.slab_front.store(
+                    ueptr::try_from(new_slab_front).unwrap()
+                );
             }
 
             debug_assert!(new_slab_back < slab_back);
-            self.slab_back.store(new_slab_back);
+            self.slab_back.store(
+                ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
+            );
             new_slab_back
         };
 
         unsafe {
-            let e = &self.slab[new_slab_back as usize]
+            let e = &self.slab[new_slab_back]
                 as *const u8 as *const Ebuf as *mut Ebuf;
             e.write(Ebuf {
                 next: Atomic::new(MarkedEptr::null()),
@@ -847,15 +877,15 @@ impl Equeue {
             while let Some(tail) = tailptr.as_ref(self) {
                 // compare targets
                 match tail.target.cmp(&target) {
-                    Ordering::Greater => {
+                    cmp::Ordering::Greater => {
                         sibling = None;
                         break;
                     }
-                    Ordering::Equal => {
+                    cmp::Ordering::Equal => {
                         sibling = Some(tail);
                         break;
                     }
-                    Ordering::Less => {
+                    cmp::Ordering::Less => {
                         // continue
                     }
                 }
@@ -2231,7 +2261,7 @@ impl Equeue {
         // find slab usage
         let slab_total = self.slab.len();
         let slab_front = self.slab_front.load() as usize;
-        let slab_back = self.slab_back.load() as usize;
+        let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
         let slab_unused = slab_back - slab_front;
 
         let mut total = 0usize;

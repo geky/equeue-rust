@@ -8,9 +8,28 @@ opt-level = 3
 debug = true
 debug-assertions = true
 
+[features]
+default = ["utick-at-least-u64", "udeptr-at-least-u64"]
+
+# integer type requirements
+# 
+# note you only need to choose one for each type,
+# feature resolution will choose the largest type
+# that satisfies all requirements
+utick-at-least-u128 = []
+utick-at-least-u64 = []
+utick-at-least-u32 = []
+utick-at-least-u16 = []
+utick-at-least-u8 = []
+
+udeptr-at-least-u128 = []
+udeptr-at-least-u64 = []
+udeptr-at-least-u32 = []
+
 [dependencies]
 async-io = "1.6.0"
 either = "1.6.1"
+cfg-if = "1.0.0"
 
 [dev-dependencies]
 rand = "0.8.4"

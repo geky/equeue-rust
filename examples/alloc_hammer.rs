@@ -3,7 +3,6 @@ use equeue::Equeue;
 
 use std::thread;
 use std::alloc::Layout;
-use std::mem::transmute;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,10 +27,7 @@ struct Opt {
 fn main() {
     let opt = Opt::from_args();
 
-    let mut buffer = vec![0; 1024*1024];
-    let q = Arc::new(Equeue::with_buffer(
-        unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-    ).unwrap());
+    let q = Arc::new(Equeue::with_size(1024*1024));
 
     // some busywork, n threads, each randomly allocating some random size for
     // some random about of time

@@ -30,18 +30,6 @@ impl Align for usize {
     }
 }
 
-impl Align for u64 {
-    #[inline]
-    fn aligndown(self, align: usize) -> u64 {
-        self - (self % align as u64)
-    }
-
-    #[inline]
-    fn alignup(self, align: usize) -> u64 {
-        (self + align as u64-1).aligndown(align)
-    }
-}
-
 impl Align for *const u8 {
     #[inline]
     fn aligndown(self, align: usize) -> *const u8 {
@@ -100,6 +88,20 @@ pub(crate) trait Scmp {
     fn scmp(self, b: Self) -> Ordering;
 }
 
+impl Scmp for u128 {
+    type Output = i128;
+
+    #[inline]
+    fn sdiff(self, b: u128) -> i128 {
+        self.wrapping_sub(b) as i128
+    }
+
+    #[inline]
+    fn scmp(self, b: u128) -> Ordering {
+        self.sdiff(b).cmp(&0)
+    }
+}
+
 impl Scmp for u64 {
     type Output = i64;
 
@@ -110,6 +112,20 @@ impl Scmp for u64 {
 
     #[inline]
     fn scmp(self, b: u64) -> Ordering {
+        self.sdiff(b).cmp(&0)
+    }
+}
+
+impl Scmp for u32 {
+    type Output = i32;
+
+    #[inline]
+    fn sdiff(self, b: u32) -> i32 {
+        self.wrapping_sub(b) as i32
+    }
+
+    #[inline]
+    fn scmp(self, b: u32) -> Ordering {
         self.sdiff(b).cmp(&0)
     }
 }
