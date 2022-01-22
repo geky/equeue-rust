@@ -51,7 +51,6 @@ use sys::*;
 mod traits;
 pub use traits::*;
 
-
 /// Default number of bits of precision to use for scheduling events, this
 /// limits the number of significant digits used in long-term events in order
 /// to create better bucketing and power consumption
@@ -81,6 +80,7 @@ const PRECISION: u8 = {
         None => 6
     }
 };
+
 
 /// Event queue errors
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -118,14 +118,14 @@ impl Tick {
         Self(t)
     }
 
-    const fn ticks(&self) -> utick {
+    const fn uticks(&self) -> utick {
         self.0
     }
 
     // we store some deltas as ticks to reuse memory, so we need this,
     // it's not worth the noise to create a union
     const fn as_delta(self) -> Option<Delta> {
-        Delta::new(self.ticks() as itick)
+        Delta::new(self.uticks() as itick)
     }
 }
 
@@ -137,7 +137,7 @@ impl PartialOrd for Tick {
 
 impl Ord for Tick {
     fn cmp(&self, other: &Tick) -> cmp::Ordering {
-        scmp(self.ticks(), other.ticks())
+        scmp(self.uticks(), other.uticks())
     }
 }
 
@@ -150,7 +150,7 @@ impl Sub for Tick {
     type Output = Delta;
 
     fn sub(self, other: Tick) -> Delta {
-        let delta = max(sdiff(self.ticks(), other.ticks()), 0);
+        let delta = max(sdiff(self.uticks(), other.uticks()), 0);
         unsafe { Delta::new_unchecked(delta) }
     }
 }
@@ -159,7 +159,7 @@ impl Add<Delta> for Tick {
     type Output = Tick;
 
     fn add(self, other: Delta) -> Tick {
-        Tick::new(self.ticks().wrapping_add(other.ticks() as utick))
+        Tick::new(self.uticks().wrapping_add(other.uticks()))
     }
 }
 
@@ -173,11 +173,11 @@ impl Tick {
         // Note that this always ensures a later deadline.
         let mask = (1 << (
             (8*size_of::<utick>() as u8).saturating_sub(
-                other.ticks().leading_zeros() as u8 + precision
+                other.uticks().leading_zeros() as u8 + precision
             )
         )) - 1;
 
-        Tick::new(self.ticks().wrapping_add(other.ticks() as utick) | mask)
+        Tick::new(self.uticks().wrapping_add(other.uticks()) | mask)
     }
 }
 
@@ -191,7 +191,7 @@ pub struct Delta(NonZeroItick);
 impl Debug for Delta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Delta")
-            .field(&self.ticks())
+            .field(&self.uticks())
             .finish()
     }
 }
@@ -213,14 +213,19 @@ impl Delta {
         Self(NonZeroItick::new_unchecked(!t))
     }
 
-    pub const fn ticks(self) -> itick {
+    pub const fn iticks(self) -> itick {
         !self.0.get()
+    }
+
+    pub const fn uticks(self) -> utick {
+        // completely safe since we know we have no negative values
+        self.iticks() as utick
     }
 
     // we store some deltas as ticks to reuse memory, so we need this,
     // it's not worth the noise to create a union
     const fn as_tick(self) -> Tick {
-        Tick::new(self.ticks() as utick)
+        Tick::new(self.uticks())
     }
 }
 
@@ -232,20 +237,20 @@ impl PartialOrd for Delta {
 
 impl Ord for Delta {
     fn cmp(&self, other: &Delta) -> cmp::Ordering {
-        self.ticks().cmp(&other.ticks())
+        self.uticks().cmp(&other.uticks())
     }
 }
 
-impl<C> TryIntoDelta<C> for Delta {
+impl TryIntoDelta for Delta {
     type Error = Infallible;
-    fn try_into_delta(self, _: &C) -> Result<Delta, Self::Error> {
+    fn try_into_delta(self, _: utick) -> Result<Delta, Self::Error> {
         Ok(self)
     }
 }
 
-impl<C> TryFromDelta<C> for Delta {
+impl TryFromDelta for Delta {
     type Error = Infallible;
-    fn try_from_delta(_: &C, delta: Delta) -> Result<Delta, Self::Error> {
+    fn try_from_delta(delta: Delta, _: utick) -> Result<Delta, Self::Error> {
         Ok(delta)
     }
 }
@@ -1288,10 +1293,10 @@ impl<C: Clock> Equeue<C> {
         }
     }
 
-    pub fn delta<Δ: TryFromDelta<C>>(&self, id: Id) -> Option<Δ> {
+    pub fn delta<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
         self.delta_(id)
             .map(|delta|
-                Δ::try_from_delta(&self.clock, delta).ok()
+                Δ::try_from_delta(delta, self.clock.frequency()).ok()
                     .expect("delta overflow in equeue")
             )
     }
@@ -1451,10 +1456,10 @@ impl<C: Clock> Equeue<C> {
         }
     }
 
-    pub fn next_delta<Δ: TryFromDelta<C>>(&self) -> Option<Δ> {
+    pub fn next_delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
         self.next_delta_(self.now())
             .map(|delta|
-                Δ::try_from_delta(&self.clock, delta).ok()
+                Δ::try_from_delta(delta, self.clock.frequency()).ok()
                     .expect("delta overflow in equeue")
             )
     }
@@ -1565,10 +1570,10 @@ impl<C: Clock+Sema> Equeue<C> {
         }
     }
 
-    pub fn dispatch<Δ: TryIntoDelta<C>>(&self, delta: Option<Δ>) -> Dispatch {
+    pub fn dispatch<Δ: TryIntoDelta>(&self, delta: Option<Δ>) -> Dispatch {
         self.dispatch_(
             delta.map(|delta|
-                delta.try_into_delta(&self.clock).ok()
+                delta.try_into_delta(self.clock.frequency()).ok()
                     .expect("delta overflow in equeue")
             )
         )
@@ -1611,19 +1616,19 @@ impl<C: Clock+Sema> Equeue<C> {
         }
     }
 
-    pub unsafe fn set_raw_delay<Δ: TryIntoDelta<C>>(&self, e: *mut u8, delay: Δ) {
+    pub unsafe fn set_raw_delay<Δ: TryIntoDelta>(&self, e: *mut u8, delay: Δ) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.target = delay.try_into_delta(&self.clock).ok()
+        e.target = delay.try_into_delta(self.clock.frequency()).ok()
             .expect("delta overflow in equeue")
             .as_tick();
     }
 
-    pub unsafe fn set_raw_period<Δ: TryIntoDelta<C>>(&self, e: *mut u8, period: Option<Δ>) {
+    pub unsafe fn set_raw_period<Δ: TryIntoDelta>(&self, e: *mut u8, period: Option<Δ>) {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.period = period.map(|period|
-            period.try_into_delta(&self.clock).ok()
+            period.try_into_delta(self.clock.frequency()).ok()
                 .expect("delta overflow in equeue")
         );
     }
@@ -1715,7 +1720,7 @@ impl<'a, C> Handle<'a, C> {
 impl<'a, C: Clock> Handle<'a, C> {
     // Some other convenience functions, which can
     // normally be done with Ids
-    pub fn delta<Δ: TryFromDelta<C>>(&self) -> Option<Δ> {
+    pub fn delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
         self.q.delta(self.id)
     }
 }
@@ -1944,24 +1949,26 @@ impl<C: Clock+Sema> Equeue<C> {
     }
 }
 
-impl<'a, T, C> Event<'a, T, C> {
-    pub fn delay<Δ: TryIntoDelta<C>>(mut self, delay: Δ) -> Self {
-        self.e.target = delay.try_into_delta(&self.q.clock).ok()
+impl<'a, T, C: Clock> Event<'a, T, C> {
+    pub fn delay<Δ: TryIntoDelta>(mut self, delay: Δ) -> Self {
+        self.e.target = delay.try_into_delta(self.q.clock.frequency()).ok()
             .expect("delta overflow in equeue")
             .as_tick();
         self
     }
 
-    pub fn period<Δ: TryIntoDelta<C>>(mut self, period: Option<Δ>) -> Self {
+    pub fn period<Δ: TryIntoDelta>(mut self, period: Option<Δ>) -> Self {
         // can't set period for PostOnce events 
         assert!(!self.once);
         self.e.period = period.map(|period|
-            period.try_into_delta(&self.q.clock).ok()
+            period.try_into_delta(self.q.clock.frequency()).ok()
                 .expect("delta overflow in equeue")
         );
         self
     }
+}
 
+impl <'a, T, C> Event<'a, T, C> {
     pub fn static_(self, static_: bool) -> Self {
         // can't make PostOnce events static
         assert!(!self.once);
@@ -2045,7 +2052,7 @@ impl<C: Clock+Sema> Equeue<C> {
         )
     }
 
-    pub fn call_in<Δ: TryIntoDelta<C>, F: PostOnce + Send>(
+    pub fn call_in<Δ: TryIntoDelta, F: PostOnce + Send>(
         &self,
         delay: Δ,
         cb: F
@@ -2057,12 +2064,12 @@ impl<C: Clock+Sema> Equeue<C> {
         )
     }
 
-    pub fn call_every<Δ: TryIntoDelta<C>, F: Post + Send>(
+    pub fn call_every<Δ: TryIntoDelta, F: Post + Send>(
         &self,
         period: Δ,
         cb: F
     ) -> Result<Id, Error> {
-        let period = period.try_into_delta(&self.clock).ok()
+        let period = period.try_into_delta(self.clock.frequency()).ok()
             .expect("delta overflow in equeue");
         Ok(
             self.alloc(cb)?
@@ -2089,7 +2096,7 @@ impl<C: Clock+Sema> Equeue<C> {
         self.call(cb).map(|id| Handle::new(self, id))
     }
 
-    pub fn call_in_handle<'a, Δ: TryIntoDelta<C>, F: PostOnce + Send>(
+    pub fn call_in_handle<'a, Δ: TryIntoDelta, F: PostOnce + Send>(
         &'a self,
         delay: Δ,
         cb: F
@@ -2097,7 +2104,7 @@ impl<C: Clock+Sema> Equeue<C> {
         self.call_in(delay, cb).map(|id| Handle::new(self, id))
     }
 
-    pub fn call_every_handle<'a, Δ: TryIntoDelta<C>, F: Post + Send>(
+    pub fn call_every_handle<'a, Δ: TryIntoDelta, F: Post + Send>(
         &'a self,
         period: Δ,
         cb: F
@@ -2257,8 +2264,8 @@ impl<C> Equeue<C> {
 }
 
 impl<C: Clock+Sema> Equeue<C> {
-    pub async fn sleep<Δ: TryIntoDelta<C>>(&self, delta: Δ) -> Result<(), Error> {
-        let delta = delta.try_into_delta(&self.clock).ok()
+    pub async fn sleep<Δ: TryIntoDelta>(&self, delta: Δ) -> Result<(), Error> {
+        let delta = delta.try_into_delta(self.clock.frequency()).ok()
             .expect("delta overflow in equeue");
         AsyncSleep {
             q: self,
@@ -2268,11 +2275,11 @@ impl<C: Clock+Sema> Equeue<C> {
         }.await
     }
 
-    pub async fn timeout<Δ: TryIntoDelta<C>, R, F> (&self, delta: Δ, f: F) -> Result<R, Error>
+    pub async fn timeout<Δ: TryIntoDelta, F, R> (&self, delta: Δ, f: F) -> Result<R, Error>
     where
         F: Future<Output=R>
     {
-        let delta = delta.try_into_delta(&self.clock).ok()
+        let delta = delta.try_into_delta(self.clock.frequency()).ok()
             .expect("delta overflow in equeue");
         AsyncTimeout {
             q: self,
@@ -2325,10 +2332,10 @@ impl<C: Clock+AsyncSema> Equeue<C> {
         }
     }
 
-    pub async fn dispatch_async<Δ: TryIntoDelta<C>>(&self, delta: Option<Δ>) -> Dispatch {
+    pub async fn dispatch_async<Δ: TryIntoDelta>(&self, delta: Option<Δ>) -> Dispatch {
         self.dispatch_async_(
             delta.map(|delta|
-                delta.try_into_delta(&self.clock).ok()
+                delta.try_into_delta(self.clock.frequency()).ok()
                     .expect("delta overflow in equeue")
             )
         ).await

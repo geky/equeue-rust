@@ -40,14 +40,14 @@ pub trait PostStatic<C=SysClock>: Sized {
 
 //// Into/From delta traits ////
 
-pub trait TryIntoDelta<C>: Sized {
+pub trait TryIntoDelta: Sized {
     type Error;
-    fn try_into_delta(self, clock: &C) -> Result<Delta, Self::Error>;
+    fn try_into_delta(self, frequency: utick) -> Result<Delta, Self::Error>;
 }
 
-pub trait TryFromDelta<C>: Sized {
+pub trait TryFromDelta: Sized {
     type Error;
-    fn try_from_delta(clock: &C, delta: Delta) -> Result<Self, Self::Error>;
+    fn try_from_delta(delta: Delta, frequency: utick) -> Result<Self, Self::Error>;
 }
 
 
@@ -56,6 +56,7 @@ pub trait TryFromDelta<C>: Sized {
 /// Some way to get the time, for some definition of time
 pub trait Clock: Send + Sync + Debug {
     fn now(&self) -> utick;
+    fn frequency(&self) -> utick;
 }
 
 /// Locking primitive

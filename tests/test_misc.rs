@@ -79,6 +79,10 @@ fn test_misc_custom_clock() {
         fn now(&self) -> utick {
             0
         }
+
+        fn frequency(&self) -> utick {
+            1000
+        }
     }
 
     impl Sema for MyClock {

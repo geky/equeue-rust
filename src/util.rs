@@ -7,6 +7,8 @@ use core::mem::size_of;
 use core::mem::transmute;
 use core::cmp::Ordering;
 
+use crate::sys::utick;
+
 
 // min/max
 pub(crate) use core::cmp::min;
@@ -130,6 +132,34 @@ impl Scmp for u32 {
     }
 }
 
+impl Scmp for u16 {
+    type Output = i16;
+
+    #[inline]
+    fn sdiff(self, b: u16) -> i16 {
+        self.wrapping_sub(b) as i16
+    }
+
+    #[inline]
+    fn scmp(self, b: u16) -> Ordering {
+        self.sdiff(b).cmp(&0)
+    }
+}
+
+impl Scmp for u8 {
+    type Output = i8;
+
+    #[inline]
+    fn sdiff(self, b: u8) -> i8 {
+        self.wrapping_sub(b) as i8
+    }
+
+    #[inline]
+    fn scmp(self, b: u8) -> Ordering {
+        self.sdiff(b).cmp(&0)
+    }
+}
+
 impl Scmp for usize {
     type Output = isize;
 
@@ -163,6 +193,23 @@ pub(crate) const fn parse_const_u8(s: &str) -> u8 {
     while i < s.len() {
         if s[i] >= b'0' && s[i] <= b'9' {
             v = v*10 + (s[i] - b'0') as u8;
+        } else {
+            panic!("invalid compile-time u8");
+        }
+        i += 1;
+    }
+
+    v
+}
+
+pub(crate) const fn parse_const_utick(s: &str) -> utick {
+    let mut v = 0;
+    let s = s.as_bytes();
+
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] >= b'0' && s[i] <= b'9' {
+            v = v*10 + (s[i] - b'0') as utick;
         } else {
             panic!("invalid compile-time u8");
         }
