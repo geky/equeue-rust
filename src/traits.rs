@@ -40,13 +40,14 @@ pub trait PostStatic<C=SysClock>: Sized {
 
 //// Into/From delta traits ////
 
-pub trait TryIntoDelta<C> {
+pub trait TryIntoDelta<C>: Sized {
     type Error;
     fn try_into_delta(self, clock: &C) -> Result<Delta, Self::Error>;
 }
 
-pub trait FromDelta<C> {
-    fn from_delta(clock: &C, delta: Delta) -> Self;
+pub trait TryFromDelta<C>: Sized {
+    type Error;
+    fn try_from_delta(clock: &C, delta: Delta) -> Result<Self, Self::Error>;
 }
 
 

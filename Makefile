@@ -15,6 +15,7 @@ build-configs:
 	cargo build --features async-io
 	cargo build --features async-std
 	cargo build --features tokio
+	cargo build --features embedded-time
 
 .PHONY: test-configs
 test-configs: build-configs
@@ -22,6 +23,7 @@ test-configs: build-configs
 	cargo test --tests --features async-io
 	cargo test --tests --features async-std
 	cargo test --tests --features tokio
+	cargo test --tests --features embedded-time
 
 .PHONY: docs
 docs:

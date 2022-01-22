@@ -13,6 +13,7 @@ use core::task::Context;
 use core::task::Waker;
 use core::mem::transmute;
 use core::time::Duration;
+use core::convert::Infallible;
 
 use cfg_if::cfg_if;
 
@@ -258,9 +259,172 @@ cfg_if! {
             }
         }
 
-        impl FromDelta<SysClock> for Duration {
-            fn from_delta(_: &SysClock, delta: Delta) -> Self {
-                Duration::from_millis(delta.ticks() as u64)
+        impl TryFromDelta<SysClock> for Duration {
+            type Error = Infallible;
+            fn try_from_delta(_: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                Ok(Duration::from_millis(delta.ticks() as u64))
+            }
+        }
+
+        cfg_if! {
+            if #[cfg(feature="embedded-time")] {
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Generic<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, _: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Milliseconds::<utick>::try_from(self).ok()
+                            .and_then(|ticks| itick::try_from(ticks.0).ok())
+                            .and_then(|ticks| Delta::new(ticks))
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Generic<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(_: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        use embedded_time::duration::Duration;
+                        embedded_time::duration::Milliseconds(delta.ticks() as utick)
+                            .to_generic(embedded_time::fraction::Fraction::new(1, 1000)).ok()
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Nanoseconds<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Nanoseconds<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Microseconds<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Microseconds<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Milliseconds<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Milliseconds<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Seconds<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Seconds<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Minutes<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Minutes<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryIntoDelta<SysClock> for embedded_time::duration::Hours<T>
+                where
+                    utick: TryFrom<T>
+                {
+                    type Error = ();
+                    fn try_into_delta(self, clock: &SysClock) -> Result<Delta, Self::Error> {
+                        embedded_time::duration::Generic::from(self).try_into_delta(clock)
+                    }
+                }
+
+                impl<T: embedded_time::TimeInt> TryFromDelta<SysClock> for embedded_time::duration::Hours<T>
+                where
+                    T: TryFrom<utick>
+                {
+                    type Error = ();
+                    fn try_from_delta(clock: &SysClock, delta: Delta) -> Result<Self, Self::Error> {
+                        embedded_time::duration::Generic::<utick>::try_from_delta(clock, delta).ok()
+                            .and_then(|ticks| Self::try_from(ticks).ok())
+                            .ok_or(())
+                    }
+                }
             }
         }
 

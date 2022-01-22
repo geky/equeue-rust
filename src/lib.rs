@@ -243,9 +243,10 @@ impl<C> TryIntoDelta<C> for Delta {
     }
 }
 
-impl<C> FromDelta<C> for Delta {
-    fn from_delta(_: &C, delta: Delta) -> Delta {
-        delta
+impl<C> TryFromDelta<C> for Delta {
+    type Error = Infallible;
+    fn try_from_delta(_: &C, delta: Delta) -> Result<Delta, Self::Error> {
+        Ok(delta)
     }
 }
 
@@ -1287,9 +1288,12 @@ impl<C: Clock> Equeue<C> {
         }
     }
 
-    pub fn delta<Δ: FromDelta<C>>(&self, id: Id) -> Option<Δ> {
+    pub fn delta<Δ: TryFromDelta<C>>(&self, id: Id) -> Option<Δ> {
         self.delta_(id)
-            .map(|delta| Δ::from_delta(&self.clock, delta))
+            .map(|delta|
+                Δ::try_from_delta(&self.clock, delta).ok()
+                    .expect("delta overflow in equeue")
+            )
     }
 }
 
@@ -1447,9 +1451,12 @@ impl<C: Clock> Equeue<C> {
         }
     }
 
-    pub fn next_delta<Δ: FromDelta<C>>(&self) -> Option<Δ> {
+    pub fn next_delta<Δ: TryFromDelta<C>>(&self) -> Option<Δ> {
         self.next_delta_(self.now())
-            .map(|delta| Δ::from_delta(&self.clock, delta))
+            .map(|delta|
+                Δ::try_from_delta(&self.clock, delta).ok()
+                    .expect("delta overflow in equeue")
+            )
     }
 }
 
@@ -1708,7 +1715,7 @@ impl<'a, C> Handle<'a, C> {
 impl<'a, C: Clock> Handle<'a, C> {
     // Some other convenience functions, which can
     // normally be done with Ids
-    pub fn delta<Δ: FromDelta<C>>(&self) -> Option<Δ> {
+    pub fn delta<Δ: TryFromDelta<C>>(&self) -> Option<Δ> {
         self.q.delta(self.id)
     }
 }

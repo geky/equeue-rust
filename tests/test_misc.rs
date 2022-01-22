@@ -17,6 +17,8 @@ use std::mem::transmute;
 #[cfg(feature="async-io")] use async_io::block_on;
 #[cfg(feature="async-std")] use async_std::task::block_on;
 
+#[cfg(feature="embedded-time")] use embedded_time::duration::Extensions;
+
 #[cfg(feature="tokio")]
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Runtime::new()
@@ -273,5 +275,28 @@ fn test_misc_handles() {
     q.dispatch(Some(Duration::from_millis(0)));
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
+    println!("usage: {:#?}", q.usage());
+}
+
+#[cfg(feature="embedded-time")]
+#[test]
+fn test_embedded_time() {
+    let q = Equeue::with_size(1024*1024);
+
+    let count = AtomicU32::new(0);
+    for i in 0..10 {
+        q.call_in((i*100u32).milliseconds(), || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+
+    q.dispatch(Some(50u32.milliseconds()));
+    for i in 0..10 {
+        assert_eq!(count.load(Ordering::SeqCst), i+1);
+        q.dispatch(Some(100u32.milliseconds()));
+    }
+    q.dispatch(Some(100u32.milliseconds()));
+
+    assert_eq!(count.load(Ordering::SeqCst), 10);
     println!("usage: {:#?}", q.usage());
 }
