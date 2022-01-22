@@ -53,6 +53,36 @@ mod traits;
 pub use traits::*;
 
 
+/// Default number of bits of precision to use for scheduling events, this
+/// limits the number of significant digits used in long-term events in order
+/// to create better bucketing and power consumption
+///
+/// So if you needed to schedule an event in 20 minutes, aka 1200000
+/// milliseconds, aka 0b000100100100111110000000 if equeue is running
+/// with a millisecond-based clock:
+///
+/// 000100100100111110000000
+/// 000100000000000000000000 => 1-bit of precision => ~20-37.48 minutes
+/// 000110000000000000000000 => 2-bits of precision => ~20-28.74 minutes
+/// 000111100000000000000000 => 4-bits of precision => ~20-22.18 minutes
+/// 000111111110000000000000 => 8-bits of precision => ~20-20.14 minutes
+/// 000111111111111111100000 => 16-bits of precision => ~20-20.00052 minutes
+/// 000111111111111111111111 => 32-bits of precision => ~20 minutes
+///
+/// This probably deserves more analysis, but some handwavey theorized
+/// runtimes:
+///
+/// - precision = n   => O(n)
+/// - precision = n/2 => O(sqrt(n))
+/// - precision = 1   => O(log(n))
+///
+const PRECISION: u8 = {
+    match option_env!("EQUEUE_PRECISION") {
+        Some(precision) => parse_const_u8(precision),
+        None => 6
+    }
+};
+
 /// Event queue errors
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
@@ -628,30 +658,6 @@ pub enum Buffer {
 #[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
 
 impl<C> Equeue<C> {
-    /// Default number of bits of precision to use for scheduling events, this
-    /// limits the number of significant digits used in long-term events in order
-    /// to create better bucketing and power consumption
-    ///
-    /// So if you needed to schedule an event in 20 minutes, aka 1200000
-    /// milliseconds, aka 0b000100100100111110000000 if equeue is running
-    /// with a millisecond-based clock:
-    ///
-    /// 000100100100111110000000
-    /// 000100000000000000000000 => 1-bit of precision => ~20-37.48 minutes
-    /// 000110000000000000000000 => 2-bits of precision => ~20-28.74 minutes
-    /// 000111100000000000000000 => 4-bits of precision => ~20-22.18 minutes
-    /// 000111111110000000000000 => 8-bits of precision => ~20-20.14 minutes
-    /// 000111111111111111100000 => 16-bits of precision => ~20-20.00052 minutes
-    /// 000111111111111111111111 => 32-bits of precision => ~20 minutes
-    ///
-    /// This probably deserves more analysis, but some handwavey theorized
-    /// runtimes:
-    ///
-    /// - precision = n   => O(n)
-    /// - precision = n/2 => O(sqrt(n))
-    /// - precision = 1   => O(log(n))
-    ///
-    const PRECISION: u8 = 6;
 
     pub fn with_config(config: Config<C>) -> Equeue<C> {
         // some sanity checks
@@ -697,7 +703,7 @@ impl<C> Equeue<C> {
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
             break_: Atomic::new(false),
-            precision: config.precision.unwrap_or(Equeue::<C>::PRECISION),
+            precision: config.precision.unwrap_or(PRECISION),
 
             clock: config.clock,
             lock: SysLock::new(),

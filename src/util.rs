@@ -154,3 +154,20 @@ pub(crate) fn scmp<T: Scmp>(a: T, b: T) -> Ordering {
     a.scmp(b)
 }
 
+// parse integers at compile time
+pub(crate) const fn parse_const_u8(s: &str) -> u8 {
+    let mut v = 0;
+    let s = s.as_bytes();
+
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] >= b'0' && s[i] <= b'9' {
+            v = v*10 + (s[i] - b'0') as u8;
+        } else {
+            panic!("invalid compile-time u8");
+        }
+        i += 1;
+    }
+
+    v
+}

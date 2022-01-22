@@ -40,31 +40,31 @@ pub(crate) use std::alloc::dealloc;
 
 // Time primitives
 cfg_if! {
-    if #[cfg(feature="utick-at-least-u128")] {
+    if #[cfg(equeue_utick_width="128")] {
         #[allow(non_camel_case_types)] pub type utick = u128;
         #[allow(non_camel_case_types)] pub type itick = i128;
         pub type NonZeroUtick = core::num::NonZeroI128;
         pub type NonZeroItick = core::num::NonZeroI128;
 
-    } else if #[cfg(feature="utick-at-least-u64")] {
+    } else if #[cfg(equeue_utick_width="64")] {
         #[allow(non_camel_case_types)] pub type utick = u64;
         #[allow(non_camel_case_types)] pub type itick = i64;
         pub type NonZeroUtick = core::num::NonZeroI64;
         pub type NonZeroItick = core::num::NonZeroI64;
 
-    } else if #[cfg(feature="utick-at-least-u32")] {
+    } else if #[cfg(equeue_utick_width="32")] {
         #[allow(non_camel_case_types)] pub type utick = u32;
         #[allow(non_camel_case_types)] pub type itick = i32;
         pub type NonZeroUtick = core::num::NonZeroI32;
         pub type NonZeroItick = core::num::NonZeroI32;
 
-    } else if #[cfg(feature="utick-at-least-u16")] {
+    } else if #[cfg(equeue_utick_width="16")] {
         #[allow(non_camel_case_types)] pub type utick = u16;
         #[allow(non_camel_case_types)] pub type itick = i16;
         pub type NonZeroUtick = core::num::NonZeroI16;
         pub type NonZeroItick = core::num::NonZeroI16;
 
-    } else if #[cfg(feature="utick-at-least-u8")] {
+    } else if #[cfg(equeue_utick_width="8")] {
         #[allow(non_camel_case_types)] pub type utick = u8;
         #[allow(non_camel_case_types)] pub type itick = i8;
         pub type NonZeroUtick = core::num::NonZeroI8;
@@ -79,17 +79,17 @@ pub(crate) use core::sync::atomic::Ordering;
 
 // The atomic double-word unit used in equeue
 cfg_if! {
-    if #[cfg(feature="udeptr-at-least-u128")] {
+    if #[cfg(equeue_udeptr_width="128")] {
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u128;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i128;
         pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU128;
 
-    } else if #[cfg(feature="udeptr-at-least-u64")] {
+    } else if #[cfg(equeue_udeptr_width="64")] {
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u64;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i64;
         pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU64;
 
-    } else if #[cfg(feature="udeptr-at-least-u32")] {
+    } else if #[cfg(equeue_udeptr_width="32")] {
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u32;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i32;
         pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU32;
@@ -98,17 +98,17 @@ cfg_if! {
 
 // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
 cfg_if! {
-    if #[cfg(feature="udeptr-at-least-u128")] {
+    if #[cfg(equeue_udeptr_width="128")] {
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u64;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i64;
         pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU64;
 
-    } else if #[cfg(feature="udeptr-at-least-u64")] {
+    } else if #[cfg(equeue_udeptr_width="64")] {
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u32;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i32;
         pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU32;
 
-    } else if #[cfg(feature="udeptr-at-least-u32")] {
+    } else if #[cfg(equeue_udeptr_width="32")] {
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u16;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i16;
         pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU16;
@@ -117,15 +117,15 @@ cfg_if! {
 
 // Integer that fits a pointer generation count, should be 1/4 of a udeptr
 cfg_if! {
-    if #[cfg(feature="udeptr-at-least-u128")] {
+    if #[cfg(equeue_udeptr_width="128")] {
         #[allow(non_camel_case_types)] pub(crate) type ugen = u32;
         #[allow(non_camel_case_types)] pub(crate) type igen = i32;
 
-    } else if #[cfg(feature="udeptr-at-least-u64")] {
+    } else if #[cfg(equeue_udeptr_width="64")] {
         #[allow(non_camel_case_types)] pub(crate) type ugen = u16;
         #[allow(non_camel_case_types)] pub(crate) type igen = i16;
 
-    } else if #[cfg(feature="udeptr-at-least-u32")] {
+    } else if #[cfg(equeue_udeptr_width="32")] {
         #[allow(non_camel_case_types)] pub(crate) type ugen = u8;
         #[allow(non_camel_case_types)] pub(crate) type igen = i8;
     }
