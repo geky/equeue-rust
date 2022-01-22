@@ -13,16 +13,34 @@ default = ["std", "alloc"]
 std = ["alloc"]
 alloc = []
 
+# integer type requirements
+#
+# note you only need to choose one for each type,
+# feature resolution will choose the largest type
+# that satisfies all requirements
+utick-at-least-u128 = []
+utick-at-least-u64 = []
+utick-at-least-u32 = []
+utick-at-least-u16 = []
+utick-at-least-u8 = []
+
+udeptr-at-least-u128 = []
+udeptr-at-least-u64 = []
+udeptr-at-least-u32 = []
+
 [dependencies]
 either = "1.6.1"
 cfg-if = "1.0.0"
 
 # optional integrations
+embedded-time = {version="0.12.1", optional=true}
+
 async-io = {version="1.6.0", optional=true}
 async-std = {version="1.10.0", optional=true}
 tokio = {version="1.15.0", optional=true, features=["time", "rt-multi-thread"]}
 
-embedded-time = {version="0.12.1", optional=true}
+[build-dependencies]
+cfg-if = "1.0.0"
 
 [dev-dependencies]
 rand = "0.8.4"

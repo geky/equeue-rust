@@ -78,55 +78,58 @@ cfg_if! {
 
 pub(crate) use core::sync::atomic::Ordering;
 
-// The atomic double-word unit used in equeue
 cfg_if! {
-    if #[cfg(equeue_udeptr_width="128")] {
+    if #[cfg(any(
+        equeue_udeptr_width="128",
+        all(equeue_udeptr_width="native", target_pointer_width="128")
+    ))] {
+        // The atomic double-eptr unit used in equeue
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u128;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i128;
         pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU128;
 
-    } else if #[cfg(equeue_udeptr_width="64")] {
-        #[allow(non_camel_case_types)] pub(crate) type udeptr = u64;
-        #[allow(non_camel_case_types)] pub(crate) type ideptr = i64;
-        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU64;
-
-    } else if #[cfg(equeue_udeptr_width="32")] {
-        #[allow(non_camel_case_types)] pub(crate) type udeptr = u32;
-        #[allow(non_camel_case_types)] pub(crate) type ideptr = i32;
-        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU32;
-    }
-}
-
-// Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
-cfg_if! {
-    if #[cfg(equeue_udeptr_width="128")] {
+        // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u64;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i64;
         pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU64;
 
-    } else if #[cfg(equeue_udeptr_width="64")] {
+        // Integer that fits a pointer generation count, should be 1/4 of a udeptr
+        #[allow(non_camel_case_types)] pub(crate) type ugen = u32;
+        #[allow(non_camel_case_types)] pub(crate) type igen = i32;
+
+    } else if #[cfg(any(
+        equeue_udeptr_width="64",
+        all(equeue_udeptr_width="native", target_pointer_width="64")
+    ))] {
+        // The atomic double-eptr unit used in equeue
+        #[allow(non_camel_case_types)] pub(crate) type udeptr = u64;
+        #[allow(non_camel_case_types)] pub(crate) type ideptr = i64;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU64;
+
+        // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u32;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i32;
         pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU32;
 
-    } else if #[cfg(equeue_udeptr_width="32")] {
-        #[allow(non_camel_case_types)] pub(crate) type ueptr = u16;
-        #[allow(non_camel_case_types)] pub(crate) type ieptr = i16;
-        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU16;
-    }
-}
-
-// Integer that fits a pointer generation count, should be 1/4 of a udeptr
-cfg_if! {
-    if #[cfg(equeue_udeptr_width="128")] {
-        #[allow(non_camel_case_types)] pub(crate) type ugen = u32;
-        #[allow(non_camel_case_types)] pub(crate) type igen = i32;
-
-    } else if #[cfg(equeue_udeptr_width="64")] {
+        // Integer that fits a pointer generation count, should be 1/4 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ugen = u16;
         #[allow(non_camel_case_types)] pub(crate) type igen = i16;
 
-    } else if #[cfg(equeue_udeptr_width="32")] {
+    } else if #[cfg(any(
+        equeue_udeptr_width="32",
+        all(equeue_udeptr_width="native", target_pointer_width="32")
+    ))] {
+        // The atomic double-eptr unit used in equeue
+        #[allow(non_camel_case_types)] pub(crate) type udeptr = u32;
+        #[allow(non_camel_case_types)] pub(crate) type ideptr = i32;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU32;
+
+        // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
+        #[allow(non_camel_case_types)] pub(crate) type ueptr = u16;
+        #[allow(non_camel_case_types)] pub(crate) type ieptr = i16;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU16;
+
+        // Integer that fits a pointer generation count, should be 1/4 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ugen = u8;
         #[allow(non_camel_case_types)] pub(crate) type igen = i8;
     }

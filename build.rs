@@ -1,15 +1,51 @@
 use std::env;
+use cfg_if::cfg_if;
 
 fn main() {
-    // EQUEUE_UTICK_WIDTH, default to u64
+    // override EQUEUE_UTICK_WIDTH
     println!("cargo:rerun-if-env-changed=EQUEUE_UTICK_WIDTH");
     let utick_width = env::var("EQUEUE_UTICK_WIDTH")
-        .unwrap_or("64".to_owned());
+        .unwrap_or_else(|_| {
+            cfg_if! {
+                if #[cfg(feature="utick-at-least-u128")] {
+                    "128".to_owned()
+                } else if #[cfg(feature="utick-at-least-u64")] {
+                    "64".to_owned()
+                } else if #[cfg(feature="utick-at-least-u32")] {
+                    "32".to_owned()
+                } else if #[cfg(feature="utick-at-least-u16")] {
+                    "16".to_owned()
+                } else if #[cfg(feature="utick-at-least-u8")] {
+                    "8".to_owned()
+                } else {
+                    // default to u32, this is fairly arbitrary, but
+                    // it's the cheap option on 32-bit MCUs
+                    "32".to_owned()
+                }
+            }
+        });
     println!("cargo:rustc-cfg=equeue_utick_width=\"{}\"", utick_width);
 
-    // EQUEUE_UDEPTR_WIDTH, default to u64
+    // override EQUEUE_UDEPTR_WIDTH
     println!("cargo:rerun-if-env-changed=EQUEUE_UDEPTR_WIDTH");
     let udeptr_width = env::var("EQUEUE_UDEPTR_WIDTH")
-        .unwrap_or("64".to_owned());
+        .unwrap_or_else(|_| {
+            cfg_if! {
+                if #[cfg(feature="udeptr-at-least-u128")] {
+                    "128".to_owned()
+                } else if #[cfg(feature="udeptr-at-least-u64")] {
+                    "64".to_owned()
+                } else if #[cfg(feature="udeptr-at-least-u32")] {
+                    // note we can't go lower than u32, we need to be able to
+                    // break the udeptr type into 3 parts
+                    "32".to_owned()
+                } else {
+                    // default to usize, udeptr and usize aren't necessarily
+                    // related, but we assume 32-bit systems don't need more
+                    // than 4*2^16 = 256 KiB of events
+                    "native".to_owned()
+                }
+            }
+        });
     println!("cargo:rustc-cfg=equeue_udeptr_width=\"{}\"", udeptr_width);
 }
