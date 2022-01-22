@@ -14,7 +14,15 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::mem::transmute;
 
-use async_io::block_on;
+#[cfg(feature="async-io")] use async_io::block_on;
+#[cfg(feature="async-std")] use async_std::task::block_on;
+
+#[cfg(feature="tokio")]
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(future)
+}
 
 
 #[test]
@@ -163,6 +171,7 @@ fn test_misc_break_busy() {
     println!("usage: {:#?}", q.usage());
 }
 
+#[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
 #[test]
 fn test_misc_async_dispatch() {
     let q = Equeue::with_size(1024*1024);
@@ -187,6 +196,7 @@ fn test_misc_async_dispatch() {
     println!("usage: {:#?}", q.usage());
 }
 
+#[cfg(any(feature="async-io", feature="async-std"))]
 #[test]
 fn test_misc_nested_async_dispatch() {
     let q1 = Equeue::with_size(1024*1024);

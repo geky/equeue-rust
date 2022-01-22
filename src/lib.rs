@@ -1,6 +1,5 @@
 
-// TODO enable
-//#![no_std]
+#![cfg_attr(not(feature="std"), no_std)]
 
 #![deny(missing_debug_implementations)]
 
@@ -625,7 +624,7 @@ pub struct Equeue<C=SysClock> {
     slab: &'static [u8],
     slab_front: Atomic<ueptr, AtomicUeptr>,
     slab_back: Atomic<ueptr, AtomicUeptr>,
-    alloced: bool,
+    #[cfg(feature="alloc")] alloced: bool,
 
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
@@ -649,7 +648,7 @@ pub struct Config<C=SysClock> {
 
 #[derive(Debug)]
 pub enum Buffer {
-    Alloc(usize),
+    #[cfg(feature="alloc")] Alloc(usize),
     Static(&'static mut [u8]),
 }
 
@@ -658,13 +657,13 @@ pub enum Buffer {
 #[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
 
 impl<C> Equeue<C> {
-
     pub fn with_config(config: Config<C>) -> Equeue<C> {
         // some sanity checks
         debug_assert!(align_of::<Ebuf>() >= align_of::<usize>());
         debug_assert_eq!(size_of::<Option<Delta>>(), size_of::<itick>());
 
         let (buffer, alloced) = match config.buffer {
+            #[cfg(feature="alloc")]
             Buffer::Alloc(size) => {
                 let size = aligndown(size, align_of::<Ebuf>());
                 let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
@@ -691,7 +690,7 @@ impl<C> Equeue<C> {
 
         Equeue {
             slab: buffer,
-            alloced: alloced,
+            #[cfg(feature="alloc")] alloced: alloced,
             // there's already a bit of finagling here to fit sizes in ueptrs,
             // slab_front is used for bytes, but should never exceed ~log2(width)
             // while slab_back is used for ebufs, which have a larger alignment
@@ -711,6 +710,7 @@ impl<C> Equeue<C> {
     }
 }
 
+#[cfg(feature="std")]
 impl Equeue {
     pub fn with_size(size: usize) -> Equeue {
         Equeue::with_config(Config {
@@ -755,6 +755,7 @@ impl<C> Drop for Equeue<C> {
         }
 
         // free allocated buffer?
+        #[cfg(feature="alloc")]
         if self.alloced {
             let layout = Layout::from_size_align(self.slab.len(), align_of::<Ebuf>()).unwrap();
             unsafe { dealloc(self.slab.as_ptr() as *mut u8, layout) };
@@ -782,7 +783,10 @@ impl<C> Equeue<C> {
     fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
         // this looks arbitrary, but Ebuf should have a pretty reasonable
         // alignment since it contains both function pointers and AtomicUdeptrs
-        assert!(layout.align() <= align_of::<Ebuf>());
+        assert!(layout.align() <= align_of::<Ebuf>(),
+            "unable to alloc alignment {} > {}",
+            layout.align(), align_of::<Ebuf>()
+        );
 
         // find best bucket
         let npw2 = npw2(
@@ -1753,11 +1757,11 @@ impl<'a, T, C> Event<'a, T, C> {
 }
 
 // event waker vtable callbacks
-unsafe fn event_waker_clone(e: *const ()) -> RawWaker {
-    RawWaker::new(e, &EVENT_WAKER_VTABLE)
+unsafe fn event_waker_clone<C: Clock+Sema>(e: *const ()) -> RawWaker {
+    RawWaker::new(e, &Equeue::<C>::EVENT_WAKER_VTABLE)
 }
 
-unsafe fn event_waker_wake(e: *const ()) {
+unsafe fn event_waker_wake<C: Clock+Sema>(e: *const ()) {
     // Fitting event ids into RawWaker is a bit frustrating
     //
     // Because of equeue's history, we already provide a unique id for each
@@ -1800,7 +1804,7 @@ unsafe fn event_waker_wake(e: *const ()) {
     }
 
     // pend
-    let q = e.q.as_ref().unwrap();
+    let q = (e.q as *const Equeue<C>).as_ref().unwrap();
     q.pend(Id::new(q, id, e));
 }
 
@@ -1808,12 +1812,14 @@ unsafe fn event_waker_drop(e: *const ()) {
     // do nothing
 }
 
-const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    event_waker_clone,
-    event_waker_wake,
-    event_waker_wake,
-    event_waker_drop,
-);
+impl<C: Clock+Sema> Equeue<C> {
+    const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        event_waker_clone::<C>,
+        event_waker_wake::<C>,
+        event_waker_wake::<C>,
+        event_waker_drop,
+    );
+}
 
 impl<C> Equeue<C> {
     pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
@@ -1862,13 +1868,13 @@ impl<C> Equeue<C> {
         Ok(Event::new(self, e, true))
     }
 
-    pub fn alloc_static<'a, T: PostStatic + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
+    pub fn alloc_static<'a, T: PostStatic<C> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
         e.q = self as *const Equeue<C> as *const Equeue;
 
         // cb/drop thunks
-        fn cb_thunk<T: PostStatic, C>(e: *mut u8) {
+        fn cb_thunk<T: PostStatic<C>, C>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
             T::post_static(e);
@@ -1885,20 +1891,22 @@ impl<C> Equeue<C> {
         e.info.store(e.info.load().set_static(true));
         Ok(Event::new(self, e, false))
     }
+}
 
+impl<C: Clock+Sema> Equeue<C> {
     pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
         e.q = self as *const Equeue<C> as *const Equeue;
 
-        fn cb_thunk<T: Future<Output=()>>(e: *mut u8) {
+        fn cb_thunk<T: Future<Output=()>, C: Clock+Sema>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             debug_assert!(e.info.load().static_());
             let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
 
             // setup waker
             let waker = unsafe {
-                Waker::from_raw(event_waker_clone(
+                Waker::from_raw(event_waker_clone::<C>(
                     e.deref() as *const T as *const ()
                 ))
             };
@@ -1920,7 +1928,7 @@ impl<C> Equeue<C> {
             unsafe { drop_in_place(e as *mut T) };
         }
 
-        e.cb = Some(cb_thunk::<T>);
+        e.cb = Some(cb_thunk::<T, C>);
         e.drop = Some(drop_thunk::<T>);
 
         // mark as static

@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+
 #[test]
 fn test_async() {
     let q = Equeue::with_size(1024*1024);
@@ -62,6 +63,7 @@ fn test_async_multiple() {
     println!("usage: {:#?}", q.usage());
 }
 
+#[cfg(feature="async-std")]
 #[test]
 fn test_async_multiple_async_std_sleep() {
     let q = Equeue::with_size(1024*1024);
