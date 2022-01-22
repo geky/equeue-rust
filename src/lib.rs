@@ -109,9 +109,15 @@ pub enum Dispatch {
 
 
 /// An Instant-like tick wrapper with better memory footprint
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(transparent)]
 struct Tick(utick);
+
+impl Debug for Tick {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}δ", self.uticks())
+    }
+}
 
 impl Tick {
     const fn new(t: utick) -> Tick {
@@ -190,17 +196,17 @@ pub struct Delta(NonZeroItick);
 
 impl Debug for Delta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Delta")
-            .field(&self.uticks())
-            .finish()
+        write!(f, "{}δ", self.uticks())
     }
 }
 
 impl Delta {
+    #[inline]
     pub const fn zero() -> Delta {
         Self(unsafe { NonZeroItick::new_unchecked(!0) })
     }
 
+    #[inline]
     pub const fn new(t: itick) -> Option<Delta> {
         if t >= 0 {
             Some(unsafe { Self::new_unchecked(t) })
@@ -209,14 +215,17 @@ impl Delta {
         }
     }
 
+    #[inline]
     pub const unsafe fn new_unchecked(t: itick) -> Delta {
         Self(NonZeroItick::new_unchecked(!t))
     }
 
+    #[inline]
     pub const fn iticks(self) -> itick {
         !self.0.get()
     }
 
+    #[inline]
     pub const fn uticks(self) -> utick {
         // completely safe since we know we have no negative values
         self.iticks() as utick
@@ -224,18 +233,21 @@ impl Delta {
 
     // we store some deltas as ticks to reuse memory, so we need this,
     // it's not worth the noise to create a union
+    #[inline]
     const fn as_tick(self) -> Tick {
         Tick::new(self.uticks())
     }
 }
 
 impl PartialOrd for Delta {
+    #[inline]
     fn partial_cmp(&self, other: &Delta) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Delta {
+    #[inline]
     fn cmp(&self, other: &Delta) -> cmp::Ordering {
         self.uticks().cmp(&other.uticks())
     }
@@ -243,6 +255,7 @@ impl Ord for Delta {
 
 impl TryIntoDelta for Delta {
     type Error = Infallible;
+    #[inline]
     fn try_into_delta(self, _: utick) -> Result<Delta, Self::Error> {
         Ok(self)
     }
@@ -250,6 +263,7 @@ impl TryIntoDelta for Delta {
 
 impl TryFromDelta for Delta {
     type Error = Infallible;
+    #[inline]
     fn try_from_delta(delta: Delta, _: utick) -> Result<Delta, Self::Error> {
         Ok(delta)
     }
