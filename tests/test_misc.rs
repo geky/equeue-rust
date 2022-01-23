@@ -220,6 +220,42 @@ fn test_misc_nested_async_dispatch() {
         q2.dispatch_async(Some(Duration::from_millis(100))).await;
     }).unwrap();
 
+    block_on(async {
+        q1.dispatch(Some(Duration::from_millis(50)));
+        for i in 0..10 {
+            assert_eq!(count.load(Ordering::SeqCst), i+1);
+            q1.dispatch(Some(Duration::from_millis(100)));
+        }
+        q1.dispatch(Some(Duration::from_millis(100)));
+    });
+
+    assert_eq!(count.load(Ordering::SeqCst), 10);
+    println!("usage: {:#?}", q1.usage());
+    println!("usage: {:#?}", q2.usage());
+}
+
+#[cfg(any(feature="async-io", feature="async-std"))]
+#[test]
+fn test_misc_mixed_async_dispatch() {
+    let q1 = Equeue::with_size(1024*1024);
+    let q2 = Equeue::with_size(1024*1024);
+
+    let count = AtomicU32::new(0);
+    for i in 0..10 {
+        q2.call_in(Duration::from_millis(i*100), || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+
+    q1.run(async {
+        q2.dispatch_async(Some(Duration::from_millis(50))).await;
+        for i in 0..10 {
+            assert_eq!(count.load(Ordering::SeqCst), i+1);
+            q2.dispatch_async(Some(Duration::from_millis(100))).await;
+        }
+        q2.dispatch_async(Some(Duration::from_millis(100))).await;
+    }).unwrap();
+
     q1.dispatch(Some(Duration::from_millis(50)));
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), i+1);

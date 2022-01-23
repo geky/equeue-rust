@@ -1,5 +1,4 @@
 
-// TODO feature gate this?
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::fence;
 use core::sync::atomic;
@@ -14,6 +13,7 @@ use core::task::Waker;
 use core::mem::transmute;
 use core::time::Duration;
 use core::convert::Infallible;
+use core::ops::Deref;
 
 use cfg_if::cfg_if;
 
@@ -23,14 +23,11 @@ use cfg_if::cfg_if;
 #[cfg(feature="std")] use std::sync::Mutex;
 #[cfg(feature="std")] use std::sync::MutexGuard;
 #[cfg(feature="std")] use std::sync::Condvar;
+#[cfg(feature="std")] use std::collections::HashMap;
 
 #[cfg(feature="async-io")] use async_io::Timer;
-
-#[cfg(feature="async-std")] use async_std::channel;
-#[cfg(feature="async-std")] use async_std::future::timeout;
-
-#[cfg(feature="tokio")] use tokio::sync::watch;
-#[cfg(feature="tokio")] use tokio::time::timeout;
+#[cfg(feature="async-std")] use async_std::task::sleep;
+#[cfg(feature="tokio")] use tokio::time::{sleep, Sleep};
 
 use crate::traits::*;
 use crate::Error;
@@ -218,12 +215,11 @@ cfg_if! {
         pub struct SysClock {
             instant: Instant,
 
-            mutex: Mutex<()>,
+            flag: Mutex<i32>,
             cond: Condvar,
 
-            #[cfg(feature="async-io")] waker: Mutex<Option<Waker>>,
-            #[cfg(feature="async-std")] channel: (channel::Sender<()>, channel::Receiver<()>),
-            #[cfg(feature="tokio")] watch: (watch::Sender<()>, watch::Receiver<()>),
+            #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
+            wakers: Mutex<HashMap<usize, Waker>>,
         }
 
         impl SysClock {
@@ -231,12 +227,11 @@ cfg_if! {
                 Self {
                     instant: Instant::now(),
 
-                    mutex: Mutex::new(()),
+                    flag: Mutex::new(0),
                     cond: Condvar::new(),
 
-                    #[cfg(feature="async-io")] waker: Mutex::new(None),
-                    #[cfg(feature="async-std")] channel: channel::bounded(1),
-                    #[cfg(feature="tokio")] watch: watch::channel(()),
+                    #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
+                    wakers: Mutex::new(HashMap::new()),
                 }
             }
         }
@@ -430,127 +425,135 @@ cfg_if! {
 
         impl Sema for SysClock {
             fn signal(&self) {
+                let mut flag = self.flag.lock().unwrap();
+                *flag = -*flag + 1;
+                drop(flag);
+
                 self.cond.notify_all();
 
-                #[cfg(feature="async-io")]
+                #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
                 {
-                    let waker = self.waker.lock().unwrap().take();
-                    if let Some(waker) = waker {
+                    for (_, waker) in self.wakers.lock().unwrap().drain() {
                         waker.wake();
                     }
                 }
-
-                #[cfg(feature="async-std")]
-                let _ = self.channel.0.try_send(());
-
-                #[cfg(feature="tokio")]
-                self.watch.0.send(()).unwrap();
             }
 
             fn wait(&self, delta: Option<Delta>) {
-                let guard = self.mutex.lock().unwrap();
+                // already signaled?
+                let mut flag = self.flag.lock().unwrap();
+                if *flag > 0 {
+                    *flag -= 1;
+                    return;
+                }
+
+                // otherwise we still decrement to indicate how many threads are
+                // waiting, this may lead to spurious wakeups but avoids not waking
+                // up all threads
+                *flag -= 1;
+
                 if let Some(delta) = delta {
                     let _ = self.cond
-                        .wait_timeout(guard, Duration::from_millis(delta.ticks() as u64))
+                        .wait_timeout(flag, Duration::from_millis(delta.ticks() as u64))
                         .unwrap();
                 } else {
                     let _ = self.cond
-                        .wait(guard)
+                        .wait(flag)
                         .unwrap();
                 }
             }
         }
 
+        #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
+        #[derive(Debug)]
+        pub struct SysClockAsyncWait<'a, T> {
+            sema: &'a SysClock,
+            timer: Option<T>,
+        }
+
+        #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
+        impl<T: Future<Output=R> + Send, R> Future for SysClockAsyncWait<'_, T> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                // already signaled?
+                let mut flag = self.sema.flag.lock().unwrap();
+                if *flag > 0 {
+                    *flag -= 1;
+                    return Poll::Ready(());
+                }
+
+                // otherwise we still decrement to indicate how many threads are
+                // waiting, this may lead to spurious wakeups but avoids not waking
+                // up all threads
+                *flag -= 1;
+
+                // save waker for signaling
+                self.sema.wakers.lock().unwrap().insert(
+                    self.deref() as *const _ as usize, 
+                    cx.waker().clone()
+                );
+
+                if let Some(ref mut timer) = unsafe { &mut self.get_unchecked_mut().timer } {
+                    // wait on timer
+                    unsafe { Pin::new_unchecked(timer) }
+                        .poll(cx)
+                        .map(|_| ())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        #[cfg(any(feature="async-io", feature="async-std", feature="tokio"))]
+        impl<T> Drop for SysClockAsyncWait<'_, T> {
+            fn drop(&mut self) {
+                // make sure our waker is cleared
+                self.sema.wakers.lock().unwrap()
+                    .remove(&(self as *const _ as usize));
+            }
+        }
+
         cfg_if! {
             if #[cfg(feature="async-io")] {
-                #[derive(Debug)]
-                pub struct SysClockAsyncWait<'a> {
-                    sema: &'a SysClock,
-                    timer: Option<Timer>,
-                }
-
-                impl Future for SysClockAsyncWait<'_> {
-                    type Output = ();
-
-                    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                        // we're ok with spurious wakeups, so we can return as soon as we get
-                        // any wakeup, though this does mean we need to poll at least once
-                        let mut waker = self.sema.waker.lock().unwrap();
-                        if waker.is_some() {
-                            *waker = None;
-                            drop(waker);
-
-                            Poll::Ready(())
-                        } else {
-                            // save waker for signalling
-                            *waker = Some(cx.waker().clone());
-                            drop(waker);
-
-                            if let Some(ref mut timer) = self.timer {
-                                // wait on timer
-                                unsafe { Pin::new_unchecked(timer) }
-                                    .poll(cx)
-                                    .map(|_| ())
-                            } else {
-                                Poll::Pending
-                            }
-                        }
-                    }
-                }
-
-                impl Drop for SysClockAsyncWait<'_> {
-                    fn drop(&mut self) {
-                        // make sure waker is cleared
-                        *self.sema.waker.lock().unwrap() = None;
-                    }
-                }
-
                 impl AsyncSema for SysClock {
                     // unfortunately we can't define types with lifetimes
                     // in traits, the best we can do is unsafely strip the
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
-                    type AsyncWait = SysClockAsyncWait<'static>;
+                    type AsyncWait = SysClockAsyncWait<'static, Timer>;
 
                     fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
-                        // only allow one async wait at a time
-                        debug_assert!(self.waker.lock().unwrap().is_none());
-
                         let wait = SysClockAsyncWait {
                             sema: self,
-                            timer: delta.map(|delta| Timer::after(Duration::from_millis(delta.ticks() as u64))),
+                            timer: delta.map(|delta|
+                                Timer::after(Duration::from_millis(delta.ticks() as u64))
+                            ),
                         };
 
                         // strip lifetime
-                        unsafe { transmute::<SysClockAsyncWait<'_>, _>(wait) }
+                        unsafe { transmute::<SysClockAsyncWait<'_, Timer>, _>(wait) }
                     }
                 }
-
             } else if #[cfg(feature="async-std")] {
                 impl AsyncSema for SysClock {
                     // unfortunately we can't define types with lifetimes
                     // in traits, the best we can do is unsafely strip the
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
-                    type AsyncWait = Pin<Box<dyn Future<Output=()> + Send>>;
+                    type AsyncWait = SysClockAsyncWait<'static, Pin<Box<dyn Future<Output=()> + Send>>>;
 
                     fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
-                        let self_ = unsafe { transmute::<_, &'static SysClock>(self) };
-                        match delta {
-                            Some(delta) => {
-                                Box::pin(async move {
-                                    let _ = timeout(
-                                        Duration::from_millis(delta.ticks() as u64),
-                                        self_.channel.1.recv()
-                                    ).await;
-                                })
-                            }
-                            None => {
-                                Box::pin(async move {
-                                    let _ = self_.channel.1.recv().await;
-                                })
-                            }
-                        }
+                        let wait = SysClockAsyncWait {
+                            sema: self,
+                            timer: delta.map(|delta|
+                                Box::pin(sleep(Duration::from_millis(delta.ticks() as u64)))
+                                    as Pin<Box<dyn Future<Output=()> + Send>>
+                            ),
+                        };
+
+                        // strip lifetime
+                        unsafe { transmute::<SysClockAsyncWait<'_, Pin<Box<dyn Future<Output=()> + Send>>>, _>(wait) }
                     }
                 }
             } else if #[cfg(feature="tokio")] {
@@ -559,26 +562,18 @@ cfg_if! {
                     // in traits, the best we can do is unsafely strip the
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
-                    type AsyncWait = Pin<Box<dyn Future<Output=()> + Send>>;
+                    type AsyncWait = SysClockAsyncWait<'static, Sleep>;
 
                     fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
-                        let self_ = unsafe { transmute::<_, &'static SysClock>(self) };
-                        let mut receiver = self_.watch.1.clone();
-                        match delta {
-                            Some(delta) => {
-                                Box::pin(async move {
-                                    let _ = timeout(
-                                        Duration::from_millis(delta.ticks() as u64),
-                                        receiver.changed()
-                                    ).await;
-                                })
-                            }
-                            None => {
-                                Box::pin(async move {
-                                    let _ = receiver.changed().await;
-                                })
-                            }
-                        }
+                        let wait = SysClockAsyncWait {
+                            sema: self,
+                            timer: delta.map(|delta|
+                                sleep(Duration::from_millis(delta.ticks() as u64))
+                            ),
+                        };
+
+                        // strip lifetime
+                        unsafe { transmute::<SysClockAsyncWait<'_, Sleep>, _>(wait) }
                     }
                 }
             }
