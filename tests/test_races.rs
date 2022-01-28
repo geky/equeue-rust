@@ -110,11 +110,11 @@ fn test_race_post() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(0)));
+            q.dispatch_for(Duration::from_millis(0));
         })
     };
 
@@ -161,11 +161,11 @@ fn test_race_post_order() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(0)));
+            q.dispatch_for(Duration::from_millis(0));
         })
     };
 
@@ -219,11 +219,11 @@ fn test_race_delay() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(1100)));
+            q.dispatch_for(Duration::from_millis(1100));
         })
     };
 
@@ -294,7 +294,7 @@ fn test_race_cancel() {
         thread.join().unwrap();
     }
 
-    q.dispatch(Some(Duration::from_millis(1100)));
+    q.dispatch_for(Duration::from_millis(1100));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     println!("usage: {:#?}", q.usage());
 }
@@ -326,7 +326,7 @@ fn test_race_cancel_enqueue() {
         thread.join().unwrap();
     }
 
-    q.dispatch(Some(Duration::from_millis(1100)));
+    q.dispatch_for(Duration::from_millis(1100));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     println!("usage: {:#?}", q.usage());
 }
@@ -343,11 +343,11 @@ fn test_race_cancel_dispatch() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(1100)));
+            q.dispatch_for(Duration::from_millis(1100));
         })
     };
 
@@ -393,11 +393,11 @@ fn test_race_cancel_periodic() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(0)));
+            q.dispatch_for(Duration::from_millis(0));
         })
     };
 
@@ -456,11 +456,11 @@ fn test_race_repost() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(0)));
+            q.dispatch_for(Duration::from_millis(0));
         })
     };
 
@@ -507,11 +507,11 @@ fn test_race_dispatch_multiple() {
         let done = done.clone();
         dispatch_threads.push(thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch_for(Duration::from_millis(0));
             }
 
             // make sure we catch any lingering events
-            q.dispatch(Some(Duration::from_millis(0)));
+            q.dispatch_for(Duration::from_millis(0));
         }));
     }
 

@@ -484,7 +484,7 @@ cfg_if! {
             }
         }
 
-        impl Sema for SysClock {
+        impl Signal for SysClock {
             fn signal(&self) {
                 let mut flag = self.flag.lock().unwrap();
                 let threads = max(-*flag, 0);
@@ -500,8 +500,10 @@ cfg_if! {
                     }
                 }
             }
+        }
 
-            fn wait(&self, delta: Option<Delta>) {
+        impl Sema for SysClock {
+            fn wait(&self) {
                 // already signaled?
                 let mut flag = self.flag.lock().unwrap();
                 if *flag > 0 {
@@ -514,18 +516,30 @@ cfg_if! {
                 // up all threads
                 *flag -= 1;
 
-                if let Some(delta) = delta {
-                    let _ = self.cond
-                        .wait_timeout(flag,
-                            Duration::try_from_delta(delta, self.frequency())
-                                .unwrap_or(Duration::MAX)
-                        )
-                        .unwrap();
-                } else {
-                    let _ = self.cond
-                        .wait(flag)
-                        .unwrap();
+                let _ = self.cond
+                    .wait(flag)
+                    .unwrap();
+            }
+
+            fn wait_timeout(&self, delta: Delta) {
+                // already signaled?
+                let mut flag = self.flag.lock().unwrap();
+                if *flag > 0 {
+                    *flag -= 1;
+                    return;
                 }
+
+                // otherwise we still decrement to indicate how many threads are
+                // waiting, this may lead to spurious wakeups but avoids not waking
+                // up all threads
+                *flag -= 1;
+
+                let _ = self.cond
+                    .wait_timeout(flag,
+                        Duration::try_from_delta(delta, self.frequency())
+                            .unwrap_or(Duration::MAX)
+                    )
+                    .unwrap();
             }
         }
 
@@ -587,11 +601,22 @@ cfg_if! {
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
                     type AsyncWait = SysClockAsyncWait<'static, Timer>;
+                    type AsyncWaitTimeout = SysClockAsyncWait<'static, Timer>;
 
-                    fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
+                    fn wait_async(&self) -> Self::AsyncWait {
                         let wait = SysClockAsyncWait {
                             sema: self,
-                            timer: delta.map(|delta|
+                            timer: None,
+                        };
+
+                        // strip lifetime
+                        unsafe { transmute::<SysClockAsyncWait<'_, Timer>, _>(wait) }
+                    }
+
+                    fn wait_timeout_async(&self, delta: Delta) -> Self::AsyncWaitTimeout {
+                        let wait = SysClockAsyncWait {
+                            sema: self,
+                            timer: Some(
                                 Timer::after(
                                     Duration::try_from_delta(delta, self.frequency())
                                         .unwrap_or(Duration::MAX)
@@ -610,11 +635,22 @@ cfg_if! {
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
                     type AsyncWait = SysClockAsyncWait<'static, Pin<Box<dyn Future<Output=()> + Send>>>;
+                    type AsyncWaitTimeout = SysClockAsyncWait<'static, Pin<Box<dyn Future<Output=()> + Send>>>;
 
-                    fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
+                    fn wait_async(&self) -> Self::AsyncWait {
                         let wait = SysClockAsyncWait {
                             sema: self,
-                            timer: delta.map(|delta|
+                            timer: None,
+                        };
+
+                        // strip lifetime
+                        unsafe { transmute::<SysClockAsyncWait<'_, Pin<Box<dyn Future<Output=()> + Send>>>, _>(wait) }
+                    }
+
+                    fn wait_timeout_async(&self, delta: Delta) -> Self::AsyncWaitTimeout {
+                        let wait = SysClockAsyncWait {
+                            sema: self,
+                            timer: Some(
                                 Box::pin(sleep(
                                     Duration::try_from_delta(delta, self.frequency())
                                         .unwrap_or(Duration::MAX)
@@ -634,11 +670,22 @@ cfg_if! {
                     // lifetime and leave it up to the caller to drop the
                     // types in the correct order
                     type AsyncWait = SysClockAsyncWait<'static, Sleep>;
+                    type AsyncWaitTimeout = SysClockAsyncWait<'static, Sleep>;
 
-                    fn wait_async(&self, delta: Option<Delta>) -> Self::AsyncWait {
+                    fn wait_async(&self) -> Self::AsyncWait {
                         let wait = SysClockAsyncWait {
                             sema: self,
-                            timer: delta.map(|delta|
+                            timer: None,
+                        };
+
+                        // strip lifetime
+                        unsafe { transmute::<SysClockAsyncWait<'_, Sleep>, _>(wait) }
+                    }
+
+                    fn wait_timeout_async(&self, delta: Delta) -> Self::AsyncWaitTimeout {
+                        let wait = SysClockAsyncWait {
+                            sema: self,
+                            timer: Some(
                                 sleep(
                                     Duration::try_from_delta(delta, self.frequency())
                                         .unwrap_or(Duration::MAX)

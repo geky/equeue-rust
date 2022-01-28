@@ -4,6 +4,7 @@ use equeue::Delta;
 use equeue::Dispatch;
 use equeue::Config;
 use equeue::Clock;
+use equeue::Signal;
 use equeue::Sema;
 use equeue::sys::SysClock;
 use equeue::sys::utick;
@@ -39,7 +40,7 @@ fn test_misc_buffer() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch(Some(Duration::from_millis(0)));
+    q.dispatch_for(Duration::from_millis(0));
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -61,7 +62,7 @@ fn test_misc_config() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch(Some(Duration::from_millis(0)));
+    q.dispatch_for(Duration::from_millis(0));
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -83,9 +84,16 @@ fn test_misc_custom_clock() {
         }
     }
 
-    impl Sema for MyClock {
+    impl Signal for MyClock {
         fn signal(&self) {}
-        fn wait(&self, _: Option<Delta>) {
+    }
+
+    impl Sema for MyClock {
+        fn wait(&self) {
+            unreachable!();
+        }
+
+        fn wait_timeout(&self, _: Delta) {
             unreachable!();
         }
     }
@@ -103,7 +111,7 @@ fn test_misc_custom_clock() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch(Some(Delta::zero()));
+    q.dispatch_for(Delta::zero());
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -129,19 +137,19 @@ fn test_misc_break() {
     }).unwrap();
 
     assert_eq!(
-        q.dispatch(None::<Delta>),
+        q.dispatch_forever(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 30);
 
     assert_eq!(
-        q.dispatch(None::<Delta>),
+        q.dispatch_forever(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 50);
 
     assert_eq!(
-        q.dispatch(Some(Duration::from_millis(1100))),
+        q.dispatch_for(Duration::from_millis(1100)),
         Dispatch::Timeout,
     );
     assert_eq!(count.load(Ordering::SeqCst), 100);
@@ -166,7 +174,7 @@ fn test_misc_break_busy() {
     q.break_();
 
     assert_eq!(
-        q.dispatch(None::<Delta>),
+        q.dispatch_forever(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 10);
@@ -186,12 +194,12 @@ fn test_misc_async_dispatch() {
     }
 
     block_on(async {
-        q.dispatch_async(Some(Duration::from_millis(50))).await;
+        q.dispatch_for_async(Duration::from_millis(50)).await;
         for i in 0..10 {
             assert_eq!(count.load(Ordering::SeqCst), i+1);
-            q.dispatch_async(Some(Duration::from_millis(100))).await;
+            q.dispatch_for_async(Duration::from_millis(100)).await;
         }
-        q.dispatch_async(Some(Duration::from_millis(100))).await;
+        q.dispatch_for_async(Duration::from_millis(100)).await;
     });
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
@@ -212,21 +220,21 @@ fn test_misc_nested_async_dispatch() {
     }
 
     q1.run(async {
-        q2.dispatch_async(Some(Duration::from_millis(50))).await;
+        q2.dispatch_for_async(Duration::from_millis(50)).await;
         for i in 0..10 {
             assert_eq!(count.load(Ordering::SeqCst), i+1);
-            q2.dispatch_async(Some(Duration::from_millis(100))).await;
+            q2.dispatch_for_async(Duration::from_millis(100)).await;
         }
-        q2.dispatch_async(Some(Duration::from_millis(100))).await;
+        q2.dispatch_for_async(Duration::from_millis(100)).await;
     }).unwrap();
 
     block_on(async {
-        q1.dispatch(Some(Duration::from_millis(50)));
+        q1.dispatch_for(Duration::from_millis(50));
         for i in 0..10 {
             assert_eq!(count.load(Ordering::SeqCst), i+1);
-            q1.dispatch(Some(Duration::from_millis(100)));
+            q1.dispatch_for(Duration::from_millis(100));
         }
-        q1.dispatch(Some(Duration::from_millis(100)));
+        q1.dispatch_for(Duration::from_millis(100));
     });
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
@@ -248,20 +256,20 @@ fn test_misc_mixed_async_dispatch() {
     }
 
     q1.run(async {
-        q2.dispatch_async(Some(Duration::from_millis(50))).await;
+        q2.dispatch_for_async(Duration::from_millis(50)).await;
         for i in 0..10 {
             assert_eq!(count.load(Ordering::SeqCst), i+1);
-            q2.dispatch_async(Some(Duration::from_millis(100))).await;
+            q2.dispatch_for_async(Duration::from_millis(100)).await;
         }
-        q2.dispatch_async(Some(Duration::from_millis(100))).await;
+        q2.dispatch_for_async(Duration::from_millis(100)).await;
     }).unwrap();
 
-    q1.dispatch(Some(Duration::from_millis(50)));
+    q1.dispatch_for(Duration::from_millis(50));
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), i+1);
-        q1.dispatch(Some(Duration::from_millis(100)));
+        q1.dispatch_for(Duration::from_millis(100));
     }
-    q1.dispatch(Some(Duration::from_millis(100)));
+    q1.dispatch_for(Duration::from_millis(100));
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
     println!("usage: {:#?}", q1.usage());
@@ -294,21 +302,21 @@ fn test_misc_handles() {
     }
 
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    q.dispatch(Some(Duration::from_millis(0)));
+    q.dispatch_for(Duration::from_millis(0));
     assert_eq!(count.load(Ordering::SeqCst), 50);
 
     // no drop another half
     handles.truncate(50);
 
     assert_eq!(count.load(Ordering::SeqCst), 50);
-    q.dispatch(Some(Duration::from_millis(0)));
+    q.dispatch_for(Duration::from_millis(0));
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     // and release the rest
     drop(handles);
 
     assert_eq!(count.load(Ordering::SeqCst), 75);
-    q.dispatch(Some(Duration::from_millis(0)));
+    q.dispatch_for(Duration::from_millis(0));
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     println!("usage: {:#?}", q.usage());
@@ -326,12 +334,12 @@ fn test_embedded_time() {
         }).unwrap();
     }
 
-    q.dispatch(Some(50u32.milliseconds()));
+    q.dispatch_for(50u32.milliseconds());
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), i+1);
-        q.dispatch(Some(100u32.milliseconds()));
+        q.dispatch_for(100u32.milliseconds());
     }
-    q.dispatch(Some(100u32.milliseconds()));
+    q.dispatch_for(100u32.milliseconds());
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
     println!("usage: {:#?}", q.usage());

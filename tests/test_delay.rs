@@ -18,12 +18,12 @@ fn test_delay() {
         }).unwrap();
     }
 
-    q.dispatch(Some(Duration::from_millis(50)));
+    q.dispatch_for(Duration::from_millis(50));
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), i+1);
-        q.dispatch(Some(Duration::from_millis(100)));
+        q.dispatch_for(Duration::from_millis(100));
     }
-    q.dispatch(Some(Duration::from_millis(100)));
+    q.dispatch_for(Duration::from_millis(100));
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
     println!("usage: {:#?}", q.usage());
@@ -42,12 +42,12 @@ fn test_delay_many() {
         }
     }
 
-    q.dispatch(Some(Duration::from_millis(50)));
+    q.dispatch_for(Duration::from_millis(50));
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
-        q.dispatch(Some(Duration::from_millis(100)));
+        q.dispatch_for(Duration::from_millis(100));
     }
-    q.dispatch(Some(Duration::from_millis(100)));
+    q.dispatch_for(Duration::from_millis(100));
 
     assert_eq!(count.load(Ordering::SeqCst), 10*100);
     println!("usage: {:#?}", q.usage());
@@ -66,12 +66,12 @@ fn test_delay_interspersed() {
         }
     }
 
-    q.dispatch(Some(Duration::from_millis(50)));
+    q.dispatch_for(Duration::from_millis(50));
     for i in 0..10 {
         assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
-        q.dispatch(Some(Duration::from_millis(100)));
+        q.dispatch_for(Duration::from_millis(100));
     }
-    q.dispatch(Some(Duration::from_millis(100)));
+    q.dispatch_for(Duration::from_millis(100));
 
     assert_eq!(count.load(Ordering::SeqCst), 10*100);
     println!("usage: {:#?}", q.usage());
@@ -90,7 +90,7 @@ fn test_delay_order() {
             }).unwrap();
         }
     }
-    q.dispatch(Some(Duration::from_millis(1100)));
+    q.dispatch_for(Duration::from_millis(1100));
 
     assert_eq!(
         count.lock().unwrap().deref(),
@@ -112,7 +112,7 @@ fn test_delay_reversed() {
             }).unwrap();
         }
     }
-    q.dispatch(Some(Duration::from_millis(1100)));
+    q.dispatch_for(Duration::from_millis(1100));
 
     assert_eq!(
         count.lock().unwrap().deref(),
@@ -135,10 +135,10 @@ fn test_periodic() {
             .post();
     }
 
-    q.dispatch(Some(Duration::from_millis(50)));
+    q.dispatch_for(Duration::from_millis(50));
     for i in 0..30 {
         assert_eq!(count.load(Ordering::SeqCst), i+1);
-        q.dispatch(Some(Duration::from_millis(100)));
+        q.dispatch_for(Duration::from_millis(100));
     }
 
     println!("usage: {:#?}", q.usage());

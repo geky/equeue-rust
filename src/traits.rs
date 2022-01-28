@@ -65,15 +65,24 @@ pub trait Lock: Send + Sync + Debug {
     fn lock(&self) -> Self::Guard;
 }
 
-/// Binary semaphore, aka a waiting/signalling primitive
-pub trait Sema: Send + Sync + Debug {
+/// Common signal trait for semaphores, this is separate since we
+/// need a single signal function for both Sema and AsyncSema
+pub trait Signal: Send + Sync + Debug {
     fn signal(&self);
-    fn wait(&self, ticks: Option<Delta>);
+}
+
+/// Binary semaphore, aka a waiting/signalling primitive
+pub trait Sema: Signal + Send + Sync + Debug {
+    fn wait(&self);
+    fn wait_timeout(&self, ticks: Delta);
 }
 
 /// An asynchronous binary semaphore, for waiting asynchronously
-pub trait AsyncSema: Sema + Send + Sync + Debug {
+pub trait AsyncSema: Signal + Send + Sync + Debug {
     type AsyncWait: Future<Output=()>;
-    fn wait_async(&self, ticks: Option<Delta>) -> Self::AsyncWait;
+    type AsyncWaitTimeout: Future<Output=()>;
+
+    fn wait_async(&self) -> Self::AsyncWait;
+    fn wait_timeout_async(&self, ticks: Delta) -> Self::AsyncWaitTimeout;
 }
 

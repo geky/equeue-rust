@@ -1377,7 +1377,7 @@ impl<C> Equeue<C> {
     }
 }
 
-impl<C: Clock+Sema> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     // Central post function
     fn post_(&self, e: &mut Ebuf, delta: Delta) {
         // calculate target
@@ -1513,74 +1513,83 @@ impl<C: Clock> Equeue<C> {
                     .expect("equeue: delta overflow")
             )
     }
+
+    // Dispatch ready events
+    pub fn dispatch(&self) {
+        // get the current time
+        let now = self.now();
+
+        // get a slice to dispatch
+        for e in self.dequeue_(now) {
+            // load id here so we can tell if it changes (which happens if the
+            // event is reclaimed in dispatch)
+            let id = e.info.load().id();
+
+            // dispatch!
+            (e.cb.unwrap())(e.data_mut_ptr());
+
+            let info = e.info.load();
+            let e = if id != info.id() {
+                // deallocated while dispatching?
+                None
+            } else if let Some(period) = e.period {
+                // if periodic, reenqueue, unless we get canceled
+                let now = self.now();
+                self.enqueue_(e, now, now.imprecise_add(
+                    period,
+                    self.precision
+                )).err()
+            } else if info.static_() {
+                // if static, try to mark as no-longer pending, but
+                // note we could be canceled or recursively pended
+                let (reenqueue, e) = {
+                    let guard = self.lock.lock();
+                    let info = e.info.load();
+                    match info.pending() {
+                        Pending::InFlight => {
+                            e.info.store(info.set_pending(Pending::Alloced));
+                            (None, None)
+                        }
+                        Pending::Nested => {
+                            (Some(e), None)
+                        }
+                        Pending::Canceled => {
+                            (None, Some(e))
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+
+                // TODO restructure this?
+                if let Some(e) = reenqueue {
+                    let now = self.now();
+                    self.enqueue_(e, now, now).err()
+                } else {
+                    e
+                }
+            } else {
+                Some(e)
+            };
+
+            // release memory?
+            if let Some(e) = e { 
+                // call drop, return event to memory pool
+                self.dealloc_(e);
+            }
+        }
+    }
 }
 
 impl<C: Clock+Sema> Equeue<C> {
     // Central dispatch function
-    fn dispatch_(&self, delta: Option<Delta>) -> Dispatch {
-        // get the current time
+    fn dispatch_for_(&self, delta: Option<Delta>) -> Dispatch {
+        // calculate the timeout
         let mut now = self.now();
         let timeout = delta.map(|delta| now + delta);
 
         loop {
-            // get a slice to dispatch
-            for e in self.dequeue_(now) {
-                // load id here so we can tell if it changes (which happens if the
-                // event is reclaimed in dispatch)
-                let id = e.info.load().id();
-
-                // dispatch!
-                (e.cb.unwrap())(e.data_mut_ptr());
-
-                let info = e.info.load();
-                let e = if id != info.id() {
-                    // deallocated while dispatching?
-                    None
-                } else if let Some(period) = e.period {
-                    // if periodic, reenqueue, unless we get canceled
-                    let now = self.now();
-                    self.enqueue_(e, now, now.imprecise_add(
-                        period,
-                        self.precision
-                    )).err()
-                } else if info.static_() {
-                    // if static, try to mark as no-longer pending, but
-                    // note we could be canceled or recursively pended
-                    let (reenqueue, e) = {
-                        let guard = self.lock.lock();
-                        let info = e.info.load();
-                        match info.pending() {
-                            Pending::InFlight => {
-                                e.info.store(info.set_pending(Pending::Alloced));
-                                (None, None)
-                            }
-                            Pending::Nested => {
-                                (Some(e), None)
-                            }
-                            Pending::Canceled => {
-                                (None, Some(e))
-                            }
-                            _ => unreachable!(),
-                        }
-                    };
-
-                    // TODO restructure this?
-                    if let Some(e) = reenqueue {
-                        let now = self.now();
-                        self.enqueue_(e, now, now).err()
-                    } else {
-                        e
-                    }
-                } else {
-                    Some(e)
-                };
-
-                // release memory?
-                if let Some(e) = e { 
-                    // call drop, return event to memory pool
-                    self.dealloc_(e);
-                }
-            }
+            // dispatch events
+            self.dispatch();
 
             // was break requested?
             if self.break_.load() {
@@ -1614,21 +1623,28 @@ impl<C: Clock+Sema> Equeue<C> {
                 .into_iter().chain(timeout_left)
                 .min();
 
-            self.clock.wait(delta);
-
-            now = self.now();
+            match delta {
+                Some(delta) => self.clock.wait_timeout(delta),
+                None => self.clock.wait(),
+            }
         }
     }
 
-    pub fn dispatch<Δ: TryIntoDelta>(&self, delta: Option<Δ>) -> Dispatch {
-        self.dispatch_(
-            delta.map(|delta|
-                delta.try_into_delta(self.clock.frequency()).ok()
-                    .expect("equeue: delta overflow")
-            )
-        )
+    #[inline]
+    pub fn dispatch_for<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
+        self.dispatch_for_(Some(
+            delta.try_into_delta(self.clock.frequency()).ok()
+                .expect("equeue: delta overflow")
+        ))
     }
 
+    #[inline]
+    pub fn dispatch_forever(&self) -> Dispatch {
+        self.dispatch_for_(None)
+    }
+}
+
+impl<C: Signal> Equeue<C> {
     // request dispatch to exit once done dispatching events
     pub fn break_(&self) {
         {   let guard = self.lock.lock();
@@ -1639,7 +1655,7 @@ impl<C: Clock+Sema> Equeue<C> {
     }
 }
 
-impl<C: Clock+Sema> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
         match self.alloc_(layout) {
@@ -1775,7 +1791,7 @@ impl<'a, C: Clock> Handle<'a, C> {
     }
 }
 
-impl<'a, C: Clock+Sema> Handle<'a, C> {
+impl<'a, C: Clock+Signal> Handle<'a, C> {
     pub fn pend(&self) -> bool {
         self.q.pend(self.id)
     }
@@ -1819,11 +1835,11 @@ impl<'a, T, C> Event<'a, T, C> {
 }
 
 // event waker vtable callbacks
-unsafe fn event_waker_clone<C: Clock+Sema>(e: *const ()) -> RawWaker {
+unsafe fn event_waker_clone<C: Clock+Signal>(e: *const ()) -> RawWaker {
     RawWaker::new(e, &Equeue::<C>::EVENT_WAKER_VTABLE)
 }
 
-unsafe fn event_waker_wake<C: Clock+Sema>(e: *const ()) {
+unsafe fn event_waker_wake<C: Clock+Signal>(e: *const ()) {
     // Fitting event ids into RawWaker is a bit frustrating
     //
     // Because of equeue's history, we already provide a unique id for each
@@ -1874,7 +1890,7 @@ unsafe fn event_waker_drop(e: *const ()) {
     // do nothing
 }
 
-impl<C: Clock+Sema> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     const EVENT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         event_waker_clone::<C>,
         event_waker_wake::<C>,
@@ -1883,7 +1899,7 @@ impl<C: Clock+Sema> Equeue<C> {
     );
 }
 
-impl<C> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
@@ -1953,15 +1969,13 @@ impl<C> Equeue<C> {
         e.info.store(e.info.load().set_static(true));
         Ok(Event::new(self, e, false))
     }
-}
 
-impl<C: Clock+Sema> Equeue<C> {
     pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
         e.q = self as *const Equeue<C> as *const Equeue;
 
-        fn cb_thunk<T: Future<Output=()>, C: Clock+Sema>(e: *mut u8) {
+        fn cb_thunk<T: Future<Output=()>, C: Clock+Signal>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             debug_assert!(e.info.load().static_());
             let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
@@ -1999,7 +2013,7 @@ impl<C: Clock+Sema> Equeue<C> {
     }
 }
 
-impl<'a, T, C: Clock> Event<'a, T, C> {
+impl<'a, T, C: Clock+Signal> Event<'a, T, C> {
     pub fn delay<Δ: TryIntoDelta>(mut self, delay: Δ) -> Self {
         self.e.target = delay.try_into_delta(self.q.clock.frequency()).ok()
             .expect("equeue: delta overflow")
@@ -2016,9 +2030,7 @@ impl<'a, T, C: Clock> Event<'a, T, C> {
         );
         self
     }
-}
 
-impl <'a, T, C> Event<'a, T, C> {
     pub fn static_(self, static_: bool) -> Self {
         // can't make PostOnce events static
         assert!(!self.once);
@@ -2040,9 +2052,7 @@ impl <'a, T, C> Event<'a, T, C> {
     pub fn into_handle(self) -> Handle<'a, C> {
         Handle::new(self.q, self.into_id())
     }
-}
 
-impl<'a, T, C: Clock+Sema> Event<'a, T, C> {
     pub fn post(self) -> Id {
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
@@ -2091,7 +2101,7 @@ impl<T, C> AsMut<T> for Event<'_, T, C> {
 
 
 // convenience functions
-impl<C: Clock+Sema> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     pub fn call<F: PostOnce + Send>(
         &self,
         cb: F
@@ -2215,7 +2225,7 @@ struct AsyncSleep<'a, C=SysClock> {
     id: Id,
 }
 
-impl<C: Clock+Sema> Future for AsyncSleep<'_, C> {
+impl<C: Clock+Signal> Future for AsyncSleep<'_, C> {
     type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2263,7 +2273,7 @@ struct AsyncTimeout<'a, F, C=SysClock> {
     id: Id,
 }
 
-impl<F: Future, C: Clock+Sema> Future for AsyncTimeout<'_, F, C> {
+impl<F: Future, C: Clock+Signal> Future for AsyncTimeout<'_, F, C> {
     type Output = Result<F::Output, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2313,7 +2323,7 @@ impl<C> Equeue<C> {
     }
 }
 
-impl<C: Clock+Sema> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     pub async fn sleep<Δ: TryIntoDelta>(&self, delta: Δ) -> Result<(), Error> {
         let delta = delta.try_into_delta(self.clock.frequency()).ok()
             .expect("equeue: delta overflow");
@@ -2341,7 +2351,7 @@ impl<C: Clock+Sema> Equeue<C> {
 }
 
 impl<C: Clock+AsyncSema> Equeue<C> {
-    async fn dispatch_async_(&self, delta: Option<Delta>) -> Dispatch {
+    async fn dispatch_for_async_(&self, delta: Option<Delta>) -> Dispatch {
         // note that some of this is ungracefull copy-pasted from non-async dispatch
 
         // get the current time
@@ -2349,12 +2359,18 @@ impl<C: Clock+AsyncSema> Equeue<C> {
         let timeout = delta.map(|delta| now + delta);
 
         loop {
-            // Note that we assume:
-            // 1. dispatch does not block
-            // 2. dispatch never enters self.clock.wait() 
-            match self.dispatch(Some(Delta::zero())) {
-                Dispatch::Timeout => {},
-                Dispatch::Break => return Dispatch::Break,
+            // dispatch events
+            self.dispatch();
+
+            // was break requested?
+            if self.break_.load() {
+                {   let guard = self.lock.lock();
+
+                    if self.break_.load() {
+                        self.break_.store(false);
+                        return Dispatch::Break;
+                    }
+                }
             }
 
             // should we stop dispatching?
@@ -2378,17 +2394,24 @@ impl<C: Clock+AsyncSema> Equeue<C> {
                 .into_iter().chain(timeout_left)
                 .min();
 
-            self.clock.wait_async(delta).await;
+            match delta {
+                Some(delta) => self.clock.wait_timeout_async(delta).await,
+                None => self.clock.wait_async().await,
+            }
         }
     }
 
-    pub async fn dispatch_async<Δ: TryIntoDelta>(&self, delta: Option<Δ>) -> Dispatch {
-        self.dispatch_async_(
-            delta.map(|delta|
-                delta.try_into_delta(self.clock.frequency()).ok()
-                    .expect("equeue: delta overflow")
-            )
-        ).await
+    #[inline]
+    pub async fn dispatch_for_async<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
+        self.dispatch_for_async_(Some(
+            delta.try_into_delta(self.clock.frequency()).ok()
+                .expect("equeue: delta overflow")
+        )).await
+    }
+
+    #[inline]
+    pub async fn dispatch_forever_async(&self) -> Dispatch {
+        self.dispatch_for_async_(None).await
     }
 }
 
