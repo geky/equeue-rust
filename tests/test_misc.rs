@@ -3,7 +3,6 @@ use equeue::Equeue;
 use equeue::Delta;
 use equeue::Dispatch;
 use equeue::Config;
-use equeue::Buffer;
 use equeue::Clock;
 use equeue::Sema;
 use equeue::sys::SysClock;
@@ -17,14 +16,14 @@ use std::mem::transmute;
 #[cfg(feature="async-io")] use async_io::block_on;
 #[cfg(feature="async-std")] use async_std::task::block_on;
 
-#[cfg(feature="embedded-time")] use embedded_time::duration::Extensions;
-
 #[cfg(feature="tokio")]
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(future)
 }
+
+#[cfg(feature="embedded-time")] use embedded_time::duration::Extensions;
 
 
 #[test]
@@ -49,13 +48,12 @@ fn test_misc_buffer() {
 #[test]
 fn test_misc_config() {
     let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_config(Config {
-        clock: SysClock::new(),
-        precision: None,
-        buffer: Buffer::Static(
-            unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-        )
-    });
+    let q = Equeue::with_config(
+        Config::new()
+            .clock(SysClock::new())
+            .precision(8)
+            .buffer(unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) })
+    );
 
     let count = AtomicU32::new(0);
     for _ in 0..1000 {
@@ -93,13 +91,11 @@ fn test_misc_custom_clock() {
     }
 
     let mut buffer = vec![0; 1024*1024];
-    let q = Equeue::with_config(Config {
-        clock: MyClock(),
-        precision: None,
-        buffer: Buffer::Static(
-            unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) }
-        )
-    });
+    let q = Equeue::with_config(
+        Config::new()
+            .clock(MyClock())
+            .buffer(unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) })
+    );
 
     let count = AtomicU32::new(0);
     for _ in 0..1000 {

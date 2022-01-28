@@ -654,6 +654,12 @@ cfg_if! {
         }
     } else {
         #[derive(Debug)]
-        pub struct SysClock();
+        pub enum SysClock {}
+
+        impl SysClock {
+            pub fn new() -> SysClock {
+                panic!("equeue: system has no default clock");
+            }
+        }
     }
 }

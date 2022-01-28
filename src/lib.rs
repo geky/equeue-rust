@@ -662,24 +662,58 @@ pub struct Equeue<C=SysClock> {
     lock: SysLock,
 }
 
-/// Event queue configuration
-#[derive(Debug)]
-pub struct Config<C=SysClock> {
-    pub clock: C,
-    pub precision: Option<u8>,
-
-    pub buffer: Buffer,
-}
-
-#[derive(Debug)]
-pub enum Buffer {
-    #[cfg(feature="alloc")] Alloc(usize),
-    Static(&'static mut [u8]),
-}
-
 // assert that we implement Send + Sync
 #[allow(unconditional_recursion)] fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
 #[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
+
+/// Event queue configuration
+#[derive(Debug)]
+pub struct Config<C=SysClock> {
+    // lazily allocate clock so we don't create it if we don't use it
+    clock: Either<fn() -> C, C>,
+    precision: u8,
+
+    buffer: Option<Either<usize, &'static mut [u8]>>,
+}
+
+impl Config {
+    pub fn new() -> Config {
+        Config {
+            clock: Left(|| SysClock::new()),
+            precision: PRECISION,
+            buffer: None,
+        }
+    }
+}
+
+impl<C> Config<C> {
+    pub fn clock<C_>(self, clock: C_) -> Config<C_> {
+        let Config { precision, buffer, .. } = self;
+        Config {
+            clock: Right(clock),
+            precision,
+            buffer,
+        }
+    }
+
+    pub fn precision(self, precision: u8) -> Config<C> {
+        let mut self_ = self;
+        self_.precision = precision;
+        self_
+    }
+
+    pub fn size(self, size: usize) -> Config<C> {
+        let mut self_ = self;
+        self_.buffer = Some(Left(size));
+        self_
+    }
+
+    pub fn buffer(self, buffer: &'static mut [u8]) -> Config<C> {
+        let mut self_ = self;
+        self_.buffer = Some(Right(buffer));
+        self_
+    }
+}
 
 impl<C> Equeue<C> {
     pub fn with_config(config: Config<C>) -> Equeue<C> {
@@ -689,7 +723,7 @@ impl<C> Equeue<C> {
 
         let (buffer, alloced) = match config.buffer {
             #[cfg(feature="alloc")]
-            Buffer::Alloc(size) => {
+            Some(Left(size)) => {
                 let size = aligndown(size, align_of::<Ebuf>());
                 let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
                 let buffer = unsafe { alloc(layout) };
@@ -698,8 +732,11 @@ impl<C> Equeue<C> {
                 let buffer = unsafe { slice::from_raw_parts_mut(buffer, size) };
                 (buffer, true)
             }
-            Buffer::Static(buffer) => {
+            Some(Right(buffer)) => {
                 (buffer, false)
+            }
+            _ => {
+                panic!("equeue: no buffer configured");
             }
         };
 
@@ -727,9 +764,11 @@ impl<C> Equeue<C> {
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
             break_: Atomic::new(false),
-            precision: config.precision.unwrap_or(PRECISION),
+            precision: config.precision,
 
-            clock: config.clock,
+            clock: config.clock
+                .map_left(|f| f())
+                .into_inner(),
             lock: SysLock::new(),
         }
     }
@@ -738,19 +777,11 @@ impl<C> Equeue<C> {
 #[cfg(feature="std")]
 impl Equeue {
     pub fn with_size(size: usize) -> Equeue {
-        Equeue::with_config(Config {
-            clock: SysClock::new(),
-            precision: None,
-            buffer: Buffer::Alloc(size),
-        })
+        Equeue::with_config(Config::new().size(size))
     }
 
     pub fn with_buffer(buffer: &'static mut [u8]) -> Equeue {
-        Equeue::with_config(Config {
-            clock: SysClock::new(),
-            precision: None,
-            buffer: Buffer::Static(buffer),
-        })
+        Equeue::with_config(Config::new().buffer(buffer))
     }
 }
 
@@ -1316,7 +1347,7 @@ impl<C: Clock> Equeue<C> {
         self.delta_(id)
             .map(|delta|
                 Δ::try_from_delta(delta, self.clock.frequency()).ok()
-                    .expect("delta overflow in equeue")
+                    .expect("equeue: delta overflow")
             )
     }
 }
@@ -1479,7 +1510,7 @@ impl<C: Clock> Equeue<C> {
         self.next_delta_(self.now())
             .map(|delta|
                 Δ::try_from_delta(delta, self.clock.frequency()).ok()
-                    .expect("delta overflow in equeue")
+                    .expect("equeue: delta overflow")
             )
     }
 }
@@ -1593,7 +1624,7 @@ impl<C: Clock+Sema> Equeue<C> {
         self.dispatch_(
             delta.map(|delta|
                 delta.try_into_delta(self.clock.frequency()).ok()
-                    .expect("delta overflow in equeue")
+                    .expect("equeue: delta overflow")
             )
         )
     }
@@ -1639,7 +1670,7 @@ impl<C: Clock+Sema> Equeue<C> {
         debug_assert!(self.contains_raw(e));
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.target = delay.try_into_delta(self.clock.frequency()).ok()
-            .expect("delta overflow in equeue")
+            .expect("equeue: delta overflow")
             .as_tick();
     }
 
@@ -1648,7 +1679,7 @@ impl<C: Clock+Sema> Equeue<C> {
         let e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.period = period.map(|period|
             period.try_into_delta(self.clock.frequency()).ok()
-                .expect("delta overflow in equeue")
+                .expect("equeue: delta overflow")
         );
     }
 
@@ -1971,7 +2002,7 @@ impl<C: Clock+Sema> Equeue<C> {
 impl<'a, T, C: Clock> Event<'a, T, C> {
     pub fn delay<Δ: TryIntoDelta>(mut self, delay: Δ) -> Self {
         self.e.target = delay.try_into_delta(self.q.clock.frequency()).ok()
-            .expect("delta overflow in equeue")
+            .expect("equeue: delta overflow")
             .as_tick();
         self
     }
@@ -1981,7 +2012,7 @@ impl<'a, T, C: Clock> Event<'a, T, C> {
         assert!(!self.once);
         self.e.period = period.map(|period|
             period.try_into_delta(self.q.clock.frequency()).ok()
-                .expect("delta overflow in equeue")
+                .expect("equeue: delta overflow")
         );
         self
     }
@@ -2089,7 +2120,7 @@ impl<C: Clock+Sema> Equeue<C> {
         cb: F
     ) -> Result<Id, Error> {
         let period = period.try_into_delta(self.clock.frequency()).ok()
-            .expect("delta overflow in equeue");
+            .expect("equeue: delta overflow");
         Ok(
             self.alloc(cb)?
                 .delay(period)
@@ -2285,7 +2316,7 @@ impl<C> Equeue<C> {
 impl<C: Clock+Sema> Equeue<C> {
     pub async fn sleep<Δ: TryIntoDelta>(&self, delta: Δ) -> Result<(), Error> {
         let delta = delta.try_into_delta(self.clock.frequency()).ok()
-            .expect("delta overflow in equeue");
+            .expect("equeue: delta overflow");
         AsyncSleep {
             q: self,
             yielded: false,
@@ -2299,7 +2330,7 @@ impl<C: Clock+Sema> Equeue<C> {
         F: Future<Output=R>
     {
         let delta = delta.try_into_delta(self.clock.frequency()).ok()
-            .expect("delta overflow in equeue");
+            .expect("equeue: delta overflow");
         AsyncTimeout {
             q: self,
             f: f,
@@ -2355,7 +2386,7 @@ impl<C: Clock+AsyncSema> Equeue<C> {
         self.dispatch_async_(
             delta.map(|delta|
                 delta.try_into_delta(self.clock.frequency()).ok()
-                    .expect("delta overflow in equeue")
+                    .expect("equeue: delta overflow")
             )
         ).await
     }
