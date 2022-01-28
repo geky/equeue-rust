@@ -44,12 +44,17 @@ use either::Left;
 use either::Right;
 
 mod util;
-pub mod sys;
 use util::*;
-use sys::*;
 
 mod traits;
 pub use traits::*;
+
+// Allow overriding the system implementation with EQUEUE_SYS_PATH
+pub mod sys {
+    include!(env!("EQUEUE_SYS_PATH"));
+}
+use sys::*;
+
 
 /// Default number of bits of precision to use for scheduling events, this
 /// limits the number of significant digits used in long-term events in order

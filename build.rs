@@ -1,7 +1,20 @@
 use std::env;
+use std::path::PathBuf;
+use std::path::Path;
 use cfg_if::cfg_if;
 
 fn main() {
+    // override EQUEUE_SYS_PATH
+    println!("cargo:rerun-if-env-changed=EQUEUE_SYS_PATH");
+    let mut sys_path = env::var_os("EQUEUE_SYS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or(PathBuf::from("src/sys.rs"));
+    // convert from crate relative
+    if sys_path.is_relative() {
+        sys_path = Path::new("..").join(sys_path);
+    }
+    println!("cargo:rustc-env=EQUEUE_SYS_PATH={}", sys_path.display());
+
     // override EQUEUE_UTICK_WIDTH
     println!("cargo:rerun-if-env-changed=EQUEUE_UTICK_WIDTH");
     let utick_width = env::var("EQUEUE_UTICK_WIDTH")
