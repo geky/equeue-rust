@@ -573,7 +573,7 @@ struct Ebuf {
     target: Tick,
     period: Option<Delta>,
     // TODO can we store this somewhere else?
-    q: *const Equeue,
+    q: *const Equeue<()>,
 }
 
 impl Ebuf {
@@ -644,7 +644,10 @@ impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
 
 /// Event queue struct
 #[derive(Debug)]
-pub struct Equeue<C=SysClock> {
+pub struct Equeue<
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     // memory management
     slab: &'static [u8],
     slab_front: Atomic<ueptr, AtomicUeptr>,
@@ -663,12 +666,19 @@ pub struct Equeue<C=SysClock> {
 }
 
 // assert that we implement Send + Sync
-#[allow(unconditional_recursion)] fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
-#[allow(unconditional_recursion)] fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
+#[allow(unconditional_recursion)]
+#[cfg(feature="std")]
+fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
+#[allow(unconditional_recursion)]
+#[cfg(feature="std")]
+fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
 
 /// Event queue configuration
 #[derive(Debug)]
-pub struct Config<C=SysClock> {
+pub struct Config<
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C=(),
+> {
     // lazily allocate clock so we don't create it if we don't use it
     clock: Either<fn() -> C, C>,
     precision: u8,
@@ -679,7 +689,8 @@ pub struct Config<C=SysClock> {
 impl Config {
     pub fn new() -> Config {
         Config {
-            clock: Left(|| SysClock::new()),
+            #[cfg(feature="std")] clock: Left(|| SysClock::new()),
+            #[cfg(not(feature="std"))] clock: Left(|| ()),
             precision: PRECISION,
             buffer: None,
         }
@@ -702,6 +713,7 @@ impl<C> Config<C> {
         self_
     }
 
+    #[cfg(feature="alloc")]
     pub fn size(self, size: usize) -> Config<C> {
         let mut self_ = self;
         self_.buffer = Some(Left(size));
@@ -776,6 +788,7 @@ impl<C> Equeue<C> {
 
 #[cfg(feature="std")]
 impl Equeue {
+    #[cfg(feature="alloc")]
     pub fn with_size(size: usize) -> Equeue {
         Equeue::with_config(Config::new().size(size))
     }
@@ -1760,7 +1773,11 @@ impl Default for Id {
 /// A strongly-typed alternative to Id which implicitly cancels the
 /// event when dropped
 #[derive(Debug)]
-pub struct Handle<'a, C=SysClock> {
+pub struct Handle<
+    'a,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     q: &'a Equeue<C>,
     id: Id,
 }
@@ -1807,7 +1824,12 @@ impl<C> Drop for Handle<'_, C> {
 // TODO can we make Event accept ?Sized? The issue is not the allocation, 
 // the issue is that we'd need to store a fat pointer somehow
 /// Event handle
-pub struct Event<'a, T, C=SysClock> {
+pub struct Event<
+    'a,
+    T,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     q: &'a Equeue<C>,
     e: &'a mut Ebuf,
     once: bool,
@@ -1946,13 +1968,13 @@ impl<C: Clock+Signal> Equeue<C> {
         Ok(Event::new(self, e, true))
     }
 
-    pub fn alloc_static<'a, T: PostStatic<C> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
+    pub fn alloc_static<'a, T: PostStatic<Event<'a, T, C>> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
-        e.q = self as *const Equeue<C> as *const Equeue;
+        e.q = self as *const Equeue<C> as *const Equeue<()>;
 
         // cb/drop thunks
-        fn cb_thunk<T: PostStatic<C>, C>(e: *mut u8) {
+        fn cb_thunk<'a, T: PostStatic<Event<'a, T, C>> + 'a, C: 'a>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
             T::post_static(e);
@@ -1973,12 +1995,12 @@ impl<C: Clock+Signal> Equeue<C> {
     pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
-        e.q = self as *const Equeue<C> as *const Equeue;
+        e.q = self as *const Equeue<C> as *const Equeue<()>;
 
         fn cb_thunk<T: Future<Output=()>, C: Clock+Signal>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             debug_assert!(e.info.load().static_());
-            let mut e = Event::<T>::new(unsafe { e.q.as_ref() }.unwrap(), e, false);
+            let mut e = Event::<T, C>::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
 
             // setup waker
             let waker = unsafe {
@@ -2197,7 +2219,11 @@ impl<C: Clock+Signal> Equeue<C> {
 // https://github.com/rust-lang/rfcs/issues/2900
 
 #[derive(Debug)]
-struct AsyncYield<'a, C=SysClock> {
+struct AsyncYield<
+    'a,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     q: &'a Equeue<C>,
     yielded: bool
 }
@@ -2218,7 +2244,11 @@ impl<C> Future for AsyncYield<'_, C> {
 }
 
 #[derive(Debug)]
-struct AsyncSleep<'a, C=SysClock> {
+struct AsyncSleep<
+    'a,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     q: &'a Equeue<C>,
     yielded: bool,
     timeout: Tick,
@@ -2266,7 +2296,12 @@ impl<C> Drop for AsyncSleep<'_, C> {
 }
 
 #[derive(Debug)]
-struct AsyncTimeout<'a, F, C=SysClock> {
+struct AsyncTimeout<
+    'a,
+    F,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
     q: &'a Equeue<C>,
     f: F,
     timeout: Tick,
@@ -2314,16 +2349,14 @@ impl<F, C> Drop for AsyncTimeout<'_, F, C> {
     }
 }
 
-impl<C> Equeue<C> {
+impl<C: Clock+Signal> Equeue<C> {
     pub async fn yield_(&self) {
         AsyncYield {
             q: self,
             yielded: false
         }.await
     }
-}
 
-impl<C: Clock+Signal> Equeue<C> {
     pub async fn sleep<Δ: TryIntoDelta>(&self, delta: Δ) -> Result<(), Error> {
         let delta = delta.try_into_delta(self.clock.frequency()).ok()
             .expect("equeue: delta overflow");
@@ -2586,4 +2619,349 @@ impl<C> Equeue<C> {
 }
 
 
+/// LocalEqueue wrapper, for non-send + non-sync types
+///
+/// Note we use *const () to force !Send and !Sync, since that's the only
+/// way to do this in stable Rust
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct LocalEqueue<
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+>(Equeue<C>, PhantomData<*const ()>);
 
+impl<C> LocalEqueue<C> {
+    pub fn with_config(config: Config<C>) -> LocalEqueue<C> {
+        Self(Equeue::with_config(config), PhantomData)
+    }
+}
+
+#[cfg(feature="std")]
+impl LocalEqueue {
+    #[cfg(feature="alloc")]
+    pub fn with_size(size: usize) -> LocalEqueue {
+        Self(Equeue::with_size(size), PhantomData)
+    }
+
+    pub fn with_buffer(buffer: &'static mut [u8]) -> LocalEqueue {
+        Self(Equeue::with_buffer(buffer), PhantomData)
+    }
+}
+
+impl<C: Clock> LocalEqueue<C> {
+    pub fn delta<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
+        self.0.delta(id)
+    }
+}
+
+impl<C> LocalEqueue<C> {
+    pub fn cancel(&self, id: Id) -> bool {
+        self.0.cancel(id)
+    }
+}
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    pub fn pend(&self, id: Id) -> bool {
+        self.0.pend(id)
+    }
+}
+
+impl<C: Clock> LocalEqueue<C> {
+    pub fn next_delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
+        self.0.next_delta()
+    }
+
+    pub fn dispatch(&self) {
+        self.0.dispatch()
+    }
+}
+
+impl<C: Clock+Sema> LocalEqueue<C> {
+    #[inline]
+    pub fn dispatch_for<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
+        self.0.dispatch_for(delta)
+    }
+
+    #[inline]
+    pub fn dispatch_forever(&self) -> Dispatch {
+        self.0.dispatch_forever()
+    }
+}
+
+impl<C: Signal> LocalEqueue<C> {
+    pub fn break_(&self) {
+        self.0.break_()
+    }
+}
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    // Handling of raw allocations
+    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
+        self.0.alloc_raw(layout)
+    }
+
+    pub unsafe fn dealloc_raw(&self, e: *mut u8, layout: Layout) {
+        self.0.dealloc_raw(e, layout)
+    }
+
+    pub fn contains_raw(&self, e: *mut u8) -> bool {
+        self.0.contains_raw(e)
+    }
+
+    pub unsafe fn set_raw_delay<Δ: TryIntoDelta>(&self, e: *mut u8, delay: Δ) {
+        self.0.set_raw_delay(e, delay)
+    }
+
+   pub unsafe fn set_raw_period<Δ: TryIntoDelta>(&self, e: *mut u8, period: Option<Δ>) {
+        self.0.set_raw_period(e, period)
+   }
+
+   pub unsafe fn set_raw_static(&self, e: *mut u8, static_: bool) {
+        self.0.set_raw_static(e, static_)
+   }
+
+   pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
+        self.0.set_raw_drop(e, drop)
+   }
+
+   pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
+        self.0.post_raw(cb, e)
+   }
+}
+
+// A wrapper to fake Send for reusing the Equeue implementation
+#[derive(Debug)]
+#[repr(transparent)]
+struct IgnoreSend<T>(T);
+
+unsafe impl<T> Send for IgnoreSend<T> {}
+
+impl<T: Post> Post for IgnoreSend<T> {
+    fn post(&mut self) {
+        self.0.post();
+    }
+}
+
+impl<T: PostOnce> PostOnce for IgnoreSend<T> {
+    fn post_once(self) {
+        self.0.post_once();
+    }
+}
+
+impl<'a, T: PostStatic<LocalEvent<'a, T, C>>, C> PostStatic<Event<'a, IgnoreSend<T>, C>> for IgnoreSend<T> {
+    fn post_static(self_: Event<'a, IgnoreSend<T>, C>) {
+        T::post_static(unsafe { transmute(self_) })
+    }
+}
+
+impl<T: Future<Output=()>> Future for IgnoreSend<T> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        unsafe { self.map_unchecked_mut(|self_| &mut self_.0) }.poll(cx)
+    }
+}
+
+/// Non-Send/Sync Event Handle
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct LocalEvent<
+    'a,
+    T,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+>(Event<'a, IgnoreSend<T>, C>, PhantomData<*const ()>);
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    pub fn alloc<'a, T: Post>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        Ok(LocalEvent(self.0.alloc(IgnoreSend(t))?, PhantomData))
+    }
+
+    pub fn alloc_once<'a, T: PostOnce>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        Ok(LocalEvent(self.0.alloc_once(IgnoreSend(t))?, PhantomData))
+    }
+
+    pub fn alloc_static<'a, T: PostStatic<LocalEvent<'a, T, C>>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        Ok(LocalEvent(self.0.alloc_static(IgnoreSend(t))?, PhantomData))
+    }
+
+    pub fn alloc_future<'a, T: Future<Output=()>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        Ok(LocalEvent(self.0.alloc_future(IgnoreSend(t))?, PhantomData))
+    }
+}
+
+impl<'a, T, C: Clock+Signal> LocalEvent<'a, T, C> {
+    pub fn delay<Δ: TryIntoDelta>(self, delay: Δ) -> Self {
+        unsafe { transmute(self.0.delay(delay)) }
+    }
+
+    pub fn period<Δ: TryIntoDelta>(self, period: Option<Δ>) -> Self {
+        unsafe { transmute(self.0.period(period)) }
+    }
+
+    pub fn static_(self, static_: bool) -> Self {
+        unsafe { transmute(self.0.static_(static_)) }
+    }
+
+    pub fn into_id(self) -> Id {
+        self.0.into_id()
+    }
+
+    pub fn into_handle(self) -> Handle<'a, C> {
+        self.0.into_handle()
+    }
+
+    pub fn post(self) -> Id {
+        self.0.post()
+    }
+
+    pub fn post_handle(self) -> Handle<'a, C> {
+        self.0.post_handle()
+    }
+}
+
+impl<T, C> Deref for LocalEvent<'_, T, C> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0.deref().0
+    }
+}
+
+impl<T, C> DerefMut for LocalEvent<'_, T, C> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0.deref_mut().0
+    }
+}
+
+impl<T, C> AsRef<T> for LocalEvent<'_, T, C> {
+    fn as_ref(&self) -> &T {
+        &self.0.as_ref().0
+    }
+}
+
+impl<T, C> AsMut<T> for LocalEvent<'_, T, C> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.0.as_mut().0
+    }
+}
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    pub fn call<F: PostOnce>(
+        &self,
+        cb: F
+    ) -> Result<Id, Error> {
+        Ok(
+            self.alloc_once(cb)?
+                .post()
+        )
+    }
+
+    pub fn call_in<Δ: TryIntoDelta, F: PostOnce>(
+        &self,
+        delay: Δ,
+        cb: F
+    ) -> Result<Id, Error> {
+        Ok(
+            self.alloc_once(cb)?
+                .delay(delay)
+                .post()
+        )
+    }
+
+    pub fn call_every<Δ: TryIntoDelta, F: Post>(
+        &self,
+        period: Δ,
+        cb: F
+    ) -> Result<Id, Error> {
+        let period = period.try_into_delta(self.0.clock.frequency()).ok()
+            .expect("equeue: delta overflow");
+        Ok(
+            self.alloc(cb)?
+                .delay(period)
+                .period(Some(period))
+                .post()
+        )
+    }
+
+    pub fn run<F: Future<Output=()>>(
+        &self,
+        cb: F
+    ) -> Result<Id, Error> {
+        Ok(
+            self.alloc_future(cb)?
+                .post()
+        )
+    }
+
+    pub fn call_handle<'a, F: PostOnce>(
+        &'a self,
+        cb: F
+    ) -> Result<Handle<'a, C>, Error> {
+        self.call(cb).map(|id| Handle::new(&self.0, id))
+    }
+
+    pub fn call_in_handle<'a, Δ: TryIntoDelta, F: PostOnce>(
+        &'a self,
+        delay: Δ,
+        cb: F
+    ) -> Result<Handle<'a, C>, Error> {
+        self.call_in(delay, cb).map(|id| Handle::new(&self.0, id))
+    }
+
+    pub fn call_every_handle<'a, Δ: TryIntoDelta, F: Post>(
+        &'a self,
+        period: Δ,
+        cb: F
+    ) -> Result<Handle<'a, C>, Error> {
+        self.call_every(period, cb).map(|id| Handle::new(&self.0, id))
+    }
+
+    pub fn run_handle<'a, F: Future<Output=()>>(
+        &'a self,
+        cb: F
+    ) -> Result<Handle<'a, C>, Error> {
+        self.run(cb).map(|id| Handle::new(&self.0, id))
+    }
+}
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    pub async fn yield_(&self) {
+        self.0.yield_().await
+    }
+
+    pub async fn sleep<Δ: TryIntoDelta>(&self, delta: Δ) -> Result<(), Error> {
+        self.0.sleep(delta).await
+    }
+
+    pub async fn timeout<Δ: TryIntoDelta, F, R>(&self, delta: Δ, f: F) -> Result<R, Error>
+    where
+        F: Future<Output=R>
+    {
+        self.0.timeout(delta, f).await
+    }
+}
+
+impl<C: Clock+AsyncSema> LocalEqueue<C> {
+    #[inline]
+    pub async fn dispatch_for_async<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
+        self.0.dispatch_for_async(delta).await
+    }
+
+    #[inline]
+    pub async fn dispatch_forever_async(&self) -> Dispatch {
+        self.0.dispatch_forever_async().await
+    }
+}
+
+impl<C> LocalEqueue<C> {
+    pub fn usage(&self) -> Usage {
+        self.0.usage()
+    }
+
+    pub fn bucket_usage(&self, buckets: &mut [usize]) {
+        self.0.bucket_usage(buckets);
+    }
+
+    pub fn slice_usage(&self, slices: &mut [usize]) {
+        self.0.slice_usage(slices);
+    }
+}

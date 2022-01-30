@@ -15,7 +15,7 @@ fn test_async() {
     q.run(async {
         count.fetch_add(1, Ordering::SeqCst);
     }).unwrap();
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
     println!("usage: {:#?}", q.usage());
@@ -34,7 +34,7 @@ fn test_async_several() {
     }).unwrap();
 
     for i in 0..100 {
-        q.dispatch_for(Duration::from_millis(0));
+        q.dispatch();
         assert_eq!(count.load(Ordering::SeqCst), i+1);
     }
 
@@ -56,7 +56,7 @@ fn test_async_multiple() {
     }
 
     for i in 0..100 {
-        q.dispatch_for(Duration::from_millis(0));
+        q.dispatch();
         assert_eq!(count.load(Ordering::SeqCst), (i+1)*100);
     }
 

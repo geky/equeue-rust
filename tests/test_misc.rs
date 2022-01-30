@@ -1,5 +1,6 @@
 
 use equeue::Equeue;
+use equeue::LocalEqueue;
 use equeue::Delta;
 use equeue::Dispatch;
 use equeue::Config;
@@ -13,6 +14,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::mem::transmute;
+use std::cell::Cell;
 
 #[cfg(feature="async-io")] use async_io::block_on;
 #[cfg(feature="async-std")] use async_std::task::block_on;
@@ -40,7 +42,7 @@ fn test_misc_buffer() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -62,7 +64,7 @@ fn test_misc_config() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -111,7 +113,46 @@ fn test_misc_custom_clock() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch_for(Delta::zero());
+    q.dispatch();
+
+    assert_eq!(count.load(Ordering::SeqCst), 1000);
+    println!("usage: {:#?}", q.usage());
+}
+
+#[test]
+fn test_misc_custom_clock_no_sema() {
+    // We're only going to do post on this, so we don't need it to be exhaustive
+    #[derive(Debug)]
+    struct MyClock();
+
+    impl Clock for MyClock {
+        fn now(&self) -> utick {
+            0
+        }
+
+        fn frequency(&self) -> utick {
+            1000
+        }
+    }
+
+    impl Signal for MyClock {
+        fn signal(&self) {}
+    }
+
+    let mut buffer = vec![0; 1024*1024];
+    let q = Equeue::with_config(
+        Config::new()
+            .clock(MyClock())
+            .buffer(unsafe { transmute::<&mut [u8], &'static mut [u8]>(buffer.as_mut()) })
+    );
+
+    let count = AtomicU32::new(0);
+    for _ in 0..1000 {
+        q.call(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }).unwrap();
+    }
+    q.dispatch();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -302,21 +343,21 @@ fn test_misc_handles() {
     }
 
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
     assert_eq!(count.load(Ordering::SeqCst), 50);
 
     // no drop another half
     handles.truncate(50);
 
     assert_eq!(count.load(Ordering::SeqCst), 50);
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     // and release the rest
     drop(handles);
 
     assert_eq!(count.load(Ordering::SeqCst), 75);
-    q.dispatch_for(Duration::from_millis(0));
+    q.dispatch();
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     println!("usage: {:#?}", q.usage());
@@ -324,7 +365,7 @@ fn test_misc_handles() {
 
 #[cfg(feature="embedded-time")]
 #[test]
-fn test_embedded_time() {
+fn test_misc_embedded_time() {
     let q = Equeue::with_size(1024*1024);
 
     let count = AtomicU32::new(0);
@@ -342,5 +383,22 @@ fn test_embedded_time() {
     q.dispatch_for(100u32.milliseconds());
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
+    println!("usage: {:#?}", q.usage());
+}
+
+#[test]
+fn test_misc_local() {
+    let q = LocalEqueue::with_size(1024*1024);
+
+    // because we're local we don't need to worry about synchronization
+    let count = Cell::new(0u32);
+    for _ in 0..1000 {
+        q.call(|| {
+            count.set(count.get() + 1);
+        }).unwrap();
+    }
+    q.dispatch();
+
+    assert_eq!(count.get(), 1000);
     println!("usage: {:#?}", q.usage());
 }

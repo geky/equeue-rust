@@ -110,11 +110,11 @@ fn test_race_post() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
-            q.dispatch_for(Duration::from_millis(0));
+            q.dispatch();
         })
     };
 
@@ -161,11 +161,11 @@ fn test_race_post_order() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
-            q.dispatch_for(Duration::from_millis(0));
+            q.dispatch();
         })
     };
 
@@ -219,7 +219,7 @@ fn test_race_delay() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
@@ -343,7 +343,7 @@ fn test_race_cancel_dispatch() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
@@ -393,11 +393,11 @@ fn test_race_cancel_periodic() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
-            q.dispatch_for(Duration::from_millis(0));
+            q.dispatch();
         })
     };
 
@@ -436,7 +436,7 @@ fn test_race_cancel_periodic() {
 
 struct StaticIncrement(Arc<AtomicU32>);
 
-impl PostStatic for StaticIncrement {
+impl PostStatic<Event<'_, StaticIncrement>> for StaticIncrement {
     fn post_static(self_: Event<'_, Self>) {
         self_.0.fetch_add(1, Ordering::SeqCst);
         forget(self_);
@@ -456,11 +456,11 @@ fn test_race_repost() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
-            q.dispatch_for(Duration::from_millis(0));
+            q.dispatch();
         })
     };
 
@@ -507,11 +507,11 @@ fn test_race_dispatch_multiple() {
         let done = done.clone();
         dispatch_threads.push(thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch_for(Duration::from_millis(0));
+                q.dispatch();
             }
 
             // make sure we catch any lingering events
-            q.dispatch_for(Duration::from_millis(0));
+            q.dispatch();
         }));
     }
 

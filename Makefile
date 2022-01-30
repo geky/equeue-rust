@@ -12,6 +12,7 @@ build-configs:
 	cargo build --no-default-features
 	cargo build --no-default-features --features alloc
 	cargo build
+	cargo build --release
 	cargo build --features embedded-time
 	cargo build --features utick-at-least-u128
 	EQUEUE_FREQUENCY=1000000000 cargo build --features utick-at-least-u64,embedded-time
@@ -22,6 +23,7 @@ build-configs:
 .PHONY: test-configs
 test-configs: build-configs
 	cargo test --tests
+	cargo test --tests --release
 	cargo test --tests --features embedded-time
 	cargo test --tests --features utick-at-least-u128
 	EQUEUE_FREQUENCY=1000000000 cargo test --tests --features utick-at-least-u64,embedded-time
