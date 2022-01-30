@@ -2,6 +2,8 @@
 .PHONY: all build
 all build:
 	cargo build
+	cargo build --tests
+	cargo build --examples
 
 .PHONY: test
 test:

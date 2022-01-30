@@ -1,6 +1,5 @@
 
 use equeue::Equeue;
-use equeue::Delta;
 
 use std::thread;
 use std::alloc::Layout;
@@ -37,7 +36,7 @@ fn main() {
     {
         let q = q.clone();
         threads.push(thread::spawn(move || {
-            q.dispatch(None::<Delta>);
+            q.dispatch_forever();
             unreachable!();
         }));
     }

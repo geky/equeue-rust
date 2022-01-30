@@ -37,7 +37,7 @@ fn main() {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             loop {
-                q.dispatch(Some(Duration::from_millis(0)));
+                q.dispatch();
                 thread::sleep(Duration::from_nanos(1000*opt.scale));
             }
         }));
