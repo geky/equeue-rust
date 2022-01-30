@@ -1668,6 +1668,7 @@ impl<C: Signal> Equeue<C> {
     }
 }
 
+#[cfg(feature="raw")]
 impl<C: Clock+Signal> Equeue<C> {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
@@ -2694,6 +2695,7 @@ impl<C: Signal> LocalEqueue<C> {
     }
 }
 
+#[cfg(feature="raw")]
 impl<C: Clock+Signal> LocalEqueue<C> {
     // Handling of raw allocations
     pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
