@@ -465,54 +465,54 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
 
 /// Several event fields are crammed in here to avoid wasting space
 #[derive(Copy, Clone, Eq, PartialEq)]
-struct Einfo(ueptr);
+struct Info(ueptr);
 
-impl Debug for Einfo {
+impl Debug for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
-        f.debug_tuple("Einfo")
+        f.debug_tuple("Info")
             .field(&format_args!("{:#x}", self.0))
             .finish()
     }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Pending {
+enum State {
     Alloced  = 0,
-    Pending  = 2,
+    InQueue  = 2,
     InFlight = 4,
     Nested   = 6,
     Canceled = 7,
 }
 
-impl Pending {
-    fn from_ueptr(pending: ueptr) -> Pending {
-        match pending {
-            0 | 1 => Pending::Alloced,
-            2 | 3 => Pending::Pending,
-            4 | 5 => Pending::InFlight,
-            6     => Pending::Nested,
-            7     => Pending::Canceled,
+impl State {
+    fn from_ueptr(state: ueptr) -> State {
+        match state {
+            0 | 1 => State::Alloced,
+            2 | 3 => State::InQueue,
+            4 | 5 => State::InFlight,
+            6     => State::Nested,
+            7     => State::Canceled,
             _ => unreachable!(),
         }
     }
 
     fn as_ueptr(&self) -> ueptr {
         match self {
-            Pending::Alloced  => 0,
-            Pending::Pending  => 2,
-            Pending::InFlight => 4,
-            Pending::Nested   => 6,
-            Pending::Canceled => 7,
+            State::Alloced  => 0,
+            State::InQueue  => 2,
+            State::InFlight => 4,
+            State::Nested   => 6,
+            State::Canceled => 7,
         }
     }
 }
 
-impl Einfo {
-    fn new(id: ugen, pending: Pending, static_: bool, npw2: u8) -> Einfo {
-        Einfo(
+impl Info {
+    fn new(id: ugen, state: State, static_: bool, npw2: u8) -> Info {
+        Info(
             ((id as ueptr) << 8*size_of::<ugen>())
-            | (pending.as_ueptr() << (8*size_of::<ugen>()-3))
+            | (state.as_ueptr() << (8*size_of::<ugen>()-3))
             | ((!static_ as ueptr) << (8*size_of::<ugen>()-3))
             | (npw2 as ueptr)
         )
@@ -522,8 +522,8 @@ impl Einfo {
         (self.0 >> 8*size_of::<ugen>()) as ugen
     }
 
-    fn pending(&self) -> Pending {
-        Pending::from_ueptr(0x7 & (self.0 >> (8*size_of::<ugen>()-3)))
+    fn state(&self) -> State {
+        State::from_ueptr(0x7 & (self.0 >> (8*size_of::<ugen>()-3)))
     }
 
     fn static_(&self) -> bool {
@@ -535,25 +535,25 @@ impl Einfo {
         (self.0 & ((1 << (8*size_of::<ugen>()-3)) - 1)) as u8
     }
 
-    fn inc_id(self) -> Einfo {
-        Einfo(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
+    fn inc_id(self) -> Info {
+        Info(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
     }
 
-    fn set_pending(self, pending: Pending) -> Einfo {
+    fn set_state(self, state: State) -> Info {
         // there is one incompatible state here
-        debug_assert!(pending != Pending::Nested || self.static_());
-        Einfo(
+        debug_assert!(state != State::Nested || self.static_());
+        Info(
             (self.0 & !(0x6 << (8*size_of::<ugen>()-3)))
-            | (pending.as_ueptr() << (8*size_of::<ugen>()-3))
+            | (state.as_ueptr() << (8*size_of::<ugen>()-3))
         )
     }
 
-    fn set_static(self, static_: bool) -> Einfo {
+    fn set_static(self, static_: bool) -> Info {
         // static is inverted so we can mask it with canceled statuses
         if !static_ {
-            Einfo(self.0 | (1 << (8*size_of::<ugen>()-3)))
+            Info(self.0 | (1 << (8*size_of::<ugen>()-3)))
         } else {
-            Einfo(self.0 & !(1 << (8*size_of::<ugen>()-3)))
+            Info(self.0 & !(1 << (8*size_of::<ugen>()-3)))
         }
     }
 }
@@ -566,7 +566,7 @@ struct Ebuf {
     next_back: Atomic<Eptr, AtomicUeptr>,
     sibling: Atomic<Eptr, AtomicUeptr>,
     sibling_back: Atomic<Eptr, AtomicUeptr>,
-    info: Atomic<Einfo, AtomicUeptr>,
+    info: Atomic<Info, AtomicUeptr>,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -804,7 +804,7 @@ impl<C> Drop for Equeue<C> {
         // make sure we call drop on any pending events
         //
         // we can't just traverse the queue here, because alloced but unpended
-        // events aren't there until pend is called, this includes
+        // events aren't there until post is called, this includes
         // intermediary states for static events/futures.
         //
         // it's up to dealloc_ to make sure drop is cleared after called
@@ -933,7 +933,7 @@ impl<C> Equeue<C> {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Einfo::new(0, Pending::InFlight, false, npw2)),
+                info: Atomic::new(Info::new(0, State::InFlight, false, npw2)),
 
                 cb: None,
                 drop: None,
@@ -965,10 +965,10 @@ impl<C> Equeue<C> {
 
             // give our event a new id
             let info = e.info.load();
-            debug_assert_ne!(info.pending(), Pending::Pending);
+            debug_assert_ne!(info.state(), State::InQueue);
             e.info.store(
                 info.inc_id()
-                    .set_pending(Pending::InFlight)
+                    .set_state(State::InFlight)
                     .set_static(false)
             );
 
@@ -1058,11 +1058,11 @@ impl<C> Equeue<C> {
                 // this may seem seem like a weird place for this check, but
                 // it's the only place we lock before re-enqueueing periodic events
                 let info = e.info.load();
-                match info.pending() {
-                    Pending::Alloced => {},
-                    Pending::Pending => return Ok(false),
-                    Pending::InFlight => {},
-                    Pending::Nested => {
+                match info.state() {
+                    State::Alloced => {},
+                    State::InQueue => return Ok(false),
+                    State::InFlight => {},
+                    State::Nested => {
                         // nested can only be marked for immediate execuction, but
                         // we can end up here if we are marked nested while trying
                         // to enqueue a periodic/delayed event
@@ -1073,7 +1073,7 @@ impl<C> Equeue<C> {
                             continue 'retry;
                         }
                     }
-                    Pending::Canceled => return Err(e),
+                    State::Canceled => return Err(e),
                 }
 
                 // did someone already change our tailsrc? dequeue iteration? restart
@@ -1111,7 +1111,7 @@ impl<C> Equeue<C> {
                 };
 
                 // mark as pending here, enabling removals
-                e.info.store(info.set_pending(Pending::Pending));
+                e.info.store(info.set_state(State::InQueue));
                 return Ok(change)
             }
         }
@@ -1120,7 +1120,7 @@ impl<C> Equeue<C> {
     fn unqueue_<'a>(
         &'a self,
         e: Either<(&'a Ebuf, ugen), ugen>,
-        npending: Pending
+        nstate: State
     ) -> (bool, Option<&'a mut Ebuf>) {
         {   let guard = self.lock.lock();
 
@@ -1156,8 +1156,8 @@ impl<C> Equeue<C> {
 
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
-            match info.pending() {
-                Pending::Pending => {
+            match info.state() {
+                State::InQueue => {
                     // we can disentangle the event here and reclaim the memory
                     let nextptr = e.next.load();
                     let next = nextptr.as_ref(self);
@@ -1224,26 +1224,26 @@ impl<C> Equeue<C> {
                     // mark as removed
                     e.next.store_inc_marked(nextptr, MarkedEptr::null());
                     // mark as not-pending
-                    e.info.store(e.info.load().set_pending(npending));
+                    e.info.store(e.info.load().set_state(nstate));
                     
                     // note we are responsible for the memory now
                     (true, Some(unsafe { e.claim() }))
                 }
-                Pending::Alloced => {
+                State::Alloced => {
                     // alloced is a weird one, if we end up here, we just need
                     // to claim the event, and since we ensure no ids coexist
                     // mutable references to events at the type-level, we can
                     // be sure we have exclusive access
-                    e.info.store(e.info.load().set_pending(npending));
+                    e.info.store(e.info.load().set_state(nstate));
                     (true, Some(unsafe { e.claim() }))
                 }
-                Pending::InFlight | Pending::Nested => {
+                State::InFlight | State::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
-                    e.info.store(e.info.load().set_pending(npending));
+                    e.info.store(e.info.load().set_state(nstate));
                     (info.static_(), None)
                 }
-                Pending::Canceled => {
+                State::Canceled => {
                     (false, None)
                 }
             }
@@ -1320,7 +1320,7 @@ impl<C> Equeue<C> {
 
         // unqueue from the dequeue list an event at a time
         Right(iter::from_fn(move || {
-            self.unqueue_(Right(mark), Pending::InFlight).1
+            self.unqueue_(Right(mark), State::InFlight).1
         }))
     }
 }
@@ -1331,7 +1331,7 @@ impl<C: Clock> Equeue<C> {
     }
 
     // How long until event executes?
-    fn delta_(&self, id: Id) -> Option<Delta> {
+    fn delta_id_(&self, id: Id) -> Option<Delta> {
         let e = match id.as_ref(self) {
             Some(e) => e,
             None => return None,
@@ -1348,17 +1348,17 @@ impl<C: Clock> Equeue<C> {
 
         // note that periodic events are always pending, we load period
         // first since it is not necessarily atomic
-        match info.pending() {
-            Pending::Alloced => None,
-            Pending::Pending => Some(target - self.now()),
-            Pending::InFlight => period,
-            Pending::Nested => Some(Delta::zero()),
-            Pending::Canceled => None,
+        match info.state() {
+            State::Alloced => None,
+            State::InQueue => Some(target - self.now()),
+            State::InFlight => period,
+            State::Nested => Some(Delta::zero()),
+            State::Canceled => None,
         }
     }
 
-    pub fn delta<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
-        self.delta_(id)
+    pub fn delta_id<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
+        self.delta_id_(id)
             .map(|delta|
                 Δ::try_from_delta(delta, self.clock.frequency()).ok()
                     .expect("equeue: delta overflow")
@@ -1376,11 +1376,11 @@ impl<C> Equeue<C> {
         };
 
         let info = e.info.load();
-        if info.id() != id.id || info.pending() == Pending::Canceled {
+        if info.id() != id.id || info.state() == State::Canceled {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_(Left((e, id.id)), Pending::Canceled);
+        let (canceled, e) = self.unqueue_(Left((e, id.id)), State::Canceled);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -1411,8 +1411,8 @@ impl<C: Clock+Signal> Equeue<C> {
         }
     }
 
-    // repost an static event which may already be pending
-    pub fn pend(&self, id: Id) -> bool {
+    // post an static event which may already be pending
+    pub fn post_id(&self, id: Id) -> bool {
         let e = match id.as_ref(self) {
             Some(e) => e,
             None => return false,
@@ -1424,7 +1424,7 @@ impl<C: Clock+Signal> Equeue<C> {
         }
 
         loop {
-            // The main difference between pend and post is that we may
+            // The main difference between post and post is that we may
             // be pending an event that's already pending. This means several
             // more corner cases to handle.
             let now = self.now();
@@ -1437,29 +1437,29 @@ impl<C: Clock+Signal> Equeue<C> {
                     return false;
                 }
 
-                match info.pending() {
-                    Pending::Alloced => {
+                match info.state() {
+                    State::Alloced => {
                         // if we're alloced we can just enqueue, make sure to mark
                         // and claim the event first
-                        e.info.store(info.set_pending(Pending::InFlight));
+                        e.info.store(info.set_state(State::InFlight));
                         Left(unsafe { e.claim() })
                     }
-                    Pending::Pending if now < e.target => {
+                    State::InQueue if now < e.target => {
                         // we're pending, but in the future, we want to move this
                         // to execute immediately
                         Right(e)
                     }
-                    Pending::InFlight if info.static_() => {
+                    State::InFlight if info.static_() => {
                         // someone else is dispatching, just make sure we mark that
                         // we are interested in the event being repended
-                        e.info.store(info.set_pending(Pending::Nested));
+                        e.info.store(info.set_state(State::Nested));
                         return true;
                     }
-                    Pending::Pending | Pending::Nested => {
+                    State::InQueue | State::Nested => {
                         // do nothing, the event is already pending
                         return true;
                     }
-                    Pending::InFlight | Pending::Canceled => {
+                    State::InFlight | State::Canceled => {
                         return false;
                     }
                 }
@@ -1486,7 +1486,7 @@ impl<C: Clock+Signal> Equeue<C> {
                 }
                 Right(e) => {
                     // try to unqueue and continue the loop to reenqueue sooner
-                    self.unqueue_(Left((e, id.id)), Pending::InFlight);
+                    self.unqueue_(Left((e, id.id)), State::InFlight);
                 }
             }
         }
@@ -1497,7 +1497,7 @@ impl<C: Clock> Equeue<C> {
     // find time until next event without locking
     //
     // note this is clamped to 0 at minimum
-    fn next_delta_(&self, now: Tick) -> Option<Delta> {
+    fn delta_(&self, now: Tick) -> Option<Delta> {
         'retry: loop {
             // wait, if break is requested we need to process
             // it immediately
@@ -1520,8 +1520,8 @@ impl<C: Clock> Equeue<C> {
         }
     }
 
-    pub fn next_delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
-        self.next_delta_(self.now())
+    pub fn delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
+        self.delta_(self.now())
             .map(|delta|
                 Δ::try_from_delta(delta, self.clock.frequency()).ok()
                     .expect("equeue: delta overflow")
@@ -1529,7 +1529,7 @@ impl<C: Clock> Equeue<C> {
     }
 
     // Dispatch ready events
-    pub fn dispatch(&self) {
+    pub fn dispatch_ready(&self) {
         // get the current time
         let now = self.now();
 
@@ -1559,15 +1559,15 @@ impl<C: Clock> Equeue<C> {
                 let (reenqueue, e) = {
                     let guard = self.lock.lock();
                     let info = e.info.load();
-                    match info.pending() {
-                        Pending::InFlight => {
-                            e.info.store(info.set_pending(Pending::Alloced));
+                    match info.state() {
+                        State::InFlight => {
+                            e.info.store(info.set_state(State::Alloced));
                             (None, None)
                         }
-                        Pending::Nested => {
+                        State::Nested => {
                             (Some(e), None)
                         }
-                        Pending::Canceled => {
+                        State::Canceled => {
                             (None, Some(e))
                         }
                         _ => unreachable!(),
@@ -1596,14 +1596,14 @@ impl<C: Clock> Equeue<C> {
 
 impl<C: Clock+Sema> Equeue<C> {
     // Central dispatch function
-    fn dispatch_for_(&self, delta: Option<Delta>) -> Dispatch {
+    fn dispatch_(&self, delta: Option<Delta>) -> Dispatch {
         // calculate the timeout
         let mut now = self.now();
         let timeout = delta.map(|delta| now + delta);
 
         loop {
             // dispatch events
-            self.dispatch();
+            self.dispatch_ready();
 
             // was break requested?
             if self.break_.load() {
@@ -1633,7 +1633,7 @@ impl<C: Clock+Sema> Equeue<C> {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let delta = self.next_delta_(now)
+            let delta = self.delta_(now)
                 .into_iter().chain(timeout_left)
                 .min();
 
@@ -1646,15 +1646,15 @@ impl<C: Clock+Sema> Equeue<C> {
 
     #[inline]
     pub fn dispatch_for<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
-        self.dispatch_for_(Some(
+        self.dispatch_(Some(
             delta.try_into_delta(self.clock.frequency()).ok()
                 .expect("equeue: delta overflow")
         ))
     }
 
     #[inline]
-    pub fn dispatch_forever(&self) -> Dispatch {
-        self.dispatch_for_(None)
+    pub fn dispatch(&self) -> Dispatch {
+        self.dispatch_(None)
     }
 }
 
@@ -1767,13 +1767,13 @@ impl<'a, C: Clock> Handle<'a, C> {
     // Some other convenience functions, which can
     // normally be done with Ids
     pub fn delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
-        self.q.delta(self.id)
+        self.q.delta_id(self.id)
     }
 }
 
 impl<'a, C: Clock+Signal> Handle<'a, C> {
-    pub fn pend(&self) -> bool {
-        self.q.pend(self.id)
+    pub fn post(&self) -> bool {
+        self.q.post_id(self.id)
     }
 }
 
@@ -1831,9 +1831,9 @@ unsafe fn event_waker_wake<C: Clock+Signal>(e: *const ()) {
         return;
     }
 
-    // pend
+    // post
     let q = (e.q as *const Equeue<C>).as_ref().unwrap();
-    q.pend(Id::new(q, id, e));
+    q.post_id(Id::new(q, id, e));
 }
 
 unsafe fn event_waker_drop(e: *const ()) {
@@ -2050,7 +2050,7 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
 
         // mark as no longer in use, allowing external pends
         let info = e.info.load();
-        e.info.store(info.set_pending(Pending::Alloced));
+        e.info.store(info.set_state(State::Alloced));
 
         let id = Id::new(q, info.id(), e);
         forget(self);
@@ -2373,7 +2373,7 @@ impl<C: Clock+Signal> Equeue<C> {
 }
 
 impl<C: Clock+AsyncSema> Equeue<C> {
-    async fn dispatch_for_async_(&self, delta: Option<Delta>) -> Dispatch {
+    async fn dispatch_async_(&self, delta: Option<Delta>) -> Dispatch {
         // note that some of this is ungracefull copy-pasted from non-async dispatch
 
         // get the current time
@@ -2382,7 +2382,7 @@ impl<C: Clock+AsyncSema> Equeue<C> {
 
         loop {
             // dispatch events
-            self.dispatch();
+            self.dispatch_ready();
 
             // was break requested?
             if self.break_.load() {
@@ -2412,7 +2412,7 @@ impl<C: Clock+AsyncSema> Equeue<C> {
             // just to behave nicely in case the system's semaphore implementation
             // does something "clever". Note we also never enter here if
             // ticks is 0 for similar reasons.
-            let delta = self.next_delta_(now)
+            let delta = self.delta_(now)
                 .into_iter().chain(timeout_left)
                 .min();
 
@@ -2425,15 +2425,15 @@ impl<C: Clock+AsyncSema> Equeue<C> {
 
     #[inline]
     pub async fn dispatch_for_async<Δ: TryIntoDelta>(&self, delta: Δ) -> Dispatch {
-        self.dispatch_for_async_(Some(
+        self.dispatch_async_(Some(
             delta.try_into_delta(self.clock.frequency()).ok()
                 .expect("equeue: delta overflow")
         )).await
     }
 
     #[inline]
-    pub async fn dispatch_forever_async(&self) -> Dispatch {
-        self.dispatch_for_async_(None).await
+    pub async fn dispatch_async(&self) -> Dispatch {
+        self.dispatch_async_(None).await
     }
 }
 
@@ -2441,8 +2441,8 @@ impl<C: Clock+AsyncSema> Equeue<C> {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Usage {
-    pub pending: usize,
-    pub pending_bytes: usize,
+    pub posted: usize,
+    pub posted_bytes: usize,
     pub alloced: usize,
     pub alloced_bytes: usize,
     pub free: usize,
@@ -2473,8 +2473,8 @@ impl<C> Equeue<C> {
         }
 
         // find pending usage
-        let mut pending = 0;
-        let mut pending_bytes = 0;
+        let mut posted = 0;
+        let mut posted_bytes = 0;
         let mut slices = 0;
         'slices: for head in iter::successors(
             self.queue.load().as_ref(self),
@@ -2486,13 +2486,13 @@ impl<C> Equeue<C> {
                 |sibling| sibling.sibling.load().as_ref(self)
                     .filter(|&sibling| sibling as *const _ != head as *const _)
             ) {
-                pending += 1;
-                pending_bytes += size_of::<Ebuf>() + sibling.size();
+                posted += 1;
+                posted_bytes += size_of::<Ebuf>() + sibling.size();
 
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
-                if pending > total {
-                    pending = 1;
+                if posted > total {
+                    posted = 1;
                     break;
                 }
 
@@ -2529,16 +2529,16 @@ impl<C> Equeue<C> {
         //
         // we can at least clamp some of the numbers to reasonable limits
         // to avoid breaking user's code as much as possible
-        let pending = min(pending, total);
-        let pending_bytes = min(pending_bytes, slab_total.saturating_sub(slab_unused+slab_front));
-        let free = min(free, total-pending);
-        let free_bytes = min(free_bytes, slab_total.saturating_sub(slab_unused+slab_front)-pending_bytes);
+        let posted = min(posted, total);
+        let posted_bytes = min(posted_bytes, slab_total.saturating_sub(slab_unused+slab_front));
+        let free = min(free, total-posted);
+        let free_bytes = min(free_bytes, slab_total.saturating_sub(slab_unused+slab_front)-posted_bytes);
 
         Usage {
-            pending: pending,
-            pending_bytes: pending_bytes,
-            alloced: total.saturating_sub(pending+free),
-            alloced_bytes: slab_total.saturating_sub(pending_bytes+free_bytes+slab_unused+slab_front),
+            posted: posted,
+            posted_bytes: posted_bytes,
+            alloced: total.saturating_sub(posted+free),
+            alloced_bytes: slab_total.saturating_sub(posted_bytes+free_bytes+slab_unused+slab_front),
             free: free,
             free_bytes: free_bytes+slab_unused,
             slices: slices,
@@ -2638,8 +2638,8 @@ impl LocalEqueue {
 }
 
 impl<C: Clock> LocalEqueue<C> {
-    pub fn delta<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
-        self.0.delta(id)
+    pub fn delta_id<Δ: TryFromDelta>(&self, id: Id) -> Option<Δ> {
+        self.0.delta_id(id)
     }
 }
 
@@ -2650,18 +2650,18 @@ impl<C> LocalEqueue<C> {
 }
 
 impl<C: Clock+Signal> LocalEqueue<C> {
-    pub fn pend(&self, id: Id) -> bool {
-        self.0.pend(id)
+    pub fn post_id(&self, id: Id) -> bool {
+        self.0.post_id(id)
     }
 }
 
 impl<C: Clock> LocalEqueue<C> {
-    pub fn next_delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
-        self.0.next_delta()
+    pub fn delta<Δ: TryFromDelta>(&self) -> Option<Δ> {
+        self.0.delta()
     }
 
-    pub fn dispatch(&self) {
-        self.0.dispatch()
+    pub fn dispatch_ready(&self) {
+        self.0.dispatch_ready()
     }
 }
 
@@ -2672,8 +2672,8 @@ impl<C: Clock+Sema> LocalEqueue<C> {
     }
 
     #[inline]
-    pub fn dispatch_forever(&self) -> Dispatch {
-        self.0.dispatch_forever()
+    pub fn dispatch(&self) -> Dispatch {
+        self.0.dispatch()
     }
 }
 
@@ -2936,8 +2936,8 @@ impl<C: Clock+AsyncSema> LocalEqueue<C> {
     }
 
     #[inline]
-    pub async fn dispatch_forever_async(&self) -> Dispatch {
-        self.0.dispatch_forever_async().await
+    pub async fn dispatch_async(&self) -> Dispatch {
+        self.0.dispatch_async().await
     }
 }
 

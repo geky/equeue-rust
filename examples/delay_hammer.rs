@@ -37,7 +37,7 @@ fn main() {
     {
         let q = q.clone();
         threads.push(thread::spawn(move || {
-            q.dispatch_forever();
+            q.dispatch();
             unreachable!();
         }));
     }
@@ -102,7 +102,7 @@ fn main() {
             }
         };
 
-        print!("\x1b[K  q "); print_slices(0); println!("  pending: {} ({} B)", usage.pending, usage.pending_bytes);
+        print!("\x1b[K  q "); print_slices(0); println!("  posted: {} ({} B)", usage.posted, usage.posted_bytes);
         print!("\x1b[K    "); print_slices(1); println!("  alloced: {} ({} B)", usage.alloced, usage.alloced_bytes);
         print!("\x1b[K    "); print_slices(2); println!("  free: {} ({} B)", usage.free, usage.free_bytes);
 
@@ -133,16 +133,16 @@ fn main() {
 
         print!("\x1b[K  [");
         for _ in 0
-            .. (opt.width-2)*usage.pending_bytes / usage.slab_total
+            .. (opt.width-2)*usage.posted_bytes / usage.slab_total
         {
             print!("|");
         }
-        for _ in (opt.width-2)*usage.pending_bytes / usage.slab_total
-            .. (opt.width-2)*(usage.pending_bytes+usage.alloced_bytes) / usage.slab_total
+        for _ in (opt.width-2)*usage.posted_bytes / usage.slab_total
+            .. (opt.width-2)*(usage.posted_bytes+usage.alloced_bytes) / usage.slab_total
         {
             print!("#");
         }
-        for _ in (opt.width-2)*(usage.alloced_bytes+usage.pending_bytes) / usage.slab_total
+        for _ in (opt.width-2)*(usage.alloced_bytes+usage.posted_bytes) / usage.slab_total
             .. (opt.width-2)*usage.slab_fragmented / usage.slab_total
         {
             print!(":");

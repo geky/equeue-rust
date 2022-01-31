@@ -98,16 +98,16 @@ fn main() {
         
         print!("\x1b[K  [");
         for _ in 0
-            .. (opt.width-2)*usage.pending_bytes / usage.slab_total
+            .. (opt.width-2)*usage.posted_bytes / usage.slab_total
         {
             print!("|");
         }
-        for _ in (opt.width-2)*usage.pending_bytes / usage.slab_total
-            .. (opt.width-2)*(usage.pending_bytes+usage.alloced_bytes) / usage.slab_total
+        for _ in (opt.width-2)*usage.posted_bytes / usage.slab_total
+            .. (opt.width-2)*(usage.posted_bytes+usage.alloced_bytes) / usage.slab_total
         {
             print!("#");
         }
-        for _ in (opt.width-2)*(usage.alloced_bytes+usage.pending_bytes) / usage.slab_total
+        for _ in (opt.width-2)*(usage.alloced_bytes+usage.posted_bytes) / usage.slab_total
             .. (opt.width-2)*usage.slab_fragmented / usage.slab_total
         {
             print!(":");

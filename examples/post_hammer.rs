@@ -38,7 +38,7 @@ fn main() {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             loop {
-                q.dispatch();
+                q.dispatch_ready();
                 thread::sleep(Duration::from_nanos(1000*opt.scale));
             }
         }));
@@ -84,15 +84,15 @@ fn main() {
         // render this thing
         print!("\x1b[K  q ");
         for i in 0..opt.width-2 {
-            if usage.pending > 2*i+1 {
+            if usage.posted > 2*i+1 {
                 print!(":");
-            } else if usage.pending > 2*i {
+            } else if usage.posted > 2*i {
                 print!("'");
             } else {
                 print!(" ");
             }
         }
-        println!("  pending: {} ({} B)", usage.pending, usage.pending_bytes);
+        println!("  posted: {} ({} B)", usage.posted, usage.posted_bytes);
 
         let print_buckets = |row: usize| {
             for &bucket in buckets.iter().take((opt.width-2)/2) {
@@ -121,16 +121,16 @@ fn main() {
 
         print!("\x1b[K  [");
         for _ in 0
-            .. (opt.width-2)*usage.pending_bytes / usage.slab_total
+            .. (opt.width-2)*usage.posted_bytes / usage.slab_total
         {
             print!("|");
         }
-        for _ in (opt.width-2)*usage.pending_bytes / usage.slab_total
-            .. (opt.width-2)*(usage.pending_bytes+usage.alloced_bytes) / usage.slab_total
+        for _ in (opt.width-2)*usage.posted_bytes / usage.slab_total
+            .. (opt.width-2)*(usage.posted_bytes+usage.alloced_bytes) / usage.slab_total
         {
             print!("#");
         }
-        for _ in (opt.width-2)*(usage.alloced_bytes+usage.pending_bytes) / usage.slab_total
+        for _ in (opt.width-2)*(usage.alloced_bytes+usage.posted_bytes) / usage.slab_total
             .. (opt.width-2)*usage.slab_fragmented / usage.slab_total
         {
             print!(":");

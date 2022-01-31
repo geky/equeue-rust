@@ -110,11 +110,11 @@ fn test_race_post() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch_ready();
         })
     };
 
@@ -161,11 +161,11 @@ fn test_race_post_order() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch_ready();
         })
     };
 
@@ -219,7 +219,7 @@ fn test_race_delay() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
@@ -343,7 +343,7 @@ fn test_race_cancel_dispatch() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
@@ -393,11 +393,11 @@ fn test_race_cancel_periodic() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch_ready();
         })
     };
 
@@ -456,11 +456,11 @@ fn test_race_repost() {
         let done = done.clone();
         thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch_ready();
         })
     };
 
@@ -473,7 +473,7 @@ fn test_race_repost() {
         let q = q.clone();
         threads.push(thread::spawn(move || {
             for _ in 0..100 {
-                q.pend(id);
+                q.post_id(id);
             }
         }));
     }
@@ -507,11 +507,11 @@ fn test_race_dispatch_multiple() {
         let done = done.clone();
         dispatch_threads.push(thread::spawn(move || {
             while !done.load(Ordering::SeqCst) {
-                q.dispatch();
+                q.dispatch_ready();
             }
 
             // make sure we catch any lingering events
-            q.dispatch();
+            q.dispatch_ready();
         }));
     }
 

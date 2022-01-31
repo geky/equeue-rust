@@ -14,7 +14,7 @@ fn test_post() {
     q.call(|| {
         count.fetch_add(1, Ordering::SeqCst);
     }).unwrap();
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
     println!("usage: {:#?}", q.usage());
@@ -30,7 +30,7 @@ fn test_post_many() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -47,7 +47,7 @@ fn test_post_order() {
             count.lock().unwrap().push(i)
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(
         count.lock().unwrap().deref(),
@@ -69,7 +69,7 @@ fn test_post_recursive() {
     q.call(|| inc(&q, &count)).unwrap();
 
     for i in 0..1000 {
-        q.dispatch();
+        q.dispatch_ready();
         assert_eq!(count.load(Ordering::SeqCst), i+1);
     }
 

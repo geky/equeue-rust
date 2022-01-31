@@ -42,7 +42,7 @@ fn test_misc_buffer() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -64,7 +64,7 @@ fn test_misc_config() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -113,7 +113,7 @@ fn test_misc_custom_clock() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -152,7 +152,7 @@ fn test_misc_custom_clock_no_sema() {
             count.fetch_add(1, Ordering::SeqCst);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
     println!("usage: {:#?}", q.usage());
@@ -178,13 +178,13 @@ fn test_misc_break() {
     }).unwrap();
 
     assert_eq!(
-        q.dispatch_forever(),
+        q.dispatch(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 30);
 
     assert_eq!(
-        q.dispatch_forever(),
+        q.dispatch(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 50);
@@ -215,7 +215,7 @@ fn test_misc_break_busy() {
     q.break_();
 
     assert_eq!(
-        q.dispatch_forever(),
+        q.dispatch(),
         Dispatch::Break,
     );
     assert_eq!(count.load(Ordering::SeqCst), 10);
@@ -333,31 +333,31 @@ fn test_misc_handles() {
         );
     }
 
-    // cancel half, pend the other half
+    // cancel half, post the other half
     for (i, handle) in handles.iter().enumerate() {
         if i % 2 == 0 {
-            assert!(handle.pend());
+            assert!(handle.post());
         } else {
             assert!(handle.cancel());
         }
     }
 
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    q.dispatch();
+    q.dispatch_ready();
     assert_eq!(count.load(Ordering::SeqCst), 50);
 
     // no drop another half
     handles.truncate(50);
 
     assert_eq!(count.load(Ordering::SeqCst), 50);
-    q.dispatch();
+    q.dispatch_ready();
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     // and release the rest
     drop(handles);
 
     assert_eq!(count.load(Ordering::SeqCst), 75);
-    q.dispatch();
+    q.dispatch_ready();
     assert_eq!(count.load(Ordering::SeqCst), 75);
 
     println!("usage: {:#?}", q.usage());
@@ -397,7 +397,7 @@ fn test_misc_local() {
             count.set(count.get() + 1);
         }).unwrap();
     }
-    q.dispatch();
+    q.dispatch_ready();
 
     assert_eq!(count.get(), 1000);
     println!("usage: {:#?}", q.usage());
