@@ -12,7 +12,6 @@ debug-assertions = true
 default = ["std", "alloc"]
 std = ["alloc"]
 alloc = []
-raw = []
 
 # integer type requirements
 #

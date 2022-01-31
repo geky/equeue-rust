@@ -33,7 +33,7 @@ impl<F: FnOnce()> PostOnce for F {
 }
 
 /// Post-static trait, a post that does not reclaim memory
-pub trait PostStatic<E>: Sized {
+pub trait PostStatic<E> {
     fn post_static(self_: E);
 }
 

@@ -611,12 +611,13 @@ impl Ebuf {
         &mut *self.data_mut_ptr()
     }
 
-    unsafe fn from_data_mut_ptr<'a, T>(ptr: *mut T) -> Option<&'a mut Ebuf> {
-        if !ptr.is_null() {
-            Some(&mut *(ptr as *mut Ebuf).sub(1))
-        } else {
-            None
-        }
+    unsafe fn from_data_mut_ptr<'a, T: ?Sized + 'a>(ptr: *mut T) -> Option<&'a mut Ebuf> {
+        ptr.as_mut()
+            .map(|ref_| Ebuf::from_data_mut(ref_))
+    }
+
+    unsafe fn from_data_mut<'a, T: ?Sized>(ref_: &'a mut T) -> &'a mut Ebuf {
+        &mut *(ref_ as *mut _ as *mut Ebuf).sub(1)
     }
 
     // we can "claim" an Ebuf once we remove it from shared structures,
@@ -1668,71 +1669,31 @@ impl<C: Signal> Equeue<C> {
     }
 }
 
-#[cfg(feature="raw")]
-impl<C: Clock+Signal> Equeue<C> {
-    // Handling of raw allocations
-    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
-        match self.alloc_(layout) {
-            Ok(e) => e.data_mut_ptr(),
-            Err(_) => ptr::null_mut(),
-        }
-    }
-
-    pub unsafe fn dealloc_raw(&self, e: *mut u8, _layout: Layout) {
-        debug_assert!(e.is_null() || self.contains_raw(e));
-        let e = match Ebuf::from_data_mut_ptr(e) {
-            Some(e) => e,
-            None => return, // do nothing
+// Raw allocations
+impl<C> Equeue<C> {
+    pub unsafe fn alloc_raw(
+        &self,
+        layout: Layout,
+        cb: fn(*mut u8),
+        drop: fn(*mut u8)
+    ) -> *mut u8 {
+        let e = match self.alloc_(layout) {
+            Ok(e) => e,
+            Err(_) => {
+                return ptr::null_mut();
+            }
         };
 
-        // clean up ebuf
-        self.dealloc_(e);
-    }
-
-    pub fn contains_raw(&self, e: *mut u8) -> bool {
-        match unsafe { Ebuf::from_data_mut_ptr(e) } {
-            Some(e) => self.contains(e),
-            None => false,
-        }
-    }
-
-    pub unsafe fn set_raw_delay<Δ: TryIntoDelta>(&self, e: *mut u8, delay: Δ) {
-        debug_assert!(self.contains_raw(e));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.target = delay.try_into_delta(self.clock.frequency()).ok()
-            .expect("equeue: delta overflow")
-            .as_tick();
-    }
-
-    pub unsafe fn set_raw_period<Δ: TryIntoDelta>(&self, e: *mut u8, period: Option<Δ>) {
-        debug_assert!(self.contains_raw(e));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.period = period.map(|period|
-            period.try_into_delta(self.clock.frequency()).ok()
-                .expect("equeue: delta overflow")
-        );
-    }
-
-    pub unsafe fn set_raw_static(&self, e: *mut u8, static_: bool) {
-        debug_assert!(self.contains_raw(e));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.info.store(e.info.load().set_static(static_));
-    }
-
-    pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
-        debug_assert!(self.contains_raw(e));
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
-        e.drop = Some(drop);
-    }
-
-    pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
-        debug_assert!(self.contains_raw(e));
-        let mut e = Ebuf::from_data_mut_ptr(e).unwrap();
         e.cb = Some(cb);
+        e.drop = Some(drop);
 
-        let id = Id::new(self, e.info.load().id(), e);
-        self.post_(e, e.target.as_delta().unwrap());
-        id
+        e.data_mut_ptr()
+    }
+
+    pub unsafe fn dealloc_raw(&self, e: *mut u8) {
+        let e = Ebuf::from_data_mut_ptr(e).unwrap();
+        debug_assert!(self.contains(e));
+        self.dealloc_(e);
     }
 }
 
@@ -1770,6 +1731,7 @@ impl Default for Id {
         Id::null()
     }
 }
+
 
 /// A strongly-typed alternative to Id which implicitly cancels the
 /// event when dropped
@@ -1821,41 +1783,6 @@ impl<C> Drop for Handle<'_, C> {
     }
 }
 
-
-// TODO can we make Event accept ?Sized? The issue is not the allocation, 
-// the issue is that we'd need to store a fat pointer somehow
-/// Event handle
-pub struct Event<
-    'a,
-    T,
-    #[cfg(feature="std")] C=SysClock,
-    #[cfg(not(feature="std"))] C,
-> {
-    q: &'a Equeue<C>,
-    e: &'a mut Ebuf,
-    once: bool,
-    _phantom: PhantomData<&'a mut T>,
-}
-
-impl<T: Debug, C> Debug for Event<'_, T, C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Event")
-            .field(&self.e)
-            .field(&self.deref())
-            .finish()
-    }
-}
-
-impl<'a, T, C> Event<'a, T, C> {
-    fn new(q: &'a Equeue<C>, e: &'a mut Ebuf, once: bool) -> Event<'a, T, C> {
-        Event {
-            q: q,
-            e: e,
-            once: once,
-            _phantom: PhantomData
-        }
-    }
-}
 
 // event waker vtable callbacks
 unsafe fn event_waker_clone<C: Clock+Signal>(e: *const ()) -> RawWaker {
@@ -1922,7 +1849,56 @@ impl<C: Clock+Signal> Equeue<C> {
     );
 }
 
-impl<C: Clock+Signal> Equeue<C> {
+
+// TODO can we make Event accept ?Sized? The issue is not the allocation, 
+// the issue is that we'd need to store a fat pointer somehow
+/// Event handle
+#[derive(Debug)]
+pub struct Event<
+    'a,
+    T: ?Sized,
+    #[cfg(feature="std")] C=SysClock,
+    #[cfg(not(feature="std"))] C,
+> {
+    q: &'a Equeue<C>,
+    t: &'a mut T,
+}
+
+impl<'a, T, C> Event<'a, T, C> {
+    fn new(q: &'a Equeue<C>, e: &'a mut Ebuf) -> Event<'a, T, C> {
+        Event {
+            q: q,
+            t: unsafe { e.data_mut() },
+        }
+    }
+}
+
+impl<'a, T: ?Sized, C> Event<'a, T, C> {
+    fn ebuf<'b>(&'b mut self) -> &'b mut Ebuf {
+        unsafe { Ebuf::from_data_mut(self.t) }
+    }
+}
+
+impl<'a, T: ?Sized, C> Event<'a, T, C> {
+    pub fn into_raw(self) -> (&'a Equeue<C>, *mut T) {
+        let raw = (self.q, self.t as *mut T);
+        forget(self);
+        raw
+    }
+
+    pub unsafe fn from_raw(q: &'a Equeue<C>, t: *mut T) -> Event<'a, T, C> {
+        // TODO track once?
+        Event {
+            q: q,
+            t: &mut *t,
+        }
+    }
+}
+
+impl<C> Equeue<C> {
+    // TODO rename me
+    // TODO actually, consolidate with alloc_raw above? We don't need clock/signal traits here
+    // TODO wait, where _do_ we need clock+signal?
     pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
@@ -1939,7 +1915,7 @@ impl<C: Clock+Signal> Equeue<C> {
         e.cb = Some(cb_thunk::<T>);
         e.drop = Some(drop_thunk::<T>);
 
-        Ok(Event::new(self, e, false))
+        Ok(Event::new(self, e))
     }
 
     pub fn alloc_once<'a, T: PostOnce + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
@@ -1966,7 +1942,7 @@ impl<C: Clock+Signal> Equeue<C> {
 
         // mark as a one-time event so we panic if we try to enqueue
         // multiple times
-        Ok(Event::new(self, e, true))
+        Ok(Event::new(self, e))
     }
 
     pub fn alloc_static<'a, T: PostStatic<Event<'a, T, C>> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
@@ -1977,7 +1953,7 @@ impl<C: Clock+Signal> Equeue<C> {
         // cb/drop thunks
         fn cb_thunk<'a, T: PostStatic<Event<'a, T, C>> + 'a, C: 'a>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
-            let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
+            let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e);
             T::post_static(e);
         }
 
@@ -1990,9 +1966,11 @@ impl<C: Clock+Signal> Equeue<C> {
 
         // mark as static
         e.info.store(e.info.load().set_static(true));
-        Ok(Event::new(self, e, false))
+        Ok(Event::new(self, e))
     }
+}
 
+impl<C: Clock+Signal> Equeue<C> {
     pub fn alloc_future<'a, T: Future<Output=()> + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
@@ -2001,7 +1979,7 @@ impl<C: Clock+Signal> Equeue<C> {
         fn cb_thunk<T: Future<Output=()>, C: Clock+Signal>(e: *mut u8) {
             let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
             debug_assert!(e.info.load().static_());
-            let mut e = Event::<T, C>::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e, false);
+            let mut e = Event::<T, C>::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e);
 
             // setup waker
             let waker = unsafe {
@@ -2032,42 +2010,49 @@ impl<C: Clock+Signal> Equeue<C> {
 
         // mark as static
         e.info.store(e.info.load().set_static(true));
-        Ok(Event::new(self, e, false))
+        Ok(Event::new(self, e))
     }
 }
 
-impl<'a, T, C: Clock+Signal> Event<'a, T, C> {
+impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
     pub fn delay<Δ: TryIntoDelta>(mut self, delay: Δ) -> Self {
-        self.e.target = delay.try_into_delta(self.q.clock.frequency()).ok()
+        self.ebuf().target = delay.try_into_delta(self.q.clock.frequency()).ok()
             .expect("equeue: delta overflow")
             .as_tick();
         self
     }
 
     pub fn period<Δ: TryIntoDelta>(mut self, period: Option<Δ>) -> Self {
-        // can't set period for PostOnce events 
-        assert!(!self.once);
-        self.e.period = period.map(|period|
+//      TODO this is unsound without trait specialization
+//        // can't set period for PostOnce events 
+//        assert!(!self.once);
+        self.ebuf().period = period.map(|period|
             period.try_into_delta(self.q.clock.frequency()).ok()
                 .expect("equeue: delta overflow")
         );
         self
     }
 
-    pub fn static_(self, static_: bool) -> Self {
-        // can't make PostOnce events static
-        assert!(!self.once);
-        self.e.info.store(self.e.info.load().set_static(static_));
+    pub fn static_(mut self, static_: bool) -> Self {
+//      TODO this is unsound without trait specialization
+//        // can't make PostOnce events static
+//        assert!(!self.once);
+        let e = self.ebuf();
+        e.info.store(e.info.load().set_static(static_));
         self
     }
 
     // note this consumes the Event, otherwise we'd risk multiple access
     // if the id is pended while we still have a mutable reference
-    pub fn into_id(self) -> Id {
-        // mark as no longer in use, allowing external pends
-        self.e.info.store(self.e.info.load().set_pending(Pending::Alloced));
+    pub fn into_id(mut self) -> Id {
+        let q = self.q;
+        let e = self.ebuf();
 
-        let id = Id::new(self.q, self.e.info.load().id(), self.e);
+        // mark as no longer in use, allowing external pends
+        let info = e.info.load();
+        e.info.store(info.set_pending(Pending::Alloced));
+
+        let id = Id::new(q, info.id(), e);
         forget(self);
         id
     }
@@ -2076,11 +2061,14 @@ impl<'a, T, C: Clock+Signal> Event<'a, T, C> {
         Handle::new(self.q, self.into_id())
     }
 
-    pub fn post(self) -> Id {
+    pub fn post(mut self) -> Id {
         // enqueue and then forget the event, it's up to equeue to
         // drop the event later
-        let id = Id::new(self.q, self.e.info.load().id(), self.e);
-        self.q.post_(self.e, self.e.target.as_delta().unwrap());
+        let q = self.q;
+        let e = self.ebuf();
+
+        let id = Id::new(q, e.info.load().id(), e);
+        q.post_(e, e.target.as_delta().unwrap());
         forget(self);
         id
     }
@@ -2090,35 +2078,35 @@ impl<'a, T, C: Clock+Signal> Event<'a, T, C> {
     }
 }
 
-impl<T, C> Drop for Event<'_, T, C> {
+impl<T: ?Sized, C> Drop for Event<'_, T, C> {
     fn drop(&mut self) {
         // clean up ebuf, note this runs the destructor internally
-        self.q.dealloc_(self.e);
+        self.q.dealloc_(self.ebuf());
     }
 }
 
-impl<T, C> Deref for Event<'_, T, C> {
+impl<T: ?Sized, C> Deref for Event<'_, T, C> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { self.e.data_ref() }
+        &self.t
     }
 }
 
-impl<T, C> DerefMut for Event<'_, T, C> {
+impl<T: ?Sized, C> DerefMut for Event<'_, T, C> {
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { self.e.data_mut() }
+        &mut self.t
     }
 }
 
-impl<T, C> AsRef<T> for Event<'_, T, C> {
+impl<T: ?Sized, C> AsRef<T> for Event<'_, T, C> {
     fn as_ref(&self) -> &T {
-        unsafe { self.e.data_ref() }
+        &self.t
     }
 }
 
-impl<T, C> AsMut<T> for Event<'_, T, C> {
+impl<T: ?Sized, C> AsMut<T> for Event<'_, T, C> {
     fn as_mut(&mut self) -> &mut T {
-        unsafe { self.e.data_mut() }
+        &mut self.t
     }
 }
 
@@ -2695,48 +2683,29 @@ impl<C: Signal> LocalEqueue<C> {
     }
 }
 
-#[cfg(feature="raw")]
-impl<C: Clock+Signal> LocalEqueue<C> {
-    // Handling of raw allocations
-    pub unsafe fn alloc_raw(&self, layout: Layout) -> *mut u8 {
-        self.0.alloc_raw(layout)
+// Raw allocations
+impl<C> LocalEqueue<C> { 
+    pub unsafe fn alloc_raw(
+        &self,
+        layout: Layout,
+        cb: fn(*mut u8),
+        drop: fn(*mut u8)
+    ) -> *mut u8 {
+        self.0.alloc_raw(layout, cb, drop)
     }
 
-    pub unsafe fn dealloc_raw(&self, e: *mut u8, layout: Layout) {
-        self.0.dealloc_raw(e, layout)
+    pub unsafe fn dealloc_raw(&self, e: *mut u8) {
+        self.0.dealloc_raw(e)
     }
-
-    pub fn contains_raw(&self, e: *mut u8) -> bool {
-        self.0.contains_raw(e)
-    }
-
-    pub unsafe fn set_raw_delay<Δ: TryIntoDelta>(&self, e: *mut u8, delay: Δ) {
-        self.0.set_raw_delay(e, delay)
-    }
-
-   pub unsafe fn set_raw_period<Δ: TryIntoDelta>(&self, e: *mut u8, period: Option<Δ>) {
-        self.0.set_raw_period(e, period)
-   }
-
-   pub unsafe fn set_raw_static(&self, e: *mut u8, static_: bool) {
-        self.0.set_raw_static(e, static_)
-   }
-
-   pub unsafe fn set_raw_drop(&self, e: *mut u8, drop: fn(*mut u8)) {
-        self.0.set_raw_drop(e, drop)
-   }
-
-   pub unsafe fn post_raw(&self, cb: fn(*mut u8), e: *mut u8) -> Id {
-        self.0.post_raw(cb, e)
-   }
 }
+
 
 // A wrapper to fake Send for reusing the Equeue implementation
 #[derive(Debug)]
 #[repr(transparent)]
-struct IgnoreSend<T>(T);
+struct IgnoreSend<T: ?Sized>(T);
 
-unsafe impl<T> Send for IgnoreSend<T> {}
+unsafe impl<T: ?Sized> Send for IgnoreSend<T> {}
 
 impl<T: Post> Post for IgnoreSend<T> {
     fn post(&mut self) {
@@ -2763,45 +2732,63 @@ impl<T: Future<Output=()>> Future for IgnoreSend<T> {
     }
 }
 
+
 /// Non-Send/Sync Event Handle
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct LocalEvent<
     'a,
-    T,
+    T: ?Sized,
     #[cfg(feature="std")] C=SysClock,
     #[cfg(not(feature="std"))] C,
->(Event<'a, IgnoreSend<T>, C>, PhantomData<*const ()>);
+>(Event<'a, T, C>, PhantomData<*const ()>);
 
-impl<C: Clock+Signal> LocalEqueue<C> {
-    pub fn alloc<'a, T: Post>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
-        Ok(LocalEvent(self.0.alloc(IgnoreSend(t))?, PhantomData))
+impl<'a, T: ?Sized, C> LocalEvent<'a, T, C> {
+    pub fn into_raw(self) -> (&'a LocalEqueue<C>, *mut T) {
+        let (q, t) = self.0.into_raw();
+        (unsafe { &mut *(q as *const _ as *mut LocalEqueue<C>) }, t)
     }
 
-    pub fn alloc_once<'a, T: PostOnce>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
-        Ok(LocalEvent(self.0.alloc_once(IgnoreSend(t))?, PhantomData))
-    }
-
-    pub fn alloc_static<'a, T: PostStatic<LocalEvent<'a, T, C>>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
-        Ok(LocalEvent(self.0.alloc_static(IgnoreSend(t))?, PhantomData))
-    }
-
-    pub fn alloc_future<'a, T: Future<Output=()>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
-        Ok(LocalEvent(self.0.alloc_future(IgnoreSend(t))?, PhantomData))
+    pub unsafe fn from_raw(q: &'a LocalEqueue<C>, t: *mut T) -> LocalEvent<'a, T, C> {
+        LocalEvent(Event::from_raw(&q.0, t), PhantomData)
     }
 }
 
-impl<'a, T, C: Clock+Signal> LocalEvent<'a, T, C> {
+impl<C> LocalEqueue<C> {
+    pub fn alloc<'a, T: Post>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        let (q, e) = self.0.alloc(IgnoreSend(t))?.into_raw();
+        Ok(LocalEvent(unsafe { Event::from_raw(q, e as *mut T) }, PhantomData))
+    }
+
+    pub fn alloc_once<'a, T: PostOnce>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        let (q, e) = self.0.alloc_once(IgnoreSend(t))?.into_raw();
+        Ok(LocalEvent(unsafe { Event::from_raw(q, e as *mut T) }, PhantomData))
+    }
+
+    pub fn alloc_static<'a, T: PostStatic<LocalEvent<'a, T, C>>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        let (q, e) = self.0.alloc_static(IgnoreSend(t))?.into_raw();
+        Ok(LocalEvent(unsafe { Event::from_raw(q, e as *mut T) }, PhantomData))
+    }
+}
+
+impl<C: Clock+Signal> LocalEqueue<C> {
+    pub fn alloc_future<'a, T: Future<Output=()>>(&'a self, t: T) -> Result<LocalEvent<'a, T, C>, Error> {
+        let (q, e) = self.0.alloc_future(IgnoreSend(t))?.into_raw();
+        Ok(LocalEvent(unsafe { Event::from_raw(q, e as *mut T) }, PhantomData))
+    }
+}
+
+impl<'a, T: ?Sized, C: Clock+Signal> LocalEvent<'a, T, C> {
     pub fn delay<Δ: TryIntoDelta>(self, delay: Δ) -> Self {
-        unsafe { transmute(self.0.delay(delay)) }
+        LocalEvent(self.0.delay(delay), PhantomData)
     }
 
     pub fn period<Δ: TryIntoDelta>(self, period: Option<Δ>) -> Self {
-        unsafe { transmute(self.0.period(period)) }
+        LocalEvent(self.0.period(period), PhantomData)
     }
 
     pub fn static_(self, static_: bool) -> Self {
-        unsafe { transmute(self.0.static_(static_)) }
+        LocalEvent(self.0.static_(static_), PhantomData)
     }
 
     pub fn into_id(self) -> Id {
@@ -2821,28 +2808,28 @@ impl<'a, T, C: Clock+Signal> LocalEvent<'a, T, C> {
     }
 }
 
-impl<T, C> Deref for LocalEvent<'_, T, C> {
+impl<T: ?Sized, C> Deref for LocalEvent<'_, T, C> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.0.deref().0
+        self.0.deref()
     }
 }
 
-impl<T, C> DerefMut for LocalEvent<'_, T, C> {
+impl<T: ?Sized, C> DerefMut for LocalEvent<'_, T, C> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.0.deref_mut().0
+        self.0.deref_mut()
     }
 }
 
-impl<T, C> AsRef<T> for LocalEvent<'_, T, C> {
+impl<T: ?Sized, C> AsRef<T> for LocalEvent<'_, T, C> {
     fn as_ref(&self) -> &T {
-        &self.0.as_ref().0
+        self.0.as_ref()
     }
 }
 
-impl<T, C> AsMut<T> for LocalEvent<'_, T, C> {
+impl<T: ?Sized, C> AsMut<T> for LocalEvent<'_, T, C> {
     fn as_mut(&mut self) -> &mut T {
-        &mut self.0.as_mut().0
+        self.0.as_mut()
     }
 }
 

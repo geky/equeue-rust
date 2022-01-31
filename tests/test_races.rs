@@ -29,7 +29,7 @@ fn test_race_alloc_unique() {
             let mut es = vec![];
             let layout = Layout::from_size_align(4, 1).unwrap();
             for _ in 0..100 {
-                let e = unsafe { q.alloc_raw(layout) };
+                let e = unsafe { q.alloc_raw(layout, |_|{}, |_|{}) };
                 assert!(!e.is_null());
                 es.push(e);
             }
@@ -60,9 +60,9 @@ fn test_race_alloc_multiple() {
         threads.push(thread::spawn(move || {
             let layout = Layout::from_size_align(10, 1).unwrap();
             for _ in 0..1000 {
-                let e = unsafe { q.alloc_raw(layout) };
+                let e = unsafe { q.alloc_raw(layout, |_|{}, |_|{}) };
                 assert!(!e.is_null());
-                unsafe { q.dealloc_raw(e, layout) };
+                unsafe { q.dealloc_raw(e) };
             }
         }));
     }
@@ -84,9 +84,9 @@ fn test_race_alloc_many() {
         threads.push(thread::spawn(move || {
             for _ in 0..1000 {
                 let layout = Layout::from_size_align(10*i, 1).unwrap();
-                let e = unsafe { q.alloc_raw(layout) };
+                let e = unsafe { q.alloc_raw(layout, |_|{}, |_|{}) };
                 assert!(!e.is_null());
-                unsafe { q.dealloc_raw(e, layout) };
+                unsafe { q.dealloc_raw(e) };
             }
         }));
     }

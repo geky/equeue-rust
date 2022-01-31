@@ -1,5 +1,6 @@
 
 use equeue::Equeue;
+use equeue::Event;
 
 use std::thread;
 use std::alloc::Layout;
@@ -52,19 +53,15 @@ fn main() {
             loop {
                 thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
 
-                // we need to use the raw APIs for dynamic sizes
+                // choose a random size, we need to use the raw APIs for dynamic sizes
                 let layout = Layout::from_size_align(rng.gen_range(1..8192), 1).unwrap();
-                let e = unsafe { q.alloc_raw(layout) };
+                let e = unsafe { q.alloc_raw(layout, |_|{}, |_|{}) };
                 if e.is_null() {
                     thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
                     continue;
                 }
-
-                fn cb(_data: *mut u8) {
-                    // do nothing
-                }
-
-                unsafe { q.post_raw(cb, e); }
+                unsafe { Event::from_raw(&q, e) }
+                    .post();
             }
         }));
     }

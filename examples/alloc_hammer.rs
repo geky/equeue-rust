@@ -40,12 +40,17 @@ fn main() {
             loop {
                 thread::sleep(Duration::from_nanos(rng.gen_range(0..1000*opt.scale)));
 
+                // choose a random size, we need to use the raw APIs for dynamic sizes
                 let layout = Layout::from_size_align(rng.gen_range(1..8192), 1).unwrap();
-                let e = unsafe { q.alloc_raw(layout) };
+                let e = unsafe { q.alloc_raw(layout, |_|{}, |_|{}) };
+                if e.is_null() {
+                    thread::sleep(Duration::from_nanos(rng.gen_range(0..2000*opt.scale)));
+                    continue;
+                }
 
                 thread::sleep(Duration::from_nanos(rng.gen_range(0..1000*opt.scale)));
 
-                unsafe { q.dealloc_raw(e, layout) };
+                unsafe { q.dealloc_raw(e) };
             }
         }));
     }
