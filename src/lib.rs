@@ -1323,6 +1323,32 @@ impl<C> Equeue<C> {
             self.unqueue_(Right(mark), State::InFlight).1
         }))
     }
+
+    fn update_<F>(&self, e: &Ebuf, f: F) -> Info
+    where
+        F: FnOnce(Info) -> Option<Info>
+    {
+        let guard = self.lock.lock();
+
+        let info = e.info.load();
+        if let Some(info_) = f(info) {
+            e.info.store(info_);
+        }
+        info
+    }
+
+    fn update_break_<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(bool) -> Option<bool>
+    {
+        let guard = self.lock.lock();
+
+        let break_ = self.break_.load();
+        if let Some(break__) = f(break_) {
+            self.break_.store(break__);
+        }
+        break_
+    }
 }
 
 impl<C: Clock> Equeue<C> {
@@ -1349,10 +1375,10 @@ impl<C: Clock> Equeue<C> {
         // note that periodic events are always pending, we load period
         // first since it is not necessarily atomic
         match info.state() {
-            State::Alloced => None,
-            State::InQueue => Some(target - self.now()),
+            State::Alloced  => None,
+            State::InQueue  => Some(target - self.now()),
             State::InFlight => period,
-            State::Nested => Some(Delta::zero()),
+            State::Nested   => Some(Delta::zero()),
             State::Canceled => None,
         }
     }
@@ -1418,8 +1444,8 @@ impl<C: Clock+Signal> Equeue<C> {
             None => return false,
         };
 
-        let info = e.info.load();
-        if info.id() != id.id {
+        // still the same event?
+        if e.info.load().id() != id.id {
             return false;
         }
 
@@ -1428,46 +1454,25 @@ impl<C: Clock+Signal> Equeue<C> {
             // be pending an event that's already pending. This means several
             // more corner cases to handle.
             let now = self.now();
-            let reenqueue = {
-                let guard = self.lock.lock();
+            let info = self.update_(e, |info| {
+                match info.state() {
+                    // still the same event?
+                    _ if info.id() != id.id           => None,
+                    State::Alloced                    => Some(info.set_state(State::InFlight)),
+                    State::InFlight if info.static_() => Some(info.set_state(State::Nested)),
+                    _                                 => None,
+                }
+            });
 
+            match info.state() {
                 // still the same event?
-                let info = e.info.load();
-                if info.id() != id.id {
+                _ if info.id() != id.id => {
                     return false;
                 }
-
-                match info.state() {
-                    State::Alloced => {
-                        // if we're alloced we can just enqueue, make sure to mark
-                        // and claim the event first
-                        e.info.store(info.set_state(State::InFlight));
-                        Left(unsafe { e.claim() })
-                    }
-                    State::InQueue if now < e.target => {
-                        // we're pending, but in the future, we want to move this
-                        // to execute immediately
-                        Right(e)
-                    }
-                    State::InFlight if info.static_() => {
-                        // someone else is dispatching, just make sure we mark that
-                        // we are interested in the event being repended
-                        e.info.store(info.set_state(State::Nested));
-                        return true;
-                    }
-                    State::InQueue | State::Nested => {
-                        // do nothing, the event is already pending
-                        return true;
-                    }
-                    State::InFlight | State::Canceled => {
-                        return false;
-                    }
-                }
-            };
-
-            match reenqueue {
-                Left(e) => {
-                    // reenqueue
+                State::Alloced => {
+                    // if we're alloced we can just enqueue, make sure to mark
+                    // and claim the event first
+                    let e = unsafe { e.claim() };
                     match self.enqueue_(e, now, now) {
                         Ok(delta_changed) => {
                             // signal queue has changed
@@ -1484,9 +1489,24 @@ impl<C: Clock+Signal> Equeue<C> {
                         }
                     }
                 }
-                Right(e) => {
-                    // try to unqueue and continue the loop to reenqueue sooner
+                State::InQueue if now < e.target => {
+                    // we're pending, but in the future, we want to move this
+                    // to execute immediately, try to unqueue and continue the
+                    // loop to reenqueue
                     self.unqueue_(Left((e, id.id)), State::InFlight);
+                }
+                State::InFlight if info.static_() => {
+                    // someone else is dispatching, just make sure we mark that
+                    // we are interested in the event being repended
+                    return true;
+                }
+                State::InQueue | State::Nested => {
+                    // do nothing, the event is already pending
+                    return true;
+                }
+                State::InFlight | State::Canceled => {
+                    // do nothing, the event is canceled
+                    return false;
                 }
             }
         }
@@ -1556,30 +1576,23 @@ impl<C: Clock> Equeue<C> {
             } else if info.static_() {
                 // if static, try to mark as no-longer pending, but
                 // note we could be canceled or recursively pended
-                let (reenqueue, e) = {
-                    let guard = self.lock.lock();
-                    let info = e.info.load();
-                    match info.state() {
-                        State::InFlight => {
-                            e.info.store(info.set_state(State::Alloced));
-                            (None, None)
+                match
+                    self.update_(e, |info| {
+                        match info.state() {
+                            State::InFlight => Some(info.set_state(State::Alloced)),
+                            State::Nested   => None,
+                            State::Canceled => None,
+                            _ => unreachable!(),
                         }
-                        State::Nested => {
-                            (Some(e), None)
-                        }
-                        State::Canceled => {
-                            (None, Some(e))
-                        }
-                        _ => unreachable!(),
+                    }).state()
+                {
+                    State::InFlight => None,
+                    State::Nested => {
+                        let now = self.now();
+                        self.enqueue_(e, now, now).err()
                     }
-                };
-
-                // TODO restructure this?
-                if let Some(e) = reenqueue {
-                    let now = self.now();
-                    self.enqueue_(e, now, now).err()
-                } else {
-                    e
+                    State::Canceled => Some(e),
+                    _ => unreachable!(),
                 }
             } else {
                 Some(e)
@@ -1606,14 +1619,12 @@ impl<C: Clock+Sema> Equeue<C> {
             self.dispatch_ready();
 
             // was break requested?
-            if self.break_.load() {
-                {   let guard = self.lock.lock();
-
-                    if self.break_.load() {
-                        self.break_.store(false);
-                        return Dispatch::Break;
-                    }
-                }
+            if
+                self.update_break_(|break_| {
+                    if break_ { Some(false) } else { None }
+                })
+            {
+                return Dispatch::Break;
             }
 
             // should we stop dispatching?
@@ -1661,9 +1672,9 @@ impl<C: Clock+Sema> Equeue<C> {
 impl<C: Signal> Equeue<C> {
     // request dispatch to exit once done dispatching events
     pub fn break_(&self) {
-        {   let guard = self.lock.lock();
-            self.break_.store(true);
-        }
+        self.update_break_(|break_| {
+            if break_ { None } else { Some(true) }
+        });
 
         self.clock.signal();
     }
@@ -1896,9 +1907,6 @@ impl<'a, T: ?Sized, C> Event<'a, T, C> {
 }
 
 impl<C> Equeue<C> {
-    // TODO rename me
-    // TODO actually, consolidate with alloc_raw above? We don't need clock/signal traits here
-    // TODO wait, where _do_ we need clock+signal?
     pub fn alloc<'a, T: Post + Send>(&'a self, t: T) -> Result<Event<'a, T, C>, Error> {
         let e = self.alloc_(Layout::new::<T>())?;
         unsafe { e.data_mut_ptr::<T>().write(t); }
@@ -2385,14 +2393,12 @@ impl<C: Clock+AsyncSema> Equeue<C> {
             self.dispatch_ready();
 
             // was break requested?
-            if self.break_.load() {
-                {   let guard = self.lock.lock();
-
-                    if self.break_.load() {
-                        self.break_.store(false);
-                        return Dispatch::Break;
-                    }
-                }
+            if
+                self.update_break_(|break_| {
+                    if break_ { Some(false) } else { None }
+                })
+            {
+                return Dispatch::Break;
             }
 
             // should we stop dispatching?
