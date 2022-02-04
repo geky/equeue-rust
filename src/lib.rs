@@ -281,6 +281,13 @@ trait AtomicStorage {
     fn new(v: Self::U) -> Self;
     fn load(&self) -> Self::U;
     fn store(&self, v: Self::U);
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+        equeue_break_mode="lockless",
+    ))]
+    fn cas(&self, old: Self::U, new: Self::U) -> Result<Self::U, Self::U>;
 }
 
 impl AtomicStorage for AtomicUdeptr {
@@ -296,6 +303,15 @@ impl AtomicStorage for AtomicUdeptr {
 
     fn store(&self, v: udeptr) {
         self.store(v, Ordering::SeqCst)
+    }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+        equeue_break_mode="lockless",
+    ))]
+    fn cas(&self, old: udeptr, new: udeptr) -> Result<udeptr, udeptr> {
+        self.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
     }
 }
 
@@ -313,6 +329,15 @@ impl AtomicStorage for AtomicUeptr {
     fn store(&self, v: ueptr) {
         self.store(v, Ordering::SeqCst)
     }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+        equeue_break_mode="lockless",
+    ))]
+    fn cas(&self, old: ueptr, new: ueptr) -> Result<ueptr, ueptr> {
+        self.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+    }
 }
 
 /// Small wrapper to generalize atomics to any <= udeptr sized type
@@ -327,7 +352,7 @@ impl<T: Copy + Debug, S: AtomicStorage> Debug for Atomic<T, S> {
     }
 }
 
-impl<T, S: AtomicStorage> Atomic<T, S> {
+impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
     fn new(t: T) -> Self {
         debug_assert!(size_of::<T>() <= size_of::<S::U>());
         Self(
@@ -336,12 +361,26 @@ impl<T, S: AtomicStorage> Atomic<T, S> {
         )
     }
 
-    fn load(&self) -> T where T: Copy {
+    fn load(&self) -> T {
         unsafe { *(&self.0.load() as *const _ as *const T) }
     }
 
-    fn store(&self, v: T) {
-        self.0.store(unsafe { *(&v as *const _ as *const S::U) })
+    fn store(&self, t: T) {
+        self.0.store(unsafe { *(&t as *const _ as *const S::U) })
+    }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+        equeue_break_mode="lockless",
+    ))]
+    fn cas(&self, old: T, new: T) -> Result<T, T> {
+        self.0.cas(
+            unsafe { *(&old as *const _ as *const S::U) },
+            unsafe { *(&new as *const _ as *const S::U) },
+        )
+            .map(|t| unsafe { *(&t as *const _ as *const T) })
+            .map_err(|t| unsafe { *(&t as *const _ as *const T) })
     }
 }
 
@@ -375,7 +414,7 @@ impl Eptr {
         })
     }
 
-    fn as_ptr<C>(&self, q: &Equeue<C>) -> *const Ebuf {
+    fn as_ptr<C>(self, q: &Equeue<C>) -> *const Ebuf {
         match self.0 {
             0 => ptr::null(),
             _ => (
@@ -385,8 +424,15 @@ impl Eptr {
         }
     }
 
-    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
         unsafe { self.as_ptr(q).as_ref() }
+    }
+
+    fn as_marked_eptr(self) -> MarkedEptr {
+        MarkedEptr {
+            gen: 0,
+            eptr: self,
+        }
     }
 }
 
@@ -423,25 +469,28 @@ impl MarkedEptr {
         }
     }
 
-    fn as_ptr<C>(&self, q: &Equeue<C>) -> *const Ebuf {
+    fn as_ptr<C>(self, q: &Equeue<C>) -> *const Ebuf {
         self.eptr.as_ptr(q)
     }
 
-    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
         self.eptr.as_ref(q)
     }
 
-    // test if mark matches expected gen from src MarkedEptr
-    fn cp_mark(self, src: MarkedEptr) -> MarkedEptr {
+    fn inc(self) -> MarkedEptr {
+        self.mark_inc(self)
+    }
+
+    fn mark(self, src: MarkedEptr) -> MarkedEptr {
         MarkedEptr {
             gen: src.gen,
             eptr: self.eptr,
         }
     }
 
-    fn inc_mark(self) -> MarkedEptr {
+    fn mark_inc(self, src: MarkedEptr) -> MarkedEptr {
         MarkedEptr {
-            gen: self.gen.wrapping_add(1),
+            gen: src.gen.wrapping_add(1),
             eptr: self.eptr,
         }
     }
@@ -449,16 +498,34 @@ impl MarkedEptr {
 
 // interactions with atomics
 impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
-    fn store_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let eptr = new.cp_mark(src);
+    fn store_mark(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let eptr = new.mark(old);
         self.store(eptr);
         eptr
     }
 
-    fn store_inc_marked(&self, src: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let eptr = new.cp_mark(src).inc_mark();
+    fn store_mark_inc(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let eptr = new.mark_inc(old);
         self.store(eptr);
         eptr
+    }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+    ))]
+    fn cas_mark(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        let eptr = new.mark(old);
+        self.cas(old, eptr)
+    }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+    ))]
+    fn cas_mark_inc(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        let eptr = new.mark_inc(old);
+        self.cas(old, eptr)
     }
 }
 
@@ -851,6 +918,18 @@ impl<C> Equeue<C> {
             .contains(&(e.deref() as *const _ as *const u8))
     }
 
+    #[cfg(equeue_alloc_mode="lockless")]
+    fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEptr, AtomicUdeptr>] {
+        let slab_front = self.slab_front.load() as usize;
+        unsafe {
+            slice::from_raw_parts(
+                self.slab.as_ptr() as *const Atomic<MarkedEptr, AtomicUdeptr>,
+                slab_front / size_of::<Atomic<MarkedEptr, AtomicUdeptr>>()
+            )
+        }
+    }
+
+    #[cfg(equeue_alloc_mode="locking")]
     fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr, AtomicUeptr>] {
         let slab_front = self.slab_front.load() as usize;
         unsafe {
@@ -862,6 +941,7 @@ impl<C> Equeue<C> {
     }
 
     // Memory management
+    #[must_use]
     fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
         // this looks arbitrary, but Ebuf should have a pretty reasonable
         // alignment since it contains both function pointers and AtomicUdeptrs
@@ -876,86 +956,144 @@ impl<C> Equeue<C> {
                 / align_of::<Ebuf>()
         );
 
-        // do we have an allocation in our buckets? we don't look
-        // at larger buckets because those are likely to be reused, we don't
-        // want to starve larger events with smaller events
-        if let Some(bucket) = self.buckets().get(npw2 as usize) {
-            // try to take an event from a bucket
-            let e = {
-                let guard = self.lock.lock();
-                if let Some(e) = bucket.load().as_ref(self) {
-                    bucket.store(e.sibling.load());
-                    Some(e)
-                } else {
-                    None
+        #[allow(unused_labels)]
+        'retry: loop {
+            // do we have an allocation in our buckets? we don't look
+            // at larger buckets because those are likely to be reused, we don't
+            // want to starve larger events with smaller events
+            if let Some(bucket) = self.buckets().get(npw2 as usize) {
+                // try to take an event from a bucket
+                #[cfg(equeue_alloc_mode="lockless")]
+                let e = {
+                    let eptr = bucket.load();
+                    if let Some(e) = eptr.as_ref(self) {
+                        if let Err(_) = bucket.cas_mark_inc(eptr, e.sibling.load().as_marked_eptr()) {
+                            continue 'retry;
+                        }
+                        Some(e)
+                    } else {
+                        None
+                    }
+                };
+                #[cfg(equeue_alloc_mode="locking")]
+                let e = {
+                    let guard = self.lock.lock();
+                    if let Some(e) = bucket.load().as_ref(self) {
+                        bucket.store(e.sibling.load());
+                        Some(e)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(e) = e {
+                    let mut e = unsafe { e.claim() };
+
+                    // zero certain fields
+                    e.cb = None;
+                    e.drop = None;
+                    e.target = Tick::new(0);
+                    e.period = None;
+                    e.q = ptr::null();
+                    return Ok(e);
                 }
+            }
+
+            #[cfg(equeue_alloc_mode="lockless")]
+            let new_slab_back = {
+                // check if we even have enough memory available, we allocate both
+                // an event and maybe some buckets if we don't have enough
+                let slab_front = self.slab_front.load() as usize;
+                let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
+                let new_slab_front = max(
+                    (npw2 as usize + 1)*size_of::<MarkedEptr>(),
+                    slab_front
+                );
+                let new_slab_back = slab_back.saturating_sub(
+                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
+                );
+
+                if new_slab_front > new_slab_back {
+                    return Err(Error::NoMem);
+                }
+
+                // commit our allocation starting with the slab_front, worst case
+                // if slab_back fails we end up with extra buckets, which isn't the
+                // end of the world, the buckets are a sparse array anyways
+                if new_slab_front > slab_front {
+                    if let Err(_) = self.slab_front.cas(
+                        ueptr::try_from(slab_front).unwrap(),
+                        ueptr::try_from(new_slab_front).unwrap()
+                    ) {
+                        continue 'retry;
+                    }
+                }
+
+                debug_assert!(new_slab_back < slab_back);
+                if let Err(_) = self.slab_back.cas(
+                    ueptr::try_from(slab_back / align_of::<Ebuf>()).unwrap(),
+                    ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
+                ) {
+                    continue 'retry;
+                }
+
+                new_slab_back
+            };
+            #[cfg(equeue_alloc_mode="locking")]
+            let new_slab_back = {
+                let guard = self.lock.lock();
+
+                // check if we even have enough memory available, we allocate both
+                // an event and maybe some buckets if we don't have enough
+                let slab_front = self.slab_front.load() as usize;
+                let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
+                let new_slab_front = max(
+                    (npw2 as usize + 1)*size_of::<Eptr>(),
+                    slab_front
+                );
+                let new_slab_back = slab_back.saturating_sub(
+                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
+                );
+
+                if new_slab_front > new_slab_back {
+                    return Err(Error::NoMem);
+                }
+
+                // actually commit our allocation
+                if new_slab_front > slab_front {
+                    self.slab_front.store(
+                        ueptr::try_from(new_slab_front).unwrap()
+                    );
+                }
+
+                debug_assert!(new_slab_back < slab_back);
+                self.slab_back.store(
+                    ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
+                );
+
+                new_slab_back
             };
 
-            if let Some(e) = e {
-                let mut e = unsafe { e.claim() };
+            unsafe {
+                let e = &self.slab[new_slab_back]
+                    as *const u8 as *const Ebuf as *mut Ebuf;
+                e.write(Ebuf {
+                    next: Atomic::new(MarkedEptr::null()),
+                    next_back: Atomic::new(Eptr::null()),
+                    sibling: Atomic::new(Eptr::null()),
+                    sibling_back: Atomic::new(Eptr::null()),
+                    info: Atomic::new(Info::new(0, false, false, State::InFlight)),
+                    npw2: npw2,
 
-                // zero certain fields
-                e.cb = None;
-                e.drop = None;
-                e.target = Tick::new(0);
-                e.period = None;
-                e.q = ptr::null();
-                return Ok(e);
+                    cb: None,
+                    drop: None,
+                    target: Tick::new(0),
+                    period: None,
+                    q: ptr::null(),
+                });
+
+                return Ok(&mut *e)
             }
-        }
-
-        let new_slab_back = {
-            let guard = self.lock.lock();
-
-            // check if we even have enough memory available, we allocate both
-            // an event and maybe some buckets if we don't have enough
-            let slab_front = self.slab_front.load() as usize;
-            let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
-            let new_slab_front = max(
-                (npw2 as usize + 1)*size_of::<Eptr>(),
-                slab_front
-            );
-            let new_slab_back = slab_back.saturating_sub(
-                size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
-            );
-
-            if new_slab_front > new_slab_back {
-                return Err(Error::NoMem);
-            }
-
-            // actually commit our allocation
-            if new_slab_front > slab_front {
-                self.slab_front.store(
-                    ueptr::try_from(new_slab_front).unwrap()
-                );
-            }
-
-            debug_assert!(new_slab_back < slab_back);
-            self.slab_back.store(
-                ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
-            );
-            new_slab_back
-        };
-
-        unsafe {
-            let e = &self.slab[new_slab_back]
-                as *const u8 as *const Ebuf as *mut Ebuf;
-            e.write(Ebuf {
-                next: Atomic::new(MarkedEptr::null()),
-                next_back: Atomic::new(Eptr::null()),
-                sibling: Atomic::new(Eptr::null()),
-                sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Info::new(0, false, false, State::InFlight)),
-                npw2: npw2,
-
-                cb: None,
-                drop: None,
-                target: Tick::new(0),
-                period: None,
-                q: ptr::null(),
-            });
-
-            Ok(&mut *e)
         }
     }
 
@@ -969,22 +1107,43 @@ impl<C> Equeue<C> {
         }
         e.drop = None;
 
+        // give our event a new id
+        self.update_info_(e, None, |info| {
+            debug_assert_ne!(info.state(), State::InQueue);
+            Some(
+                info.inc_id()
+                    .set_static(false)
+                    .set_once(false)
+                    .set_state(State::InFlight)
+            )
+        });
+
         // we can load buckets here because it can never shrink
         let bucket = &self.buckets()[e.npw2 as usize];
 
         // add our event to a bucket, while also incrementing our
         // generation count
-        {   let guard = self.lock.lock();
+        #[cfg(equeue_alloc_mode="lockless")]
+        {
+            // push onto bucket
+            let mut siblingptr = bucket.load();
+            loop {
+                debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
+                e.sibling.store(siblingptr.eptr);
+                if let Err(siblingptr_) = bucket.cas_mark_inc(
+                    siblingptr,
+                    e.as_marked_eptr(self)
+                ) {
+                    siblingptr = siblingptr_;
+                    continue;
+                }
 
-            // give our event a new id
-            let info = e.info.load();
-            debug_assert_ne!(info.state(), State::InQueue);
-            e.info.store(
-                info.inc_id()
-                    .set_state(State::InFlight)
-                    .set_static(false)
-                    .set_once(false)
-            );
+                break;
+            }
+        }
+        #[cfg(equeue_alloc_mode="locking")]
+        {
+            let guard = self.lock.lock();
 
             // push onto bucket
             let siblingptr = bucket.load();
@@ -993,10 +1152,9 @@ impl<C> Equeue<C> {
             bucket.store(e.as_eptr(self));
         }
     }
-}
 
-// Queue management
-impl<C> Equeue<C> {
+    // Queue management
+    #[cfg(equeue_queue_mode="locking")]
     #[must_use]
     fn enqueue_<'a>(
         &self,
@@ -1051,14 +1209,14 @@ impl<C> Equeue<C> {
             match sibling {
                 None => {
                     // insert a new slice
-                    e.next.store_marked(e.next.load(), tailptr);
+                    e.next.store_mark(e.next.load(), tailptr);
                     e.next_back.store(back.as_eptr(self));
                     e.sibling.store(e.as_eptr(self));
                     e.sibling_back.store(e.as_eptr(self));
                 }
                 Some(sibling) => {
                     // push onto existing slice
-                    e.next.store_marked(e.next.load(), MarkedEptr::null());
+                    e.next.store_mark(e.next.load(), MarkedEptr::null());
                     e.next_back.store(Eptr::null());
                     e.sibling.store(sibling.as_eptr(self));
                 }
@@ -1101,7 +1259,7 @@ impl<C> Equeue<C> {
                 let change = match sibling {
                     None => {
                         // insert a new slice
-                        tailsrc.store_marked(tailptr, e.as_marked_eptr(self));
+                        tailsrc.store_mark(tailptr, e.as_marked_eptr(self));
                         if let Some(next) = tailptr.as_ref(self) {
                             next.next_back.store(e.as_eptr(self));
                         }
@@ -1131,6 +1289,8 @@ impl<C> Equeue<C> {
         }
     }
 
+    #[cfg(equeue_queue_mode="locking")]
+    #[must_use]
     fn unqueue_<'a>(
         &'a self,
         e: Either<(&'a Ebuf, ugen), ugen>,
@@ -1194,13 +1354,13 @@ impl<C> Equeue<C> {
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, nextptr);
+                                self.queue.store_mark(headptr, nextptr);
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, nextptr);
+                                self.dequeue.store_mark(deheadptr, nextptr);
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), nextptr);
+                                next_back.next.store_mark(next_back.next.load(), nextptr);
                             }
                             if let Some(next) = next {
                                 next.next_back.store(next_back.as_eptr(self));
@@ -1213,18 +1373,18 @@ impl<C> Equeue<C> {
                             // the sibling's next pointer, which could be a race condition
                             // if we aren't locked
                             let sibling = unsafe { sibling.claim() };
-                            sibling.next.store_marked(sibling.next.load(), nextptr);
+                            sibling.next.store_mark(sibling.next.load(), nextptr);
                             sibling.next_back.store(next_back.as_eptr(self));
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, sibling.as_marked_eptr(self));
+                                self.queue.store_mark(headptr, sibling.as_marked_eptr(self));
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, sibling.as_marked_eptr(self));
+                                self.dequeue.store_mark(deheadptr, sibling.as_marked_eptr(self));
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), sibling.as_marked_eptr(self));
+                                next_back.next.store_mark(next_back.next.load(), sibling.as_marked_eptr(self));
                             }
                             if let Some(next) = next {
                                 next.next_back.store(sibling.as_eptr(self));
@@ -1236,7 +1396,7 @@ impl<C> Equeue<C> {
                     sibling.sibling_back.store(sibling_back.as_eptr(self));
 
                     // mark as removed
-                    e.next.store_inc_marked(nextptr, MarkedEptr::null());
+                    e.next.store_mark_inc(nextptr, MarkedEptr::null());
                     // mark as not-pending
                     e.info.store(e.info.load().set_state(nstate));
                     
@@ -1264,6 +1424,8 @@ impl<C> Equeue<C> {
         }
     }
 
+    #[cfg(equeue_queue_mode="locking")]
+    #[must_use]
     fn dequeue_<'a>(
         &'a self,
         now: Tick
@@ -1318,17 +1480,17 @@ impl<C> Equeue<C> {
                 }
 
                 // point dequeue to the head of ready events
-                self.dequeue.store_inc_marked(deheadptr, headptr);
+                self.dequeue.store_mark_inc(deheadptr, headptr);
                 // point queue to the tail of ready events
-                self.queue.store_marked(headptr, tailptr);
+                self.queue.store_mark(headptr, tailptr);
 
                 // cut our unrolled queue
-                back.unwrap().next.store_inc_marked(tailptr, MarkedEptr::null());
+                back.unwrap().next.store_mark_inc(tailptr, MarkedEptr::null());
                 if let Some(tail) = tailptr.as_ref(self) {
                     tail.next_back.store(Eptr::null());
                 }
 
-                break deheadptr.inc_mark().gen;
+                break deheadptr.inc().gen;
             }
         };
 
@@ -1338,30 +1500,70 @@ impl<C> Equeue<C> {
         }))
     }
 
-    fn update_<F>(&self, e: &Ebuf, f: F) -> Info
+    fn update_info_<F>(
+        &self,
+        e: &Ebuf,
+        // TODO can we get rid of this?
+        #[allow(unused)] guard: Option<<SysLock as Lock>::Guard>,
+        mut f: F
+    ) -> Info
     where
-        F: FnOnce(Info) -> Option<Info>
+        F: FnMut(Info) -> Option<Info>
     {
-        let guard = self.lock.lock();
+        #[cfg(equeue_queue_mode="lockless")]
+        {
+            let mut info = e.info.load();
+            loop {
+                if let Some(info_) = f(info) {
+                    if let Err(info_) = e.info.cas(info, info_) {
+                        info = info_;
+                        continue;
+                    }
+                }
 
-        let info = e.info.load();
-        if let Some(info_) = f(info) {
-            e.info.store(info_);
+                return info;
+            }
         }
-        info
+        #[cfg(equeue_queue_mode="locking")]
+        {
+            let guard = guard.unwrap_or_else(|| self.lock.lock());
+
+            let info = e.info.load();
+            if let Some(info_) = f(info) {
+                e.info.store(info_);
+            }
+            info
+        }
     }
 
-    fn update_break_<F>(&self, f: F) -> bool
+    fn update_break_<F>(&self, mut f: F) -> bool
     where
-        F: FnOnce(bool) -> Option<bool>
+        F: FnMut(bool) -> Option<bool>
     {
-        let guard = self.lock.lock();
+        #[cfg(equeue_break_mode="lockless")]
+        {
+            let mut break_ = self.break_.load();
+            loop {
+                if let Some(break__) = f(break_) {
+                    if let Err(break__) = self.break_.cas(break_, break__) {
+                        break_ = break__;
+                        continue;
+                    }
+                }
 
-        let break_ = self.break_.load();
-        if let Some(break__) = f(break_) {
-            self.break_.store(break__);
+                return break_;
+            }
         }
-        break_
+        #[cfg(equeue_break_mode="locking")]
+        {
+            let guard = self.lock.lock();
+
+            let break_ = self.break_.load();
+            if let Some(break__) = f(break_) {
+                self.break_.store(break__);
+            }
+            break_
+        }
     }
 }
 
@@ -1468,10 +1670,10 @@ impl<C: Clock+Signal> Equeue<C> {
             // be pending an event that's already pending. This means several
             // more corner cases to handle.
             let now = self.now();
-            let info = self.update_(e, |info| {
+            let info = self.update_info_(e, None, |info| {
                 match info.state() {
                     // still the same event?
-                    _ if info.id != id.id           => None,
+                    _ if info.id != id.id             => None,
                     State::Alloced                    => Some(info.set_state(State::InFlight)),
                     State::InFlight if info.static_() => Some(info.set_state(State::Nested)),
                     _                                 => None,
@@ -1507,7 +1709,7 @@ impl<C: Clock+Signal> Equeue<C> {
                     // we're pending, but in the future, we want to move this
                     // to execute immediately, try to unqueue and continue the
                     // loop to reenqueue
-                    self.unqueue_(Left((e, id.id)), State::InFlight);
+                    let _ = self.unqueue_(Left((e, id.id)), State::InFlight);
                 }
                 State::InFlight if info.static_() => {
                     // someone else is dispatching, just make sure we mark that
@@ -1591,7 +1793,7 @@ impl<C: Clock> Equeue<C> {
                 // if static, try to mark as no-longer pending, but
                 // note we could be canceled or recursively pended
                 match
-                    self.update_(e, |info| {
+                    self.update_info_(e, None, |info| {
                         match info.state() {
                             State::InFlight => Some(info.set_state(State::Alloced)),
                             State::Nested   => None,

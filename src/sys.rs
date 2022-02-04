@@ -147,6 +147,11 @@ cfg_if! {
 
 
 // Locking primitive
+#[cfg(any(
+    equeue_queue_mode="locking",
+    equeue_alloc_mode="locking",
+    equeue_break_mode="locking",
+))]
 cfg_if! {
     if #[cfg(feature="std")] {
         #[derive(Debug)]

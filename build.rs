@@ -61,4 +61,46 @@ fn main() {
             }
         });
     println!("cargo:rustc-cfg=equeue_udeptr_width=\"{}\"", udeptr_width);
+
+    // override EQUEUE_QUEUE_MODE
+    println!("cargo:rerun-if-env-changed=EQUEUE_QUEUE_MODE");
+    match env::var("EQUEUE_QUEUE_MODE").as_deref() {
+        Ok("lockless") => {
+            println!("cargo:rustc-cfg=equeue_queue_mode=\"lockless\"");
+        }
+        Ok("locking") | Err(_) => {
+            println!("cargo:rustc-cfg=equeue_queue_mode=\"locking\"");
+        }
+        Ok(mode) => {
+            panic!("equeue: unknown equeue_queue_mode {:?}?", mode);
+        }
+    }
+
+    // override EQUEUE_ALLOC_MODE
+    println!("cargo:rerun-if-env-changed=EQUEUE_ALLOC_MODE");
+    match env::var("EQUEUE_ALLOC_MODE").as_deref() {
+        Ok("lockless") | Err(_) => {
+            println!("cargo:rustc-cfg=equeue_alloc_mode=\"lockless\"");
+        }
+        Ok("locking") => {
+            println!("cargo:rustc-cfg=equeue_alloc_mode=\"locking\"");
+        }
+        Ok(mode) => {
+            panic!("equeue: unknown equeue_alloc_mode {:?}?", mode);
+        }
+    }
+
+    // override EQUEUE_BREAK_MODE
+    println!("cargo:rerun-if-env-changed=EQUEUE_BREAK_MODE");
+    match env::var("EQUEUE_BREAK_MODE").as_deref() {
+        Ok("lockless") | Err(_) => {
+            println!("cargo:rustc-cfg=equeue_break_mode=\"lockless\"");
+        }
+        Ok("locking") => {
+            println!("cargo:rustc-cfg=equeue_break_mode=\"locking\"");
+        }
+        Ok(mode) => {
+            panic!("equeue: unknown equeue_break_mode {:?}?", mode);
+        }
+    }
 }
