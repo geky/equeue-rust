@@ -81,7 +81,7 @@ fn test_cancel_many_reversed() {
 
 #[test]
 fn test_cancel_many_delay() {
-    let q = Equeue::with_size(1024*1024);
+    let q = Equeue::with_size(2*1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -104,7 +104,7 @@ fn test_cancel_many_delay() {
 
 #[test]
 fn test_cancel_many_delay_reversed() {
-    let q = Equeue::with_size(1024*1024);
+    let q = Equeue::with_size(2*1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];
@@ -127,7 +127,7 @@ fn test_cancel_many_delay_reversed() {
 
 #[test]
 fn test_cancel_many_periodic() {
-    let q = Equeue::with_size(1024*1024);
+    let q = Equeue::with_size(2*1024*1024);
 
     let count = AtomicU32::new(0);
     let mut ids = vec![];

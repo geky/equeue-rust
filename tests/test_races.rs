@@ -17,7 +17,7 @@ use std::time::Duration;
 
 #[test]
 fn test_race_alloc_unique() {
-    let q = Arc::new(Equeue::with_size(1024*1024));
+    let q = Arc::new(Equeue::with_size(2*1024*1024));
 
     let set = Arc::new(Mutex::new(HashSet::new()));
 
@@ -262,7 +262,7 @@ fn test_race_delay() {
 
 #[test]
 fn test_race_cancel() {
-    let q = Arc::new(Equeue::with_size(1024*1024));
+    let q = Arc::new(Equeue::with_size(2*1024*1024));
 
     let count = Arc::new(AtomicU32::new(0));
 

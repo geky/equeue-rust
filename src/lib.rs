@@ -465,13 +465,17 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
 
 /// Several event fields are crammed in here to avoid wasting space
 #[derive(Copy, Clone, Eq, PartialEq)]
-struct Info(ueptr);
+struct Info {
+    id: ugen,
+    state: ugen,
+}
 
 impl Debug for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("Info")
-            .field(&format_args!("{:#x}", self.0))
+            .field(&self.id)
+            .field(&format_args!("{:#x}", self.state))
             .finish()
     }
 }
@@ -479,81 +483,92 @@ impl Debug for Info {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum State {
     Alloced  = 0,
-    InQueue  = 2,
-    InFlight = 4,
-    Nested   = 6,
-    Canceled = 7,
+    InQueue  = 1,
+    InFlight = 2,
+    Nested   = 3,
+    Canceled = 4,
 }
 
 impl State {
-    fn from_ueptr(state: ueptr) -> State {
+    fn from_ugen(state: ugen) -> State {
         match state {
-            0 | 1 => State::Alloced,
-            2 | 3 => State::InQueue,
-            4 | 5 => State::InFlight,
-            6     => State::Nested,
-            7     => State::Canceled,
+            0 => State::Alloced,
+            1 => State::InQueue,
+            2 => State::InFlight,
+            3 => State::Nested,
+            4 => State::Canceled,
             _ => unreachable!(),
         }
     }
 
-    fn as_ueptr(&self) -> ueptr {
+    fn as_ugen(&self) -> ugen {
         match self {
             State::Alloced  => 0,
-            State::InQueue  => 2,
-            State::InFlight => 4,
-            State::Nested   => 6,
-            State::Canceled => 7,
+            State::InQueue  => 1,
+            State::InFlight => 2,
+            State::Nested   => 3,
+            State::Canceled => 4,
         }
     }
 }
 
 impl Info {
-    fn new(id: ugen, state: State, static_: bool, npw2: u8) -> Info {
-        Info(
-            ((id as ueptr) << 8*size_of::<ugen>())
-            | (state.as_ueptr() << (8*size_of::<ugen>()-3))
-            | ((!static_ as ueptr) << (8*size_of::<ugen>()-3))
-            | (npw2 as ueptr)
-        )
-    }
-
-    fn id(&self) -> ugen {
-        (self.0 >> 8*size_of::<ugen>()) as ugen
-    }
-
-    fn state(&self) -> State {
-        State::from_ueptr(0x7 & (self.0 >> (8*size_of::<ugen>()-3)))
+    fn new(id: ugen, static_: bool, once: bool, state: State) -> Info {
+        Info {
+            id: id,
+            state: (
+                ((static_ as ugen) << 8*size_of::<ugen>()-1)
+                | ((once as ugen) << 8*size_of::<ugen>()-2)
+                | state.as_ugen()
+            )
+        }
     }
 
     fn static_(&self) -> bool {
-        // static is inverted so we can mask it with canceled statuses
-        !(self.0 & (1 << (8*size_of::<ugen>()-3)) != 0)
+        self.state & (1 << 8*size_of::<ugen>()-1) != 0
     }
 
-    fn npw2(&self) -> u8 {
-        (self.0 & ((1 << (8*size_of::<ugen>()-3)) - 1)) as u8
+    fn once(&self) -> bool {
+        self.state & (1 << 8*size_of::<ugen>()-2) != 0
+    }
+
+    fn state(&self) -> State {
+        State::from_ugen(self.state & 0xf)
     }
 
     fn inc_id(self) -> Info {
-        Info(self.0.wrapping_add(1 << 8*size_of::<ugen>()))
-    }
-
-    fn set_state(self, state: State) -> Info {
-        // there is one incompatible state here
-        debug_assert!(state != State::Nested || self.static_());
-        Info(
-            (self.0 & !(0x6 << (8*size_of::<ugen>()-3)))
-            | (state.as_ueptr() << (8*size_of::<ugen>()-3))
-        )
+        Info {
+            id: self.id.wrapping_add(1),
+            state: self.state
+        }
     }
 
     fn set_static(self, static_: bool) -> Info {
-        // static is inverted so we can mask it with canceled statuses
-        if !static_ {
-            Info(self.0 | (1 << (8*size_of::<ugen>()-3)))
-        } else {
-            Info(self.0 & !(1 << (8*size_of::<ugen>()-3)))
+        Info {
+            id: self.id,
+            state: if static_ {
+                self.state | (1 << (8*size_of::<ugen>()-1))
+            } else {
+                self.state & !(1 << (8*size_of::<ugen>()-1))
+            }
+        }
+    }
+
+    fn set_once(self, static_: bool) -> Info {
+        Info {
+            id: self.id,
+            state: if static_ {
+                self.state | (1 << (8*size_of::<ugen>()-2))
+            } else {
+                self.state & !(1 << (8*size_of::<ugen>()-2))
+            }
+        }
+    }
+
+    fn set_state(self, state: State) -> Info {
+        Info {
+            id: self.id,
+            state: (self.state & !0xf) | state.as_ugen()
         }
     }
 }
@@ -567,6 +582,7 @@ struct Ebuf {
     sibling: Atomic<Eptr, AtomicUeptr>,
     sibling_back: Atomic<Eptr, AtomicUeptr>,
     info: Atomic<Info, AtomicUeptr>,
+    npw2: u8,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -586,12 +602,8 @@ impl Ebuf {
     }
 
     // info access
-    fn npw2(&self) -> u8 {
-        self.info.load().npw2()
-    }
-
     fn size(&self) -> usize {
-        align_of::<Ebuf>() << self.npw2()
+        align_of::<Ebuf>() << self.npw2
     }
 
     // access to the trailing buffer
@@ -933,7 +945,8 @@ impl<C> Equeue<C> {
                 next_back: Atomic::new(Eptr::null()),
                 sibling: Atomic::new(Eptr::null()),
                 sibling_back: Atomic::new(Eptr::null()),
-                info: Atomic::new(Info::new(0, State::InFlight, false, npw2)),
+                info: Atomic::new(Info::new(0, false, false, State::InFlight)),
+                npw2: npw2,
 
                 cb: None,
                 drop: None,
@@ -957,7 +970,7 @@ impl<C> Equeue<C> {
         e.drop = None;
 
         // we can load buckets here because it can never shrink
-        let bucket = &self.buckets()[e.npw2() as usize];
+        let bucket = &self.buckets()[e.npw2 as usize];
 
         // add our event to a bucket, while also incrementing our
         // generation count
@@ -970,6 +983,7 @@ impl<C> Equeue<C> {
                 info.inc_id()
                     .set_state(State::InFlight)
                     .set_static(false)
+                    .set_once(false)
             );
 
             // push onto bucket
@@ -1136,7 +1150,7 @@ impl<C> Equeue<C> {
                 Left((e, id)) => {
                     // still the same event?
                     let info = e.info.load();
-                    if info.id() != id {
+                    if info.id != id {
                         return (false, None);
                     }
 
@@ -1368,7 +1382,7 @@ impl<C: Clock> Equeue<C> {
         let target = e.target;
         let period = e.period;
         let info = e.info.load();
-        if info.id() != id.id {
+        if info.id != id.id {
             return None;
         }
 
@@ -1402,7 +1416,7 @@ impl<C> Equeue<C> {
         };
 
         let info = e.info.load();
-        if info.id() != id.id || info.state() == State::Canceled {
+        if info.id != id.id || info.state() == State::Canceled {
             return false;
         }
 
@@ -1445,7 +1459,7 @@ impl<C: Clock+Signal> Equeue<C> {
         };
 
         // still the same event?
-        if e.info.load().id() != id.id {
+        if e.info.load().id != id.id {
             return false;
         }
 
@@ -1457,7 +1471,7 @@ impl<C: Clock+Signal> Equeue<C> {
             let info = self.update_(e, |info| {
                 match info.state() {
                     // still the same event?
-                    _ if info.id() != id.id           => None,
+                    _ if info.id != id.id           => None,
                     State::Alloced                    => Some(info.set_state(State::InFlight)),
                     State::InFlight if info.static_() => Some(info.set_state(State::Nested)),
                     _                                 => None,
@@ -1466,7 +1480,7 @@ impl<C: Clock+Signal> Equeue<C> {
 
             match info.state() {
                 // still the same event?
-                _ if info.id() != id.id => {
+                _ if info.id != id.id => {
                     return false;
                 }
                 State::Alloced => {
@@ -1557,13 +1571,13 @@ impl<C: Clock> Equeue<C> {
         for e in self.dequeue_(now) {
             // load id here so we can tell if it changes (which happens if the
             // event is reclaimed in dispatch)
-            let id = e.info.load().id();
+            let id = e.info.load().id;
 
             // dispatch!
             (e.cb.unwrap())(e.data_mut_ptr());
 
             let info = e.info.load();
-            let e = if id != info.id() {
+            let e = if id != info.id {
                 // deallocated while dispatching?
                 None
             } else if let Some(period) = e.period {
@@ -1837,7 +1851,7 @@ unsafe fn event_waker_wake<C: Clock+Signal>(e: *const ()) {
     ).unwrap();
 
     // check that id matches first
-    let id = e.info.load().id();
+    let id = e.info.load().id;
     if id_trunc != id & mask as ugen {
         return;
     }
@@ -1898,7 +1912,6 @@ impl<'a, T: ?Sized, C> Event<'a, T, C> {
     }
 
     pub unsafe fn from_raw(q: &'a Equeue<C>, t: *mut T) -> Event<'a, T, C> {
-        // TODO track once?
         Event {
             q: q,
             t: &mut *t,
@@ -1948,8 +1961,8 @@ impl<C> Equeue<C> {
         e.cb = Some(cb_thunk::<T>);
         e.drop = Some(drop_thunk::<T>);
 
-        // mark as a one-time event so we panic if we try to enqueue
-        // multiple times
+        // mark as a one-time event
+        e.info.store(e.info.load().set_once(true));
         Ok(Event::new(self, e))
     }
 
@@ -2031,9 +2044,8 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
     }
 
     pub fn period<Δ: TryIntoDelta>(mut self, period: Option<Δ>) -> Self {
-//      TODO this is unsound without trait specialization
-//        // can't set period for PostOnce events 
-//        assert!(!self.once);
+        // can't set period for PostOnce events 
+        assert!(!self.ebuf().info.load().once());
         self.ebuf().period = period.map(|period|
             period.try_into_delta(self.q.clock.frequency()).ok()
                 .expect("equeue: delta overflow")
@@ -2042,9 +2054,8 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
     }
 
     pub fn static_(mut self, static_: bool) -> Self {
-//      TODO this is unsound without trait specialization
-//        // can't make PostOnce events static
-//        assert!(!self.once);
+        // can't make PostOnce events static
+        assert!(!self.ebuf().info.load().once());
         let e = self.ebuf();
         e.info.store(e.info.load().set_static(static_));
         self
@@ -2060,7 +2071,7 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
         let info = e.info.load();
         e.info.store(info.set_state(State::Alloced));
 
-        let id = Id::new(q, info.id(), e);
+        let id = Id::new(q, info.id, e);
         forget(self);
         id
     }
@@ -2075,7 +2086,7 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
         let q = self.q;
         let e = self.ebuf();
 
-        let id = Id::new(q, e.info.load().id(), e);
+        let id = Id::new(q, e.info.load().id, e);
         q.post_(e, e.target.as_delta().unwrap());
         forget(self);
         id
