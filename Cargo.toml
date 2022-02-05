@@ -8,6 +8,10 @@ opt-level = 3
 debug = true
 debug-assertions = true
 
+[profile.debug_]
+inherits = "dev"
+opt-level = 0
+
 [features]
 default = ["std", "alloc"]
 std = ["alloc"]
