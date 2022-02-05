@@ -428,7 +428,7 @@ impl Eptr {
         unsafe { self.as_ptr(q).as_ref() }
     }
 
-    fn as_marked_eptr(self) -> MarkedEptr {
+    fn as_marked(self) -> MarkedEptr {
         MarkedEptr {
             mark: 0,
             gen: 0,
@@ -467,6 +467,9 @@ impl MarkedEptr {
         }
     }
 
+    // TODO should we actually get rid of this relatively dangerous function?
+    //
+    // prefer: MarkedEptr::null().set_ebuf(q, e)
     fn from_ebuf<C>(q: &Equeue<C>, e: &Ebuf) -> MarkedEptr {
         MarkedEptr {
             mark: 0,
@@ -484,26 +487,30 @@ impl MarkedEptr {
     }
 
     fn inc(self) -> MarkedEptr {
-        self.cp_gen_inc(self)
-    }
-
-    fn cp_gen(self, src: MarkedEptr) -> MarkedEptr {
         MarkedEptr {
             mark: self.mark,
-            gen: src.gen,
+            gen: self.gen.wrapping_add(1),
             eptr: self.eptr,
         }
     }
 
-    fn cp_gen_inc(self, src: MarkedEptr) -> MarkedEptr {
+    fn set_eptr(self, other: Eptr) -> MarkedEptr {
         MarkedEptr {
             mark: self.mark,
-            gen: src.gen.wrapping_add(1),
-            eptr: self.eptr,
+            gen: self.gen,
+            eptr: other,
         }
     }
 
-    fn cp_mark(self, mark: ugen) -> MarkedEptr {
+    fn cp_eptr(self, other: MarkedEptr) -> MarkedEptr {
+        MarkedEptr {
+            mark: self.mark,
+            gen: self.gen,
+            eptr: other.eptr,
+        }
+    }
+
+    fn set_mark(self, mark: ugen) -> MarkedEptr {
         MarkedEptr {
             mark: mark,
             gen: self.gen,
@@ -518,34 +525,34 @@ impl MarkedEptr {
 
 // interactions with atomics
 impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
-    fn store_gen(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let eptr = new.cp_gen(old);
-        self.store(eptr);
-        eptr
+    fn store_marked(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let new = old.cp_eptr(new);
+        self.store(new);
+        new
     }
 
-    fn store_gen_inc(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let eptr = new.cp_gen_inc(old);
-        self.store(eptr);
-        eptr
-    }
-
-    #[cfg(any(
-        equeue_queue_mode="lockless",
-        equeue_alloc_mode="lockless",
-    ))]
-    fn cas_gen(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        let eptr = new.cp_gen(old);
-        self.cas(old, eptr)
+    fn store_marked_inc(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
+        let new = old.cp_eptr(new).inc();
+        self.store(new);
+        new
     }
 
     #[cfg(any(
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_gen_inc(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        let eptr = new.cp_gen_inc(old);
-        self.cas(old, eptr)
+    fn cas_marked(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        let new = old.cp_eptr(new);
+        self.cas(old, new)
+    }
+
+    #[cfg(any(
+        equeue_queue_mode="lockless",
+        equeue_alloc_mode="lockless",
+    ))]
+    fn cas_marked_inc(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
+        let new = old.cp_eptr(new).inc();
+        self.cas(old, new)
     }
 }
 
@@ -555,6 +562,7 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
 #[repr(C)]
 struct Info {
     mark: ugen,
+    gen: ugen,
     id: ugen,
     state: ugen,
 }
@@ -564,6 +572,7 @@ impl Debug for Info {
         // these really need to be in hex to be readable
         f.debug_tuple("Info")
             .field(&self.mark)
+            .field(&self.gen)
             .field(&self.id)
             .field(&format_args!("{:#x}", self.state))
             .finish()
@@ -572,11 +581,11 @@ impl Debug for Info {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum State {
-    Alloced  = 0,
-    InQueue  = 1,
-    InFlight = 2,
-    Nested   = 3,
-    Canceled = 4,
+    Alloced,
+    InQueue,
+    InFlight,
+    Nested,
+    Canceled,
 }
 
 impl State {
@@ -606,6 +615,7 @@ impl Info {
     fn new(id: ugen, static_: bool, once: bool, state: State) -> Info {
         Info {
             mark: 0,
+            gen: 0,
             id: id,
             state: (
                 ((static_ as ugen) << 8*size_of::<ugen>()-1)
@@ -630,6 +640,7 @@ impl Info {
     fn inc_id(self) -> Info {
         Info {
             mark: self.mark,
+            gen: self.gen,
             id: self.id.wrapping_add(1),
             state: self.state
         }
@@ -638,6 +649,7 @@ impl Info {
     fn set_static(self, static_: bool) -> Info {
         Info {
             mark: self.mark,
+            gen: self.gen,
             id: self.id,
             state: if static_ {
                 self.state | (1 << (8*size_of::<ugen>()-1))
@@ -650,6 +662,7 @@ impl Info {
     fn set_once(self, static_: bool) -> Info {
         Info {
             mark: self.mark,
+            gen: self.gen,
             id: self.id,
             state: if static_ {
                 self.state | (1 << (8*size_of::<ugen>()-2))
@@ -662,19 +675,20 @@ impl Info {
     fn set_state(self, state: State) -> Info {
         Info {
             mark: self.mark,
+            gen: self.gen,
             id: self.id,
             state: (self.state & !0xf) | state.as_ugen()
         }
     }
 
-    fn as_marked_eptr(self) -> MarkedEptr {
+    fn as_marked(self) -> MarkedEptr {
         unsafe { *(&self as *const _ as *const MarkedEptr) }
     }
 }
 
 // interactions with atomics
 impl<S: AtomicStorage> Atomic<Info, S> {
-    fn as_atomic_marked_eptr<'a>(&'a self) -> &'a Atomic<MarkedEptr, S> {
+    fn as_atomic_marked<'a>(&'a self) -> &'a Atomic<MarkedEptr, S> {
         unsafe { &*(self as *const _ as *const Atomic<MarkedEptr, S>) }
     }
 }
@@ -704,7 +718,7 @@ impl Ebuf {
         Eptr::from_ebuf(q, self)
     }
 
-    fn as_marked_eptr<C>(&self, q: &Equeue<C>) -> MarkedEptr {
+    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr {
         MarkedEptr::from_ebuf(q, self)
     }
 
@@ -750,7 +764,7 @@ impl Ebuf {
 // some convenience extensions to Option<&Ebuf>
 trait OptionEbuf<'a> {
     fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr;
-    fn as_marked_eptr<C>(&self, q: &Equeue<C>) -> MarkedEptr;
+    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr;
 }
 
 impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
@@ -761,14 +775,15 @@ impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
         }
     }
 
-    fn as_marked_eptr<C>(&self, q: &Equeue<C>) -> MarkedEptr {
+    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr {
         match self {
-            Some(e) => e.as_marked_eptr(q),
+            Some(e) => e.as_marked(q),
             None => MarkedEptr::null(),
         }
     }
 }
 
+// TODO rename to HelpState and HelpInfo?
 /// State machine for mutually synchronized operations
 #[cfg(equeue_queue_mode="lockless")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -841,7 +856,6 @@ impl HelpOp {
             }
             Op::UnqueueSiblingSiblingNext(_) => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
-                
             }
             Op::UnqueueSiblingSiblingNextBack(_) => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
@@ -955,10 +969,10 @@ impl HelpOp {
                 Some(&help_ctx.as_ref(q).unwrap().next)
             }
             Op::UpdateState(_) => {
-                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked_eptr())
+                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
             }
             Op::UpdateStateInc(_) => {
-                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked_eptr())
+                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
             }
         }
     }
@@ -973,65 +987,73 @@ impl HelpOp {
             // TODO we need to be cp_gen_inc marked pointer here, note this causes problems for
             // our dequeue generation, but fortunately have the extra mark slot for that
             Op::EnqueueSliceNextBackNext => {
-                self.eptr.as_marked_eptr().cp_gen(help_old)
+                help_old.set_eptr(self.eptr).inc()
             }
             Op::EnqueueSliceNextNextBack => {
-                self.eptr.as_marked_eptr().cp_gen(help_old)
+                help_old.set_eptr(self.eptr).inc()
             }
             Op::EnqueueSiblingSiblingSiblingBack => {
-                self.eptr.as_marked_eptr().cp_gen(help_old)
+                help_old.set_eptr(self.eptr).inc()
             }
             Op::EnqueueSiblingSiblingBackSibling => {
-                self.eptr.as_marked_eptr().cp_gen(help_old)
+                help_old.set_eptr(self.eptr).inc()
             }
-            Op::UnqueueSliceNextBackNext(_) => {
-                self.eptr.as_ref(q).unwrap().next.load().cp_gen(help_old)
+            Op::UnqueueSliceNextBackNext(_) => { // TODO NEED TO CHECK DEQUEUE MARK?
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
             }
             Op::UnqueueSliceNextNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().next_back.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
             }
             Op::UnqueueSiblingSiblingNext(_) => {
-                self.eptr.as_ref(q).unwrap().next.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
             }
             Op::UnqueueSiblingSiblingNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().next_back.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
             }
             Op::UnqueueSiblingNextBackNext(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
             Op::UnqueueSiblingNextNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
             Op::UnqueueSiblingBackSibling(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
             Op::UnqueueSiblingSiblingBack(_) => {
-                self.eptr.as_ref(q).unwrap().sibling_back.load().cp_gen(help_old)
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load()).inc()
             }
-            Op::UnqueueNext(state) => {
-                MarkedEptr::null().cp_gen_inc(help_old)
+            Op::UnqueueNext(_) => {
+                help_old.set_eptr(Eptr::null()).inc()
             }
             Op::DequeueDequeue => {
-                q.queue.load().cp_gen_inc(q.dequeue.load())
+                help_old
+                    .set_mark(help_old.mark.wrapping_add(1))
+                    .cp_eptr(q.queue.load())
+                    .inc()
             }
             Op::DequeueQueue => {
-                self.eptr.as_ref(q).unwrap().next.load().cp_gen(q.queue.load())
+                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
             }
             Op::DequeueBackNextNextBack => {
-                MarkedEptr::null().cp_gen(help_old)
+                help_old.set_eptr(Eptr::null()).inc()
             }
             Op::DequeueBackNext => {
-                MarkedEptr::null().cp_gen_inc(help_old)
+                help_old.set_eptr(Eptr::null()).inc()
             }
             Op::UpdateState(state) => {
-                help_old.as_info().set_state(state).as_marked_eptr()
+                help_old.as_info()
+                    .set_state(state)
+                    .as_marked()
+                    .inc()
             }
             Op::UpdateStateInc(state) => {
                 help_old.as_info()
                     .inc_id()
                     .set_static(false)
                     .set_once(false)
-                    .set_state(state).as_marked_eptr()
+                    .set_state(state)
+                    .as_marked()
+                    .inc()
             }
         }
     }
@@ -1321,7 +1343,7 @@ impl<C> Equeue<C> {
                 let e = {
                     let eptr = bucket.load();
                     if let Some(e) = eptr.as_ref(self) {
-                        if let Err(_) = bucket.cas_gen_inc(eptr, e.sibling.load()) {
+                        if let Err(_) = bucket.cas_marked_inc(eptr, e.sibling.load()) {
                             continue 'retry;
                         }
                         Some(e)
@@ -1478,10 +1500,10 @@ impl<C> Equeue<C> {
             let mut siblingptr = bucket.load();
             loop {
                 debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
-                e.sibling.store(siblingptr);
-                if let Err(siblingptr_) = bucket.cas_gen_inc(
+                e.sibling.store_marked(e.sibling.load(), siblingptr);
+                if let Err(siblingptr_) = bucket.cas_marked_inc(
                     siblingptr,
-                    e.as_marked_eptr(self)
+                    e.as_marked(self)
                 ) {
                     siblingptr = siblingptr_;
                     continue;
@@ -1514,7 +1536,6 @@ impl<C> Equeue<C> {
             // find help-op location and old value, we store these globally
             // marked by the help-op's generation count to keep things in sync
             let mut help_ctx = self.help_ctx.load();
-            assert!(!(help_ctx.mark != help_op.gen.wrapping_sub(1)));
             if help_ctx.mark != help_op.gen {
                 // we must be one behind, if not significant state has changed 
                 if help_ctx.mark != help_op.gen.wrapping_sub(1) {
@@ -1522,8 +1543,8 @@ impl<C> Equeue<C> {
                 }
 
                 let help_ctx_ = help_op.find_ctx(self)
-                    .as_marked_eptr()
-                    .cp_mark(help_op.gen);
+                    .as_marked()
+                    .set_mark(help_op.gen);
                 if let Err(_) = self.help_ctx.cas(help_ctx, help_ctx_) {
                     continue 'retry;
                 }
@@ -1533,40 +1554,44 @@ impl<C> Equeue<C> {
 
             // get reference to atom we are updating
             let help_atom = help_op.find_atom(self, help_ctx.eptr);
+
+            // we always load the old value from the source, this is to preserve
+            // the mark field which we override in our help state 
+            let old = match help_atom {
+                Some(atom) => atom.load(),
+                None => MarkedEptr::null(),
+            };
+
             let mut help_old = self.help_old.load();
-            if let Some(help_atom) = help_atom {
-                if help_old.mark != help_op.gen {
-                    // we must be one behind, if not significant state has changed 
-                    if help_old.mark != help_op.gen.wrapping_sub(1) {
-                        continue 'retry;
-                    }
-
-                    let help_old_ = help_atom.load()
-                        .cp_mark(help_op.gen);
-                    if let Err(_) = self.help_old.cas(help_old, help_old_) {
-                        continue 'retry;
-                    }
-
-                    help_old = help_old_;
+            if help_old.mark != help_op.gen {
+                // we must be one behind, if not significant state has changed 
+                // TODO do we need both 1 and 2? this is due to done being a skipped state...
+                if help_old.mark != help_op.gen.wrapping_sub(1) {
+                    continue 'retry;
                 }
 
-                // clear marks, we don't use and can't track this for updates
-                let help_old = help_old.cp_mark(0);
-
-                // perform the actual compare and swap
-                let help_new = help_op.find_new(self, help_old);
-                if let Err(help_old_) = help_atom.cas(help_old, help_new) {
-                    // oh did someone update the value before us?
-                    if help_old_ != help_new {
-                        continue 'retry;
-                    }
-                }
-            } else {
-                // we still need to increment the mark on the old value we are tracking
-                let help_old_ = help_old
-                    .cp_mark(help_op.gen);
+                let help_old_ = old.set_mark(help_op.gen);
                 if let Err(_) = self.help_old.cas(help_old, help_old_) {
                     continue 'retry;
+                }
+
+                help_old = help_old_;
+            }
+
+            if let Some(atom) = help_atom
+                // if the value does not match help_old, someone _must_ have
+                // completed the operation
+                .filter(|_| help_old.set_mark(0) == old.set_mark(0))
+            {
+                // find new value
+                let new = help_op.find_new(self, old);
+
+                // perform the actual compare and swap
+                if let Err(old_) = atom.cas(old, new) {
+                    // oh did someone update the value before us?
+                    if old_ != new {
+                        continue 'retry;
+                    }
                 }
             }
 
@@ -1583,22 +1608,22 @@ impl<C> Equeue<C> {
         }
     }
 
-    #[cfg(equeue_queue_mode="lockless")]
-    fn do_queue_<'a>(&self, op: Op, e: &'a Ebuf) {
-        // is there something to do already?
-        let mut help_op = self.help_queue_();
-        loop {
-            if let Err(help_op_) = self.try_do_queue_(help_op, op, e) {
-                help_op = help_op_;
-                continue;
-            }
+//    #[cfg(equeue_queue_mode="lockless")]
+//    fn do_queue_<'a>(&self, op: Op, e: &'a Ebuf) {
+//        loop {
+//            // is there something to do already?
+//            let help_op = self.help_queue_();
+//
+//            if let Err(_) = self.try_do_queue_(help_op, op, e) {
+//                continue;
+//            }
+//
+//            break;
+//        }
+//    }
 
-            break;
-        }
-    }
-
     #[cfg(equeue_queue_mode="lockless")]
-    fn try_do_queue_<'a>(&self, help_op: HelpOp, op: Op, e: &'a Ebuf) -> Result<(), HelpOp> {
+    fn try_do_queue_<'a>(&self, help_op: HelpOp, op: Op, e: &'a Ebuf) -> Result<HelpOp, HelpOp> {
         // help_queue_ should always put help_op into a none state
         debug_assert!(help_op.op.is_none());
 
@@ -1612,8 +1637,7 @@ impl<C> Equeue<C> {
             return Err(help_op_);
         }
 
-        self.help_queue_();
-        Ok(())
+        Ok(self.help_queue_())
     }
 
     // Queue management
@@ -1629,7 +1653,7 @@ impl<C> Equeue<C> {
         e.target = target;
 
         'retry: loop {
-            let dequeue_gen = self.dequeue.load().gen;
+            let dequeue_mark = self.dequeue.load().mark;
 
             // find insertion point
             let mut back = None;
@@ -1671,16 +1695,16 @@ impl<C> Equeue<C> {
             match sibling {
                 None => {
                     // insert a new slice
-                    e.next.store_gen(e.next.load(), tailptr);
-                    e.next_back.store(back.as_marked_eptr(self));
-                    e.sibling.store(e.as_marked_eptr(self));
-                    e.sibling_back.store(e.as_marked_eptr(self));
+                    e.next.store_marked(e.next.load(), tailptr);
+                    e.next_back.store_marked(e.next_back.load(), back.as_marked(self));
+                    e.sibling.store_marked(e.sibling.load(), e.as_marked(self));
+                    e.sibling_back.store_marked(e.sibling_back.load(), e.as_marked(self));
                 }
                 Some(sibling) => {
                     // push onto existing slice
-                    e.next.store_gen(e.next.load(), MarkedEptr::null());
-                    e.next_back.store(MarkedEptr::null());
-                    e.sibling.store(sibling.as_marked_eptr(self));
+                    e.next.store_marked(e.next.load(), MarkedEptr::null());
+                    e.next_back.store_marked(e.next_back.load(), MarkedEptr::null());
+                    e.sibling.store_marked(e.sibling.load(), sibling.as_marked(self));
                 }
             }
 
@@ -1688,10 +1712,10 @@ impl<C> Equeue<C> {
             #[cfg(equeue_queue_mode="lockless")]
             {
                 // TODO if this works we shouldn't need to lock
-                let guard = self.lock.lock();
-
-                let mut help_op = self.help_queue_();
+                //let guard = self.lock.lock();
                 loop {
+                    let help_op = self.help_queue_();
+
                     // are we trying to enqueue an event that's already been canceled?
                     //
                     // this may seem like a weird place for this check, but it's the
@@ -1717,11 +1741,11 @@ impl<C> Equeue<C> {
 
                     // did someone already change our tailsrc? dequeue iteration? restart
                     if tailsrc.load() != tailptr
-                        || self.dequeue.load().gen != dequeue_gen
+                        || self.dequeue.load().mark != dequeue_mark
                     {
                         continue 'retry;
                     }
-                    
+
                     // found our insertion point, now lets try to insert
                     let change;
                     match sibling {
@@ -1729,26 +1753,24 @@ impl<C> Equeue<C> {
                             // insert a new slice
                             change = tailsrc as *const _ == &self.queue as *const _;
 
-                            if let Err(help_op_) = self.try_do_queue_(
+                            if let Err(_) = self.try_do_queue_(
                                 help_op,
                                 Op::EnqueueSliceNextBackNext,
                                 e
                             ) {
-                                help_op = help_op_;
                                 continue;
                             }
                         }
                         Some(sibling) => {
                             // push onto existing slice
-                            e.sibling_back.store(sibling.sibling_back.load());
+                            e.sibling_back.store_marked(e.sibling_back.load(), sibling.sibling_back.load());
                             change = false;
 
-                            if let Err(help_op_) = self.try_do_queue_(
+                            if let Err(_) = self.try_do_queue_(
                                 help_op,
                                 Op::EnqueueSiblingSiblingSiblingBack,
                                 e
                             ) {
-                                help_op = help_op_;
                                 continue;
                             }
                         }
@@ -1786,7 +1808,7 @@ impl<C> Equeue<C> {
 
                 // did someone already change our tailsrc? dequeue iteration? restart
                 if tailsrc.load() != tailptr
-                    || self.dequeue.load().gen != dequeue_gen
+                    || self.dequeue.load().mark != dequeue_mark
                 {
                     continue 'retry;
                 }
@@ -1795,9 +1817,10 @@ impl<C> Equeue<C> {
                 let change = match sibling {
                     None => {
                         // insert a new slice
-                        tailsrc.store_gen(tailptr, e.as_marked_eptr(self));
+                        tailsrc.store_marked(tailptr, e.as_marked(self));
                         if let Some(next) = tailptr.as_ref(self) {
-                            next.next_back.store(e.as_marked_eptr(self));
+                            // TODO we should prevent these somehow? at least change these to all just store
+                            next.next_back.store(e.as_marked(self));
                         }
 
                         tailsrc as *const _ == &self.queue as *const _
@@ -1809,10 +1832,10 @@ impl<C> Equeue<C> {
                         // the back-references are correct atomically
                         let sibling_back = sibling.sibling_back.load()
                             .as_ref(self).unwrap();
-                        sibling.sibling_back.store(e.as_marked_eptr(self));
+                        sibling.sibling_back.store(e.as_marked(self));
                         
-                        sibling_back.sibling.store(e.as_marked_eptr(self));
-                        e.sibling_back.store(sibling_back.as_marked_eptr(self));
+                        sibling_back.sibling.store(e.as_marked(self));
+                        e.sibling_back.store(sibling_back.as_marked(self));
 
                         false
                     }
@@ -1834,10 +1857,10 @@ impl<C> Equeue<C> {
         #[cfg(equeue_queue_mode="lockless")]
         {
             // TODO if this works we shouldn't need to lock
-            let guard = self.lock.lock();
-
-            let mut help_op = self.help_queue_();
+            //let guard = self.lock.lock();
             loop {
+                let help_op = self.help_queue_();
+
                 // Either unqueue a known event, with specific id, or the head of
                 // the dequeue. This looks innocent, but it's important we do both
                 // of these checks while locked, since that protects against:
@@ -1856,11 +1879,11 @@ impl<C> Equeue<C> {
 
                         (e, info)
                     }
-                    Right(gen) => {
+                    Right(dequeue_mark) => {
                         // no event specified, pop from dequeue if our gen matches
                         let dequeueptr = self.dequeue.load();
                         let e = match dequeueptr.as_ref(self) {
-                            Some(e) if dequeueptr.gen == gen => e,
+                            Some(e) if dequeueptr.mark == dequeue_mark => e,
                             _ => return (false, None),
                         };
 
@@ -1891,34 +1914,31 @@ impl<C> Equeue<C> {
                         {
                             if sibling as *const _ == e as *const _ {
                                 // just remove the slice
-                                if let Err(help_op_) = self.try_do_queue_(
+                                if let Err(_) = self.try_do_queue_(
                                     help_op,
                                     Op::UnqueueSliceNextBackNext(state),
                                     e
                                 ) {
-                                    help_op = help_op_;
                                     continue;
                                 }
                             } else {
                                 // remove from siblings
-                                if let Err(help_op_) = self.try_do_queue_(
+                                if let Err(_) = self.try_do_queue_(
                                     help_op,
                                     Op::UnqueueSiblingSiblingNext(state),
                                     e
                                 ) {
-                                    help_op = help_op_;
                                     continue;
                                 }
                             }
                         } else {
                             // no next_back just means we are a sibling, we still need
                             // to remove from siblings
-                            if let Err(help_op_) = self.try_do_queue_(
+                            if let Err(_) = self.try_do_queue_(
                                 help_op,
                                 Op::UnqueueSiblingBackSibling(state),
                                 e
                             ) {
-                                help_op = help_op_;
                                 continue;
                             }
                         }
@@ -1931,12 +1951,11 @@ impl<C> Equeue<C> {
                         // to claim the event, and since we ensure no ids coexist
                         // mutable references to events at the type-level, we can
                         // be sure we have exclusive access
-                        if let Err(help_op_) = self.try_do_queue_(
+                        if let Err(_) = self.try_do_queue_(
                             help_op,
                             Op::UpdateState(state),
                             e
                         ) {
-                            help_op = help_op_;
                             continue;
                         }
 
@@ -1945,12 +1964,11 @@ impl<C> Equeue<C> {
                     State::InFlight | State::Nested => {
                         // if we're periodic/static and currently executing best we
                         // can do is mark the event so it isn't re-enqueued
-                        if let Err(help_op_) = self.try_do_queue_(
+                        if let Err(_) = self.try_do_queue_(
                             help_op,
                             Op::UpdateState(state),
                             e
                         ) {
-                            help_op = help_op_;
                             continue;
                         }
 
@@ -1983,11 +2001,11 @@ impl<C> Equeue<C> {
 
                     (e, info)
                 }
-                Right(gen) => {
+                Right(dequeue_mark) => {
                     // no event specified, pop from dequeue if our gen matches
                     let dequeueptr = self.dequeue.load();
                     let e = match dequeueptr.as_ref(self) {
-                        Some(e) if dequeueptr.gen == gen => e,
+                        Some(e) if dequeueptr.mark == dequeue_mark => e,
                         _ => return (false, None),
                     };
 
@@ -2021,16 +2039,16 @@ impl<C> Equeue<C> {
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_gen(headptr, nextptr);
+                                self.queue.store_marked(headptr, nextptr);
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_gen(deheadptr, nextptr);
+                                self.dequeue.store_marked(deheadptr, nextptr);
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_gen(next_back.next.load(), nextptr);
+                                next_back.next.store_marked(next_back.next.load(), nextptr);
                             }
                             if let Some(next) = next {
-                                next.next_back.store(next_back.as_marked_eptr(self));
+                                next.next_back.store(next_back.as_marked(self));
                             }
                         } else {
                             // remove from siblings
@@ -2040,30 +2058,30 @@ impl<C> Equeue<C> {
                             // the sibling's next pointer, which could be a race condition
                             // if we aren't locked
                             let sibling = unsafe { sibling.claim() };
-                            sibling.next.store_gen(sibling.next.load(), nextptr);
-                            sibling.next_back.store(next_back.as_marked_eptr(self));
+                            sibling.next.store_marked(sibling.next.load(), nextptr);
+                            sibling.next_back.store(next_back.as_marked(self));
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_gen(headptr, sibling.as_marked_eptr(self));
+                                self.queue.store_marked(headptr, sibling.as_marked(self));
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_gen(deheadptr, sibling.as_marked_eptr(self));
+                                self.dequeue.store_marked(deheadptr, sibling.as_marked(self));
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_gen(next_back.next.load(), sibling.as_marked_eptr(self));
+                                next_back.next.store_marked(next_back.next.load(), sibling.as_marked(self));
                             }
                             if let Some(next) = next {
-                                next.next_back.store(sibling.as_marked_eptr(self));
+                                next.next_back.store(sibling.as_marked(self));
                             }
                         }
                     }
 
-                    sibling_back.sibling.store(sibling.as_marked_eptr(self));
-                    sibling.sibling_back.store(sibling_back.as_marked_eptr(self));
+                    sibling_back.sibling.store(sibling.as_marked(self));
+                    sibling.sibling_back.store(sibling_back.as_marked(self));
 
                     // mark as removed
-                    e.next.store_gen_inc(nextptr, MarkedEptr::null());
+                    e.next.store_marked_inc(nextptr, MarkedEptr::null());
                     // mark as not-pending
                     e.info.store(e.info.load().set_state(state));
                     
@@ -2096,11 +2114,11 @@ impl<C> Equeue<C> {
         &'a self,
         now: Tick
     ) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
-        let gen = 'retry: loop {
+        let dequeue_mark = 'retry: loop {
             // dispatch already in progress? let's try to help out
             let deheadptr = self.dequeue.load();
             if deheadptr.as_ref(self).is_some() {
-                break deheadptr.gen;
+                break 'retry deheadptr.mark;
             }
 
             // find all events ready to execute
@@ -2138,10 +2156,10 @@ impl<C> Equeue<C> {
             #[cfg(equeue_queue_mode="lockless")]
             {
                 // TODO if this works we shouldn't need to lock
-                let guard = self.lock.lock();
-
-                let mut help_op = self.help_queue_();
+                //let guard = self.lock.lock();
                 loop {
+                    let help_op = self.help_queue_();
+
                     // did someone already change our tailsrc? dequeue? queue? restart
                     if tailsrc.load() != tailptr
                         || self.dequeue.load() != deheadptr
@@ -2151,16 +2169,15 @@ impl<C> Equeue<C> {
                     }
 
                     // cut our unrolled queue
-                    if let Err(help_op_) = self.try_do_queue_(
+                    if let Err(_) = self.try_do_queue_(
                         help_op,
                         Op::DequeueDequeue,
                         back.unwrap()
                     ) {
-                        help_op = help_op_;
                         continue;
                     }
 
-                    break 'retry deheadptr.inc().gen;
+                    break 'retry deheadptr.mark.wrapping_add(1);
                 }
             }
             #[cfg(equeue_queue_mode="locking")]
@@ -2175,23 +2192,26 @@ impl<C> Equeue<C> {
                 }
 
                 // point dequeue to the head of ready events
-                self.dequeue.store_gen_inc(deheadptr, headptr);
+                self.dequeue.store_marked(
+                    deheadptr.set_mark(deheadptr.mark.wrapping_add(1)),
+                    headptr
+                );
                 // point queue to the tail of ready events
-                self.queue.store_gen(headptr, tailptr);
+                self.queue.store_marked(headptr, tailptr);
 
                 // cut our unrolled queue
                 if let Some(tail) = tailptr.as_ref(self) {
                     tail.next_back.store(MarkedEptr::null());
                 }
-                back.unwrap().next.store_gen_inc(tailptr, MarkedEptr::null());
+                back.unwrap().next.store_marked_inc(tailptr, MarkedEptr::null());
 
-                break 'retry deheadptr.inc().gen;
+                break 'retry deheadptr.mark.wrapping_add(1);
             }
         };
 
         // unqueue from the dequeue list an event at a time
         Right(iter::from_fn(move || {
-            self.unqueue_(Right(gen), State::InFlight).1
+            self.unqueue_(Right(dequeue_mark), State::InFlight).1
         }))
     }
 
@@ -2202,18 +2222,17 @@ impl<C> Equeue<C> {
         #[cfg(equeue_queue_mode="lockless")]
         {
             // TODO if this works we shouldn't need to lock
-            let guard = self.lock.lock();
-
-            let mut help_op = self.help_queue_();
+            //let guard = self.lock.lock();
             loop {
+                let help_op = self.help_queue_();
+
                 let info = e.info.load();
                 if let Some(state_) = f(info) {
-                    if let Err(help_op_) = self.try_do_queue_(
+                    if let Err(_) = self.try_do_queue_(
                         help_op,
                         Op::UpdateState(state_),
                         e
                     ) {
-                        help_op = help_op_;
                         continue;
                     }
                 }
@@ -2240,18 +2259,17 @@ impl<C> Equeue<C> {
         #[cfg(equeue_queue_mode="lockless")]
         {
             // TODO if this works we shouldn't need to lock
-            let guard = self.lock.lock();
-
-            let mut help_op = self.help_queue_();
+            //let guard = self.lock.lock();
             loop {
+                let help_op = self.help_queue_();
+
                 let info = e.info.load();
                 if let Some(state_) = f(info) {
-                    if let Err(help_op_) = self.try_do_queue_(
+                    if let Err(_) = self.try_do_queue_(
                         help_op,
                         Op::UpdateStateInc(state_),
                         e
                     ) {
-                        help_op = help_op_;
                         continue;
                     }
                 }
