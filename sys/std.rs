@@ -1,7 +1,4 @@
 
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::fence;
-use core::sync::atomic;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::fmt::Debug;
@@ -21,10 +18,10 @@ use cfg_if::cfg_if;
 #[cfg(feature="alloc")] extern crate alloc as core_alloc;
 
 #[cfg(feature="std")] use std::time::Instant;
+#[cfg(feature="std")] use std::collections::HashMap;
 #[cfg(feature="std")] use std::sync::Mutex;
 #[cfg(feature="std")] use std::sync::MutexGuard;
 #[cfg(feature="std")] use std::sync::Condvar;
-#[cfg(feature="std")] use std::collections::HashMap;
 
 #[cfg(feature="async-io")] use async_io::Timer;
 #[cfg(feature="async-std")] use async_std::task::sleep;
@@ -54,31 +51,31 @@ cfg_if! {
     if #[cfg(equeue_utick_width="128")] {
         #[allow(non_camel_case_types)] pub type utick = u128;
         #[allow(non_camel_case_types)] pub type itick = i128;
-        pub type NonZeroUtick = core::num::NonZeroI128;
+        pub type NonZeroUtick = core::num::NonZeroU128;
         pub type NonZeroItick = core::num::NonZeroI128;
 
     } else if #[cfg(equeue_utick_width="64")] {
         #[allow(non_camel_case_types)] pub type utick = u64;
         #[allow(non_camel_case_types)] pub type itick = i64;
-        pub type NonZeroUtick = core::num::NonZeroI64;
+        pub type NonZeroUtick = core::num::NonZeroU64;
         pub type NonZeroItick = core::num::NonZeroI64;
 
     } else if #[cfg(equeue_utick_width="32")] {
         #[allow(non_camel_case_types)] pub type utick = u32;
         #[allow(non_camel_case_types)] pub type itick = i32;
-        pub type NonZeroUtick = core::num::NonZeroI32;
+        pub type NonZeroUtick = core::num::NonZeroU32;
         pub type NonZeroItick = core::num::NonZeroI32;
 
     } else if #[cfg(equeue_utick_width="16")] {
         #[allow(non_camel_case_types)] pub type utick = u16;
         #[allow(non_camel_case_types)] pub type itick = i16;
-        pub type NonZeroUtick = core::num::NonZeroI16;
+        pub type NonZeroUtick = core::num::NonZeroU16;
         pub type NonZeroItick = core::num::NonZeroI16;
 
     } else if #[cfg(equeue_utick_width="8")] {
         #[allow(non_camel_case_types)] pub type utick = u8;
         #[allow(non_camel_case_types)] pub type itick = i8;
-        pub type NonZeroUtick = core::num::NonZeroI8;
+        pub type NonZeroUtick = core::num::NonZeroU8;
         pub type NonZeroItick = core::num::NonZeroI8;
     }
 }

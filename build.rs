@@ -8,7 +8,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EQUEUE_SYS_PATH");
     let mut sys_path = env::var_os("EQUEUE_SYS_PATH")
         .map(PathBuf::from)
-        .unwrap_or(PathBuf::from("src/sys.rs"));
+        .unwrap_or_else(|| {
+            cfg_if! {
+                if #[cfg(feature="loom")] {
+                    PathBuf::from("sys/loom.rs")
+                } else {
+                    PathBuf::from("sys/std.rs")
+                }
+            }
+        });
     // convert from crate relative
     if sys_path.is_relative() {
         sys_path = Path::new("..").join(sys_path);

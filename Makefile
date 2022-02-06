@@ -9,12 +9,16 @@ all build:
 test:
 	cargo test --tests
 
+.PHONY: test-loom
+test-loom:
+	LOOM_MAX_PREEMPTIONS=2 cargo test --test test_loom --features loom
+
 .PHONY: build-configs
 build-configs:
 	cargo build --no-default-features
 	cargo build --no-default-features --features alloc
 	cargo build
-	cargo build
+	cargo build --features loom
 	cargo build --release
 	cargo build --features embedded-time
 	cargo build --features utick-at-least-u128
