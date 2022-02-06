@@ -65,10 +65,10 @@ fn main() {
     // override EQUEUE_QUEUE_MODE
     println!("cargo:rerun-if-env-changed=EQUEUE_QUEUE_MODE");
     match env::var("EQUEUE_QUEUE_MODE").as_deref() {
-        Ok("lockless") => {
+        Ok("lockless") | Err(_) => {
             println!("cargo:rustc-cfg=equeue_queue_mode=\"lockless\"");
         }
-        Ok("locking") | Err(_) => {
+        Ok("locking") => {
             println!("cargo:rustc-cfg=equeue_queue_mode=\"locking\"");
         }
         Ok(mode) => {
