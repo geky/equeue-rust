@@ -1025,6 +1025,15 @@ impl HelpOp {
             Op::UnqueueNext(_) => {
                 help_old.set_eptr(Eptr::null()).inc()
             }
+            // The only reason we need a redundant mark here for queue and dequeue
+            // is so that we can invalidate traversals correctly. If we only had
+            // a mark in dequeue, it's possible to get the updated dequeue mark,
+            // but the outdated queue pointer. Keeping a mark in both avoids this.
+            //
+            // You could also reverse the order of queue and dequeue updates,
+            // but then we'd need to store the old queue pointer somewhere, which
+            // doesn't work with this FSM scheme.
+            //
             Op::DequeueDequeue => {
                 help_old
                     .set_mark(help_old.mark.wrapping_add(1))
@@ -1032,7 +1041,10 @@ impl HelpOp {
                     .inc()
             }
             Op::DequeueQueue => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
+                help_old
+                    .set_mark(help_old.mark.wrapping_add(1))
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
+                    .inc()
             }
             Op::DequeueBackNextNextBack => {
                 help_old.set_eptr(Eptr::null()).inc()
@@ -1653,13 +1665,14 @@ impl<C> Equeue<C> {
         e.target = target;
 
         'retry: loop {
-            let dequeue_mark = self.dequeue.load().mark;
+            let headptr = self.queue.load();
+            let queue_mark = headptr.mark;
 
             // find insertion point
             let mut back = None;
             let mut sibling = None;
 
-            let mut tailptr = self.queue.load();
+            let mut tailptr = headptr;
             let mut tailsrc = &self.queue;
             while let Some(tail) = tailptr.as_ref(self) {
                 // compare targets
@@ -1739,20 +1752,17 @@ impl<C> Equeue<C> {
                         State::Canceled => break 'retry Err(e),
                     }
 
-                    // did someone already change our tailsrc? dequeue iteration? restart
+                    // did someone already change our tailsrc? queue iteration? restart
                     if tailsrc.load() != tailptr
-                        || self.dequeue.load().mark != dequeue_mark
+                        || self.queue.load().mark != queue_mark
                     {
                         continue 'retry;
                     }
 
                     // found our insertion point, now lets try to insert
-                    let change;
-                    match sibling {
+                    let change = match sibling {
                         None => {
                             // insert a new slice
-                            change = tailsrc as *const _ == &self.queue as *const _;
-
                             if let Err(_) = self.try_do_queue_(
                                 help_op,
                                 Op::EnqueueSliceNextBackNext,
@@ -1760,11 +1770,12 @@ impl<C> Equeue<C> {
                             ) {
                                 continue;
                             }
+
+                            tailsrc as *const _ == &self.queue as *const _
                         }
                         Some(sibling) => {
                             // push onto existing slice
                             e.sibling_back.store_marked(e.sibling_back.load(), sibling.sibling_back.load());
-                            change = false;
 
                             if let Err(_) = self.try_do_queue_(
                                 help_op,
@@ -1773,6 +1784,8 @@ impl<C> Equeue<C> {
                             ) {
                                 continue;
                             }
+
+                            false
                         }
                     };
 
@@ -1808,7 +1821,7 @@ impl<C> Equeue<C> {
 
                 // did someone already change our tailsrc? dequeue iteration? restart
                 if tailsrc.load() != tailptr
-                    || self.dequeue.load().mark != dequeue_mark
+                    || self.queue.load().mark != queue_mark
                 {
                     continue 'retry;
                 }
@@ -2197,7 +2210,10 @@ impl<C> Equeue<C> {
                     headptr
                 );
                 // point queue to the tail of ready events
-                self.queue.store_marked(headptr, tailptr);
+                self.queue.store_marked(
+                    headptr.set_mark(headptr.mark.wrapping_add(1)),
+                    tailptr
+                );
 
                 // cut our unrolled queue
                 if let Some(tail) = tailptr.as_ref(self) {
