@@ -811,7 +811,7 @@ struct HelpOp {
 
 #[cfg(equeue_queue_mode="lockless")]
 impl HelpOp {
-    const fn none() -> HelpOp {
+    const fn done() -> HelpOp {
         HelpOp {
             gen: 0,
             op: None,
@@ -819,7 +819,7 @@ impl HelpOp {
         }
     }
 
-    fn find_ctx<C>(
+    fn help_eptr<C>(
         &self,
         q: &Equeue<C>
     ) -> Eptr {
@@ -886,29 +886,29 @@ impl HelpOp {
 
     // TODO would it simplify things to use Eptr-granular Eptrs? And make -1 and -2 queue and dequeue?
     #[cfg(equeue_queue_mode="lockless")]
-    fn find_atom<'a, C>(
+    fn help_atom<'a, C>(
         &self,
         q: &'a Equeue<C>,
-        help_ctx: Eptr,
+        help_eptr: Eptr,
     ) -> Option<&'a Atomic<MarkedEptr, AtomicUdeptr>> {
         match self.op.unwrap() {
             HelpState::EnqueueSliceNextBackNext => {
-                match help_ctx.as_ref(q) {
+                match help_eptr.as_ebuf(q) {
                     Some(e) => Some(&e.next),
                     None    => Some(&q.queue),
                 }
             }
             HelpState::EnqueueSliceNextNextBack => {
-                help_ctx.as_ref(q).map(|e| &e.next_back)
+                help_eptr.as_ebuf(q).map(|e| &e.next_back)
             }
             HelpState::EnqueueSiblingSiblingSiblingBack => {
-                help_ctx.as_ref(q).map(|e| &e.sibling_back)
+                help_eptr.as_ebuf(q).map(|e| &e.sibling_back)
             }
             HelpState::EnqueueSiblingSiblingBackSibling => {
-                help_ctx.as_ref(q).map(|e| &e.sibling)
+                help_eptr.as_ebuf(q).map(|e| &e.sibling)
             }
             HelpState::UnqueueSliceNextBackNext(_) => {
-                match help_ctx.as_ref(q) {
+                match help_eptr.as_ebuf(q) {
                     Some(e)                                 => Some(&e.next),
                     _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
                     _ if q.dequeue.load().eptr == self.eptr => Some(&q.dequeue),
@@ -916,16 +916,16 @@ impl HelpOp {
                 }
             }
             HelpState::UnqueueSliceNextNextBack(_) => {
-                help_ctx.as_ref(q).map(|e| &e.next_back)
+                help_eptr.as_ebuf(q).map(|e| &e.next_back)
             }
             HelpState::UnqueueSiblingSiblingNext(_) => {
-                help_ctx.as_ref(q).map(|e| &e.next)
+                help_eptr.as_ebuf(q).map(|e| &e.next)
             }
             HelpState::UnqueueSiblingSiblingNextBack(_) => {
-                help_ctx.as_ref(q).map(|e| &e.next_back)
+                help_eptr.as_ebuf(q).map(|e| &e.next_back)
             }
             HelpState::UnqueueSiblingNextBackNext(_) => {
-                match help_ctx.as_ref(q) {
+                match help_eptr.as_ebuf(q) {
                     Some(e)                                 => Some(&e.next),
                     _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
                     _ if q.dequeue.load().eptr == self.eptr => Some(&q.dequeue),
@@ -933,16 +933,16 @@ impl HelpOp {
                 }
             }
             HelpState::UnqueueSiblingNextNextBack(_) => {
-                help_ctx.as_ref(q).map(|e| &e.next_back)
+                help_eptr.as_ebuf(q).map(|e| &e.next_back)
             }
             HelpState::UnqueueSiblingBackSibling(_) => {
-                help_ctx.as_ref(q).map(|e| &e.sibling)
+                help_eptr.as_ebuf(q).map(|e| &e.sibling)
             }
             HelpState::UnqueueSiblingSiblingBack(_) => {
-                help_ctx.as_ref(q).map(|e| &e.sibling_back)
+                help_eptr.as_ebuf(q).map(|e| &e.sibling_back)
             }
             HelpState::UnqueueNext(_) => {
-                Some(&help_ctx.as_ref(q).unwrap().next)
+                Some(&help_eptr.as_ebuf(q).unwrap().next)
             }
             HelpState::DequeueDequeue => {
                 Some(&q.dequeue)
@@ -951,22 +951,22 @@ impl HelpOp {
                 Some(&q.queue)
             }
             HelpState::DequeueBackNextNextBack => {
-                help_ctx.as_ref(q).map(|e| &e.next_back)
+                help_eptr.as_ebuf(q).map(|e| &e.next_back)
             }
             HelpState::DequeueBackNext => {
-                Some(&help_ctx.as_ref(q).unwrap().next)
+                Some(&help_eptr.as_ebuf(q).unwrap().next)
             }
             HelpState::UpdateState(_) => {
-                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
+                Some(help_eptr.as_ebuf(q).unwrap().info.as_atomic_marked())
             }
             HelpState::UpdateStateInc(_) => {
-                Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
+                Some(help_eptr.as_ebuf(q).unwrap().info.as_atomic_marked())
             }
         }
     }
 
     #[cfg(equeue_queue_mode="lockless")]
-    fn find_new<C>(
+    fn help_new<C>(
         &self,
         q: &Equeue<C>,
         help_old: MarkedEptr
@@ -1057,7 +1057,7 @@ impl HelpOp {
     }
 
     #[cfg(equeue_queue_mode="lockless")]
-    fn find_next(
+    fn help_next(
         &self,
     ) -> Option<HelpState> {
         match self.op.unwrap() {
@@ -1229,7 +1229,7 @@ impl<C> Equeue<C> {
             break_: Atomic::new(0),
             precision: config.precision,
 
-            #[cfg(equeue_queue_mode="lockless")] help_op: Atomic::new(HelpOp::none()),
+            #[cfg(equeue_queue_mode="lockless")] help_op: Atomic::new(HelpOp::done()),
             #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic::new(MarkedEptr::null()),
             #[cfg(equeue_queue_mode="lockless")] help_old: Atomic::new(MarkedEptr::null()),
 
@@ -1527,65 +1527,63 @@ impl<C> Equeue<C> {
             // find help-op location and old value, we store these globally
             // marked by the help-op's generation count to keep things in sync
             let mut help_ctx = self.help_ctx.load();
-            if help_ctx.mark != help_op.gen {
+            let help_atom;
+            let help_old;
+            if help_ctx.gen != help_op.gen {
                 // we must be one behind, if not significant state has changed 
-                if help_ctx.mark != help_op.gen.wrapping_sub(1) {
+                if help_ctx.gen != help_op.gen.wrapping_sub(1) {
                     continue 'retry;
                 }
 
-                let help_ctx_ = help_op.find_ctx(self)
-                    .as_marked()
-                    .set_mark(help_op.gen);
+                // get reference to the atom we are updating
+                let help_eptr = help_op.help_eptr(self);
+                help_atom = help_op.help_atom(self, help_eptr);
+
+                // load the old value
+                help_old = match help_atom {
+                    Some(atom) => atom.load(),
+                    None => MarkedEptr::null(),
+                };
+
+                // try to commit the context
+                let help_ctx_ = help_ctx
+                    .set_mark(help_old.gen)
+                    .set_eptr(help_eptr)
+                    .inc();
                 if let Err(_) = self.help_ctx.cas(help_ctx, help_ctx_) {
                     continue 'retry;
                 }
 
                 help_ctx = help_ctx_;
-            }
-
-            // get reference to atom we are updating
-            let help_atom = help_op.find_atom(self, help_ctx.eptr);
-
-            // we always load the old value from the source, this is to preserve
-            // the mark field which we override in our help state 
-            let old = match help_atom {
-                Some(atom) => atom.load(),
-                None => MarkedEptr::null(),
-            };
-
-            let mut help_old = self.help_old.load();
-            if help_old.mark != help_op.gen {
-                // we must be one behind, if not significant state has changed 
-                if help_old.mark != help_op.gen.wrapping_sub(1) {
-                    continue 'retry;
-                }
-
-                let help_old_ = old.set_mark(help_op.gen);
-                if let Err(_) = self.help_old.cas(help_old, help_old_) {
-                    continue 'retry;
-                }
-
-                help_old = help_old_;
+            } else {
+                // get reference to atom we are updating
+                help_atom = help_op.help_atom(self, help_ctx.eptr);
+                
+                // we always load the old value from the source
+                help_old = match help_atom {
+                    Some(atom) => atom.load(),
+                    None => MarkedEptr::null(),
+                };
             }
 
             if let Some(atom) = help_atom
                 // if the value does not match help_old, someone _must_ have
                 // completed the operation
-                .filter(|_| help_old.set_mark(0) == old.set_mark(0))
+                .filter(|_| help_old.gen == help_ctx.mark)
             {
                 // find new value
-                let new = help_op.find_new(self, old);
+                let help_new = help_op.help_new(self, help_old);
 
                 // perform the actual compare and swap
-                if let Err(old_) = atom.cas(old, new) {
+                if let Err(help_old_) = atom.cas(help_old, help_new) {
                     // oh did someone update the value before us?
-                    if old_ != new {
+                    if help_old_ != help_new {
                         continue 'retry;
                     }
                 }
             }
 
-            let op_ = help_op.find_next();
+            let op_ = help_op.help_next();
             let help_op_ = HelpOp {
                 gen: help_op.gen.wrapping_add(if op_.is_some() { 1 } else { 0 }),
                 op: op_,
