@@ -141,7 +141,6 @@ cfg_if! {
 
 // Locking primitive
 #[cfg(any(
-    all(), // TODO rm this
     equeue_queue_mode="locking",
     equeue_alloc_mode="locking",
     equeue_break_mode="locking",

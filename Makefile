@@ -8,6 +8,7 @@ all build:
 .PHONY: test
 test:
 	cargo test --tests
+	LOOM_MAX_PREEMPTIONS=1 cargo test --test test_loom --features loom
 
 .PHONY: test-loom
 test-loom:

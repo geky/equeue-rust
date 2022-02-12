@@ -38,6 +38,7 @@ use core::task::RawWakerVTable;
 use core::ops::Add;
 use core::ops::Sub;
 use core::convert::Infallible;
+use core::mem::transmute_copy;
 
 use either::Either;
 use either::Left;
@@ -353,20 +354,29 @@ impl<T: Copy + Debug, S: AtomicStorage> Debug for Atomic<T, S> {
 }
 
 impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
+    const _ASSERT_FITS: bool = {
+        assert!(size_of::<T>() <= size_of::<S::U>());
+        true
+    };
+
     fn new(t: T) -> Self {
+        // compile-time assert
+        debug_assert!(Self::_ASSERT_FITS);
+        // run-time assert (I don't trust the compile-time assert yet)
         debug_assert!(size_of::<T>() <= size_of::<S::U>());
+
         Self(
-            S::new(unsafe { *(&t as *const _ as *const S::U) }),
+            S::new(unsafe { transmute_copy(&t) }),
             PhantomData
         )
     }
 
     fn load(&self) -> T {
-        unsafe { *(&self.0.load() as *const _ as *const T) }
+        unsafe { transmute_copy(&self.0.load()) }
     }
 
     fn store(&self, t: T) {
-        self.0.store(unsafe { *(&t as *const _ as *const S::U) })
+        self.0.store(unsafe { transmute_copy(&t) })
     }
 
     #[cfg(any(
@@ -376,11 +386,11 @@ impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
     ))]
     fn cas(&self, old: T, new: T) -> Result<T, T> {
         self.0.cas(
-            unsafe { *(&old as *const _ as *const S::U) },
-            unsafe { *(&new as *const _ as *const S::U) },
+            unsafe { transmute_copy(&old) },
+            unsafe { transmute_copy(&new) },
         )
-            .map(|t| unsafe { *(&t as *const _ as *const T) })
-            .map_err(|t| unsafe { *(&t as *const _ as *const T) })
+            .map(|t| unsafe { transmute_copy(&t) })
+            .map_err(|t| unsafe { transmute_copy(&t) })
     }
 }
 
@@ -440,10 +450,10 @@ impl Eptr {
 /// A marked eptr, used to double-check non-locking parts
 /// of the data structures
 #[derive(Copy, Clone, Eq, PartialEq)]
-#[repr(C)]
+#[repr(C)] // we need a specific order to transmute between marked types
 struct MarkedEptr {
-    mark: ugen,
     gen: ugen,
+    mark: ugen,
     eptr: Eptr,
 }
 
@@ -451,8 +461,8 @@ impl Debug for MarkedEptr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("MarkedEptr")
-            .field(&self.mark)
             .field(&self.gen)
+            .field(&self.mark)
             .field(&format_args!("{:#x}", self.eptr.0))
             .finish()
     }
@@ -461,20 +471,9 @@ impl Debug for MarkedEptr {
 impl MarkedEptr {
     const fn null() -> MarkedEptr {
         MarkedEptr {
-            mark: 0,
             gen: 0,
+            mark: 0,
             eptr: Eptr::null(),
-        }
-    }
-
-    // TODO should we actually get rid of this relatively dangerous function?
-    //
-    // prefer: MarkedEptr::null().set_ebuf(q, e)
-    fn from_ebuf<C>(q: &Equeue<C>, e: &Ebuf) -> MarkedEptr {
-        MarkedEptr {
-            mark: 0,
-            gen: 0,
-            eptr: Eptr::from_ebuf(q, e),
         }
     }
 
@@ -488,51 +487,51 @@ impl MarkedEptr {
 
     fn inc(self) -> MarkedEptr {
         MarkedEptr {
-            mark: self.mark,
             gen: self.gen.wrapping_add(1),
+            mark: self.mark,
             eptr: self.eptr,
         }
     }
 
     fn set_eptr(self, other: Eptr) -> MarkedEptr {
         MarkedEptr {
-            mark: self.mark,
             gen: self.gen,
+            mark: self.mark,
             eptr: other,
         }
     }
 
     fn cp_eptr(self, other: MarkedEptr) -> MarkedEptr {
         MarkedEptr {
-            mark: self.mark,
             gen: self.gen,
+            mark: self.mark,
             eptr: other.eptr,
         }
     }
 
     fn set_mark(self, mark: ugen) -> MarkedEptr {
         MarkedEptr {
-            mark: mark,
             gen: self.gen,
+            mark: mark,
             eptr: self.eptr,
         }
     }
 
     fn as_info(self) -> Info {
-        unsafe { *(&self as *const _ as *const Info) }
+        unsafe { transmute_copy(&self) }
     }
 }
 
 // interactions with atomics
 impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
-    fn store_marked(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let new = old.cp_eptr(new);
+    fn store_marked(&self, old: MarkedEptr, new: Eptr) -> MarkedEptr {
+        let new = old.set_eptr(new);
         self.store(new);
         new
     }
 
-    fn store_marked_inc(&self, old: MarkedEptr, new: MarkedEptr) -> MarkedEptr {
-        let new = old.cp_eptr(new).inc();
+    fn store_marked_inc(&self, old: MarkedEptr, new: Eptr) -> MarkedEptr {
+        let new = old.set_eptr(new).inc();
         self.store(new);
         new
     }
@@ -541,8 +540,8 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        let new = old.cp_eptr(new);
+    fn cas_marked(&self, old: MarkedEptr, new: Eptr) -> Result<MarkedEptr, MarkedEptr> {
+        let new = old.set_eptr(new);
         self.cas(old, new)
     }
 
@@ -550,8 +549,8 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked_inc(&self, old: MarkedEptr, new: MarkedEptr) -> Result<MarkedEptr, MarkedEptr> {
-        let new = old.cp_eptr(new).inc();
+    fn cas_marked_inc(&self, old: MarkedEptr, new: Eptr) -> Result<MarkedEptr, MarkedEptr> {
+        let new = old.set_eptr(new).inc();
         self.cas(old, new)
     }
 }
@@ -559,22 +558,22 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
 
 /// Several event fields are crammed in here to avoid wasting space
 #[derive(Copy, Clone, Eq, PartialEq)]
-#[repr(C)]
+#[repr(C)] // we need a specific order to transmute between marked types
 struct Info {
-    mark: ugen,
     gen: ugen,
     id: ugen,
-    state: ugen,
+    state: u8,
+    npw2: u8,
 }
 
 impl Debug for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
-        f.debug_tuple("Info")
-            .field(&self.mark)
-            .field(&self.gen)
-            .field(&self.id)
-            .field(&format_args!("{:#x}", self.state))
+        f.debug_struct("Info")
+            .field("gen", &self.gen)
+            .field("id", &self.id)
+            .field("state", &format_args!("{:#x}", self.state))
+            .field("npw2", &self.npw2)
             .finish()
     }
 }
@@ -589,7 +588,7 @@ enum State {
 }
 
 impl State {
-    fn from_ugen(state: ugen) -> State {
+    fn from_u8(state: u8) -> State {
         match state {
             0 => State::Alloced,
             1 => State::InQueue,
@@ -600,7 +599,7 @@ impl State {
         }
     }
 
-    fn as_ugen(&self) -> ugen {
+    fn as_u8(&self) -> u8 {
         match self {
             State::Alloced  => 0,
             State::InQueue  => 1,
@@ -612,77 +611,77 @@ impl State {
 }
 
 impl Info {
-    fn new(id: ugen, static_: bool, once: bool, state: State) -> Info {
+    fn new(id: ugen, static_: bool, once: bool, state: State, npw2: u8) -> Info {
         Info {
-            mark: 0,
             gen: 0,
             id: id,
             state: (
-                ((static_ as ugen) << 8*size_of::<ugen>()-1)
-                | ((once as ugen) << 8*size_of::<ugen>()-2)
-                | state.as_ugen()
-            )
+                ((static_ as u8) << 7)
+                | ((once as u8) << 6)
+                | state.as_u8()
+            ),
+            npw2: npw2,
         }
     }
 
     fn static_(&self) -> bool {
-        self.state & (1 << 8*size_of::<ugen>()-1) != 0
+        self.state & 0x80 != 0
     }
 
     fn once(&self) -> bool {
-        self.state & (1 << 8*size_of::<ugen>()-2) != 0
+        self.state & 0x40 != 0
     }
 
     fn state(&self) -> State {
-        State::from_ugen(self.state & 0xf)
+        State::from_u8(self.state & 0x0f)
     }
 
     fn inc_id(self) -> Info {
         Info {
-            mark: self.mark,
             gen: self.gen,
             id: self.id.wrapping_add(1),
-            state: self.state
+            state: self.state,
+            npw2: self.npw2,
         }
     }
 
     fn set_static(self, static_: bool) -> Info {
         Info {
-            mark: self.mark,
             gen: self.gen,
             id: self.id,
             state: if static_ {
-                self.state | (1 << (8*size_of::<ugen>()-1))
+                self.state | 0x80
             } else {
-                self.state & !(1 << (8*size_of::<ugen>()-1))
-            }
+                self.state & !0x80
+            },
+            npw2: self.npw2,
         }
     }
 
     fn set_once(self, static_: bool) -> Info {
         Info {
-            mark: self.mark,
             gen: self.gen,
             id: self.id,
             state: if static_ {
-                self.state | (1 << (8*size_of::<ugen>()-2))
+                self.state | 0x40
             } else {
-                self.state & !(1 << (8*size_of::<ugen>()-2))
-            }
+                self.state & !0x40
+            },
+            npw2: self.npw2,
         }
     }
 
     fn set_state(self, state: State) -> Info {
         Info {
-            mark: self.mark,
             gen: self.gen,
             id: self.id,
-            state: (self.state & !0xf) | state.as_ugen()
+            state: (self.state & !0x0f) | state.as_u8(),
+            npw2: self.npw2,
         }
     }
 
     fn as_marked(self) -> MarkedEptr {
-        unsafe { *(&self as *const _ as *const MarkedEptr) }
+        unsafe { transmute_copy(&self) }
     }
 }
 
@@ -701,9 +700,7 @@ struct Ebuf {
     next_back: Atomic<MarkedEptr, AtomicUdeptr>,
     sibling: Atomic<MarkedEptr, AtomicUdeptr>,
     sibling_back: Atomic<MarkedEptr, AtomicUdeptr>,
-    // TODO squish npw2 into info again
     info: Atomic<Info, AtomicUdeptr>,
-    npw2: u8,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -718,13 +715,13 @@ impl Ebuf {
         Eptr::from_ebuf(q, self)
     }
 
-    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr {
-        MarkedEptr::from_ebuf(q, self)
+    // info access
+    fn npw2(&self) -> u8 {
+        self.info.load().npw2
     }
 
-    // info access
     fn size(&self) -> usize {
-        align_of::<Ebuf>() << self.npw2
+        align_of::<Ebuf>() << self.npw2()
     }
 
     // access to the trailing buffer
@@ -764,7 +761,6 @@ impl Ebuf {
 // some convenience extensions to Option<&Ebuf>
 trait OptionEbuf<'a> {
     fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr;
-    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr;
 }
 
 impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
@@ -774,21 +770,13 @@ impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
             None => Eptr::null(),
         }
     }
-
-    fn as_marked<C>(&self, q: &Equeue<C>) -> MarkedEptr {
-        match self {
-            Some(e) => e.as_marked(q),
-            None => MarkedEptr::null(),
-        }
-    }
 }
 
-// TODO rename to HelpState and HelpInfo?
 /// State machine for mutually synchronized operations
 #[cfg(equeue_queue_mode="lockless")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u8)]
-enum Op {
+enum HelpState {
     EnqueueSliceNextBackNext,             // -.
     EnqueueSliceNextNextBack,             // <'---.
     EnqueueSiblingSiblingSiblingBack,     // -.   |
@@ -817,7 +805,7 @@ enum Op {
 #[derive(Debug, Copy, Clone)]
 struct HelpOp {
     gen: ugen,
-    op: Option<Op>,
+    op: Option<HelpState>,
     eptr: Eptr,
 }
 
@@ -836,61 +824,61 @@ impl HelpOp {
         q: &Equeue<C>
     ) -> Eptr {
         match self.op.unwrap() {
-            Op::EnqueueSliceNextBackNext => {
+            HelpState::EnqueueSliceNextBackNext => {
                 self.eptr.as_ref(q).unwrap().next_back.load().eptr
             }
-            Op::EnqueueSliceNextNextBack => {
+            HelpState::EnqueueSliceNextNextBack => {
                 self.eptr.as_ref(q).unwrap().next.load().eptr
             }
-            Op::EnqueueSiblingSiblingSiblingBack => {
+            HelpState::EnqueueSiblingSiblingSiblingBack => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
             }
-            Op::EnqueueSiblingSiblingBackSibling => {
+            HelpState::EnqueueSiblingSiblingBackSibling => {
                 self.eptr.as_ref(q).unwrap().sibling_back.load().eptr
             }
-            Op::UnqueueSliceNextBackNext(_) => {
+            HelpState::UnqueueSliceNextBackNext(_) => {
                 self.eptr.as_ref(q).unwrap().next_back.load().eptr
             }
-            Op::UnqueueSliceNextNextBack(_) => {
+            HelpState::UnqueueSliceNextNextBack(_) => {
                 self.eptr.as_ref(q).unwrap().next.load().eptr
             }
-            Op::UnqueueSiblingSiblingNext(_) => {
+            HelpState::UnqueueSiblingSiblingNext(_) => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
             }
-            Op::UnqueueSiblingSiblingNextBack(_) => {
+            HelpState::UnqueueSiblingSiblingNextBack(_) => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
             }
-            Op::UnqueueSiblingNextBackNext(_) => {
+            HelpState::UnqueueSiblingNextBackNext(_) => {
                 self.eptr.as_ref(q).unwrap().next_back.load().eptr
             }
-            Op::UnqueueSiblingNextNextBack(_) => {
+            HelpState::UnqueueSiblingNextNextBack(_) => {
                 self.eptr.as_ref(q).unwrap().next.load().eptr
             }
-            Op::UnqueueSiblingBackSibling(_) => {
+            HelpState::UnqueueSiblingBackSibling(_) => {
                 self.eptr.as_ref(q).unwrap().sibling_back.load().eptr
             }
-            Op::UnqueueSiblingSiblingBack(_) => {
+            HelpState::UnqueueSiblingSiblingBack(_) => {
                 self.eptr.as_ref(q).unwrap().sibling.load().eptr
             }
-            Op::UnqueueNext(_) => {
+            HelpState::UnqueueNext(_) => {
                 self.eptr
             }
-            Op::DequeueDequeue => {
+            HelpState::DequeueDequeue => {
                 Eptr::null()
             }
-            Op::DequeueQueue => {
+            HelpState::DequeueQueue => {
                 Eptr::null()
             }
-            Op::DequeueBackNextNextBack => {
+            HelpState::DequeueBackNextNextBack => {
                 self.eptr.as_ref(q).unwrap().next.load().eptr
             }
-            Op::DequeueBackNext => {
+            HelpState::DequeueBackNext => {
                 self.eptr
             }
-            Op::UpdateState(_) => {
+            HelpState::UpdateState(_) => {
                 self.eptr
             }
-            Op::UpdateStateInc(_) => {
+            HelpState::UpdateStateInc(_) => {
                 self.eptr
             }
         }
@@ -904,22 +892,22 @@ impl HelpOp {
         help_ctx: Eptr,
     ) -> Option<&'a Atomic<MarkedEptr, AtomicUdeptr>> {
         match self.op.unwrap() {
-            Op::EnqueueSliceNextBackNext => {
+            HelpState::EnqueueSliceNextBackNext => {
                 match help_ctx.as_ref(q) {
                     Some(e) => Some(&e.next),
                     None    => Some(&q.queue),
                 }
             }
-            Op::EnqueueSliceNextNextBack => {
+            HelpState::EnqueueSliceNextNextBack => {
                 help_ctx.as_ref(q).map(|e| &e.next_back)
             }
-            Op::EnqueueSiblingSiblingSiblingBack => {
+            HelpState::EnqueueSiblingSiblingSiblingBack => {
                 help_ctx.as_ref(q).map(|e| &e.sibling_back)
             }
-            Op::EnqueueSiblingSiblingBackSibling => {
+            HelpState::EnqueueSiblingSiblingBackSibling => {
                 help_ctx.as_ref(q).map(|e| &e.sibling)
             }
-            Op::UnqueueSliceNextBackNext(_) => {
+            HelpState::UnqueueSliceNextBackNext(_) => {
                 match help_ctx.as_ref(q) {
                     Some(e)                                 => Some(&e.next),
                     _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
@@ -927,16 +915,16 @@ impl HelpOp {
                     None                                    => None,
                 }
             }
-            Op::UnqueueSliceNextNextBack(_) => {
+            HelpState::UnqueueSliceNextNextBack(_) => {
                 help_ctx.as_ref(q).map(|e| &e.next_back)
             }
-            Op::UnqueueSiblingSiblingNext(_) => {
+            HelpState::UnqueueSiblingSiblingNext(_) => {
                 help_ctx.as_ref(q).map(|e| &e.next)
             }
-            Op::UnqueueSiblingSiblingNextBack(_) => {
+            HelpState::UnqueueSiblingSiblingNextBack(_) => {
                 help_ctx.as_ref(q).map(|e| &e.next_back)
             }
-            Op::UnqueueSiblingNextBackNext(_) => {
+            HelpState::UnqueueSiblingNextBackNext(_) => {
                 match help_ctx.as_ref(q) {
                     Some(e)                                 => Some(&e.next),
                     _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
@@ -944,34 +932,34 @@ impl HelpOp {
                     None                                    => None,
                 }
             }
-            Op::UnqueueSiblingNextNextBack(_) => {
+            HelpState::UnqueueSiblingNextNextBack(_) => {
                 help_ctx.as_ref(q).map(|e| &e.next_back)
             }
-            Op::UnqueueSiblingBackSibling(_) => {
+            HelpState::UnqueueSiblingBackSibling(_) => {
                 help_ctx.as_ref(q).map(|e| &e.sibling)
             }
-            Op::UnqueueSiblingSiblingBack(_) => {
+            HelpState::UnqueueSiblingSiblingBack(_) => {
                 help_ctx.as_ref(q).map(|e| &e.sibling_back)
             }
-            Op::UnqueueNext(_) => {
+            HelpState::UnqueueNext(_) => {
                 Some(&help_ctx.as_ref(q).unwrap().next)
             }
-            Op::DequeueDequeue => {
+            HelpState::DequeueDequeue => {
                 Some(&q.dequeue)
             }
-            Op::DequeueQueue => {
+            HelpState::DequeueQueue => {
                 Some(&q.queue)
             }
-            Op::DequeueBackNextNextBack => {
+            HelpState::DequeueBackNextNextBack => {
                 help_ctx.as_ref(q).map(|e| &e.next_back)
             }
-            Op::DequeueBackNext => {
+            HelpState::DequeueBackNext => {
                 Some(&help_ctx.as_ref(q).unwrap().next)
             }
-            Op::UpdateState(_) => {
+            HelpState::UpdateState(_) => {
                 Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
             }
-            Op::UpdateStateInc(_) => {
+            HelpState::UpdateStateInc(_) => {
                 Some(help_ctx.as_ref(q).unwrap().info.as_atomic_marked())
             }
         }
@@ -984,45 +972,43 @@ impl HelpOp {
         help_old: MarkedEptr
     ) -> MarkedEptr {
         match self.op.unwrap() {
-            // TODO we need to be cp_gen_inc marked pointer here, note this causes problems for
-            // our dequeue generation, but fortunately have the extra mark slot for that
-            Op::EnqueueSliceNextBackNext => {
+            HelpState::EnqueueSliceNextBackNext => {
                 help_old.set_eptr(self.eptr).inc()
             }
-            Op::EnqueueSliceNextNextBack => {
+            HelpState::EnqueueSliceNextNextBack => {
                 help_old.set_eptr(self.eptr).inc()
             }
-            Op::EnqueueSiblingSiblingSiblingBack => {
+            HelpState::EnqueueSiblingSiblingSiblingBack => {
                 help_old.set_eptr(self.eptr).inc()
             }
-            Op::EnqueueSiblingSiblingBackSibling => {
+            HelpState::EnqueueSiblingSiblingBackSibling => {
                 help_old.set_eptr(self.eptr).inc()
             }
-            Op::UnqueueSliceNextBackNext(_) => { // TODO NEED TO CHECK DEQUEUE MARK?
+            HelpState::UnqueueSliceNextBackNext(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
             }
-            Op::UnqueueSliceNextNextBack(_) => {
+            HelpState::UnqueueSliceNextNextBack(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
             }
-            Op::UnqueueSiblingSiblingNext(_) => {
+            HelpState::UnqueueSiblingSiblingNext(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
             }
-            Op::UnqueueSiblingSiblingNextBack(_) => {
+            HelpState::UnqueueSiblingSiblingNextBack(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
             }
-            Op::UnqueueSiblingNextBackNext(_) => {
+            HelpState::UnqueueSiblingNextBackNext(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
-            Op::UnqueueSiblingNextNextBack(_) => {
+            HelpState::UnqueueSiblingNextNextBack(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
-            Op::UnqueueSiblingBackSibling(_) => {
+            HelpState::UnqueueSiblingBackSibling(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
             }
-            Op::UnqueueSiblingSiblingBack(_) => {
+            HelpState::UnqueueSiblingSiblingBack(_) => {
                 help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load()).inc()
             }
-            Op::UnqueueNext(_) => {
+            HelpState::UnqueueNext(_) => {
                 help_old.set_eptr(Eptr::null()).inc()
             }
             // The only reason we need a redundant mark here for queue and dequeue
@@ -1034,31 +1020,31 @@ impl HelpOp {
             // but then we'd need to store the old queue pointer somewhere, which
             // doesn't work with this FSM scheme.
             //
-            Op::DequeueDequeue => {
+            HelpState::DequeueDequeue => {
                 help_old
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(q.queue.load())
                     .inc()
             }
-            Op::DequeueQueue => {
+            HelpState::DequeueQueue => {
                 help_old
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .inc()
             }
-            Op::DequeueBackNextNextBack => {
+            HelpState::DequeueBackNextNextBack => {
                 help_old.set_eptr(Eptr::null()).inc()
             }
-            Op::DequeueBackNext => {
+            HelpState::DequeueBackNext => {
                 help_old.set_eptr(Eptr::null()).inc()
             }
-            Op::UpdateState(state) => {
+            HelpState::UpdateState(state) => {
                 help_old.as_info()
                     .set_state(state)
                     .as_marked()
                     .inc()
             }
-            Op::UpdateStateInc(state) => {
+            HelpState::UpdateStateInc(state) => {
                 help_old.as_info()
                     .inc_id()
                     .set_static(false)
@@ -1073,30 +1059,30 @@ impl HelpOp {
     #[cfg(equeue_queue_mode="lockless")]
     fn find_next(
         &self,
-    ) -> Option<Op> {
+    ) -> Option<HelpState> {
         match self.op.unwrap() {
-            Op::EnqueueSliceNextBackNext             => Some(Op::EnqueueSliceNextNextBack),             // -.
-            Op::EnqueueSliceNextNextBack             => Some(Op::UpdateState(State::InQueue)),          // <'---.
-            Op::EnqueueSiblingSiblingSiblingBack     => Some(Op::EnqueueSiblingSiblingBackSibling),     // -.   |
-            Op::EnqueueSiblingSiblingBackSibling     => Some(Op::UpdateState(State::InQueue)),          // <'---+
-                                                                                                        //      |
-            Op::UnqueueSliceNextBackNext(state)      => Some(Op::UnqueueSliceNextNextBack(state)),      // -.   |
-            Op::UnqueueSliceNextNextBack(state)      => Some(Op::UnqueueSiblingBackSibling(state)),     // <'-. |
-            Op::UnqueueSiblingSiblingNext(state)     => Some(Op::UnqueueSiblingSiblingNextBack(state)), // -. | |
-            Op::UnqueueSiblingSiblingNextBack(state) => Some(Op::UnqueueSiblingNextBackNext(state)),    // <' | |
-            Op::UnqueueSiblingNextBackNext(state)    => Some(Op::UnqueueSiblingNextNextBack(state)),    // <' | |
-            Op::UnqueueSiblingNextNextBack(state)    => Some(Op::UnqueueSiblingBackSibling(state)),     // <' | |
-            Op::UnqueueSiblingBackSibling(state)     => Some(Op::UnqueueSiblingSiblingBack(state)),     // <'<' |
-            Op::UnqueueSiblingSiblingBack(state)     => Some(Op::UnqueueNext(state)),                   // <'   |
-            Op::UnqueueNext(state)                   => Some(Op::UpdateState(state)),                   // <'---+
-                                                                                                        //      |
-            Op::DequeueDequeue                       => Some(Op::DequeueQueue),                         // -.   |
-            Op::DequeueQueue                         => Some(Op::DequeueBackNextNextBack),              // <'   |
-            Op::DequeueBackNextNextBack              => Some(Op::DequeueBackNext),                      // <'   |
-            Op::DequeueBackNext                      => None,                                           // <'   |
-                                                                                                        //      |
-            Op::UpdateState(_)                       => None,                                           // <----'
-            Op::UpdateStateInc(_)                    => None,                                           //
+            HelpState::EnqueueSliceNextBackNext             => Some(HelpState::EnqueueSliceNextNextBack),             // -.
+            HelpState::EnqueueSliceNextNextBack             => Some(HelpState::UpdateState(State::InQueue)),          // <'---.
+            HelpState::EnqueueSiblingSiblingSiblingBack     => Some(HelpState::EnqueueSiblingSiblingBackSibling),     // -.   |
+            HelpState::EnqueueSiblingSiblingBackSibling     => Some(HelpState::UpdateState(State::InQueue)),          // <'---+
+                                                                                                                      //      |
+            HelpState::UnqueueSliceNextBackNext(state)      => Some(HelpState::UnqueueSliceNextNextBack(state)),      // -.   |
+            HelpState::UnqueueSliceNextNextBack(state)      => Some(HelpState::UnqueueSiblingBackSibling(state)),     // <'-. |
+            HelpState::UnqueueSiblingSiblingNext(state)     => Some(HelpState::UnqueueSiblingSiblingNextBack(state)), // -. | |
+            HelpState::UnqueueSiblingSiblingNextBack(state) => Some(HelpState::UnqueueSiblingNextBackNext(state)),    // <' | |
+            HelpState::UnqueueSiblingNextBackNext(state)    => Some(HelpState::UnqueueSiblingNextNextBack(state)),    // <' | |
+            HelpState::UnqueueSiblingNextNextBack(state)    => Some(HelpState::UnqueueSiblingBackSibling(state)),     // <' | |
+            HelpState::UnqueueSiblingBackSibling(state)     => Some(HelpState::UnqueueSiblingSiblingBack(state)),     // <'<' |
+            HelpState::UnqueueSiblingSiblingBack(state)     => Some(HelpState::UnqueueNext(state)),                   // <'   |
+            HelpState::UnqueueNext(state)                   => Some(HelpState::UpdateState(state)),                   // <'---+
+                                                                                                                      //      |
+            HelpState::DequeueDequeue                       => Some(HelpState::DequeueQueue),                         // -.   |
+            HelpState::DequeueQueue                         => Some(HelpState::DequeueBackNextNextBack),              // <'   |
+            HelpState::DequeueBackNextNextBack              => Some(HelpState::DequeueBackNext),                      // <'   |
+            HelpState::DequeueBackNext                      => None,                                                  // <'   |
+                                                                                                                      //      |
+            HelpState::UpdateState(_)                       => None,                                                  // <----'
+            HelpState::UpdateStateInc(_)                    => None,                                                  //
         }
     }
 }
@@ -1117,7 +1103,7 @@ pub struct Equeue<
     // queue management
     queue: Atomic<MarkedEptr, AtomicUdeptr>,
     dequeue: Atomic<MarkedEptr, AtomicUdeptr>,
-    break_: Atomic<bool, AtomicUeptr>,
+    break_: Atomic<u8, AtomicUeptr>,
     precision: u8,
 
     #[cfg(equeue_queue_mode="lockless")] help_op: Atomic<HelpOp, AtomicUdeptr>,
@@ -1126,16 +1112,17 @@ pub struct Equeue<
 
     // other things
     clock: C,
+    #[cfg(any(
+        equeue_queue_mode="locking",
+        equeue_alloc_mode="locking",
+        equeue_break_mode="locking",
+    ))]
     lock: SysLock,
 }
 
 // assert that we implement Send + Sync
-#[allow(unconditional_recursion)]
-#[cfg(feature="std")]
-fn assert_send<T: Send>() -> ! { assert_send::<Equeue>() }
-#[allow(unconditional_recursion)]
-#[cfg(feature="std")]
-fn assert_sync<T: Sync>() -> ! { assert_sync::<Equeue>() }
+#[allow(unconditional_recursion)] fn assert_send<T: Send, C: Send>() -> ! { assert_send::<Equeue<C>, C>() }
+#[allow(unconditional_recursion)] fn assert_sync<T: Sync, C: Sync>() -> ! { assert_sync::<Equeue<C>, C>() }
 
 /// Event queue configuration
 #[derive(Debug)]
@@ -1239,7 +1226,7 @@ impl<C> Equeue<C> {
 
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
-            break_: Atomic::new(false),
+            break_: Atomic::new(0),
             precision: config.precision,
 
             #[cfg(equeue_queue_mode="lockless")] help_op: Atomic::new(HelpOp::none()),
@@ -1249,6 +1236,11 @@ impl<C> Equeue<C> {
             clock: config.clock
                 .map_left(|f| f())
                 .into_inner(),
+            #[cfg(any(
+                equeue_queue_mode="locking",
+                equeue_alloc_mode="locking",
+                equeue_break_mode="locking",
+            ))]
             lock: SysLock::new(),
         }
     }
@@ -1306,24 +1298,12 @@ impl<C> Equeue<C> {
             .contains(&(e.deref() as *const _ as *const u8))
     }
 
-    #[cfg(equeue_alloc_mode="lockless")]
     fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEptr, AtomicUdeptr>] {
         let slab_front = self.slab_front.load() as usize;
         unsafe {
             slice::from_raw_parts(
                 self.slab.as_ptr() as *const Atomic<MarkedEptr, AtomicUdeptr>,
                 slab_front / size_of::<Atomic<MarkedEptr, AtomicUdeptr>>()
-            )
-        }
-    }
-
-    #[cfg(equeue_alloc_mode="locking")]
-    fn buckets<'a>(&'a self) -> &'a [Atomic<Eptr, AtomicUeptr>] {
-        let slab_front = self.slab_front.load() as usize;
-        unsafe {
-            slice::from_raw_parts(
-                self.slab.as_ptr() as *const Atomic<Eptr, AtomicUeptr>,
-                slab_front / size_of::<Atomic<Eptr, AtomicUeptr>>()
             )
         }
     }
@@ -1355,7 +1335,7 @@ impl<C> Equeue<C> {
                 let e = {
                     let eptr = bucket.load();
                     if let Some(e) = eptr.as_ref(self) {
-                        if let Err(_) = bucket.cas_marked_inc(eptr, e.sibling.load()) {
+                        if let Err(_) = bucket.cas_marked_inc(eptr, e.sibling.load().eptr) {
                             continue 'retry;
                         }
                         Some(e)
@@ -1436,7 +1416,7 @@ impl<C> Equeue<C> {
                 let slab_front = self.slab_front.load() as usize;
                 let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
                 let new_slab_front = max(
-                    (npw2 as usize + 1)*size_of::<Eptr>(),
+                    (npw2 as usize + 1)*size_of::<MarkedEptr>(),
                     slab_front
                 );
                 let new_slab_back = slab_back.saturating_sub(
@@ -1470,8 +1450,7 @@ impl<C> Equeue<C> {
                     next_back: Atomic::new(MarkedEptr::null()),
                     sibling: Atomic::new(MarkedEptr::null()),
                     sibling_back: Atomic::new(MarkedEptr::null()),
-                    info: Atomic::new(Info::new(0, false, false, State::InFlight)),
-                    npw2: npw2,
+                    info: Atomic::new(Info::new(0, false, false, State::InFlight, npw2)),
 
                     cb: None,
                     drop: None,
@@ -1502,7 +1481,7 @@ impl<C> Equeue<C> {
         });
 
         // we can load buckets here because it can never shrink
-        let bucket = &self.buckets()[e.npw2 as usize];
+        let bucket = &self.buckets()[e.npw2() as usize];
 
         // add our event to a bucket, while also incrementing our
         // generation count
@@ -1512,10 +1491,10 @@ impl<C> Equeue<C> {
             let mut siblingptr = bucket.load();
             loop {
                 debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
-                e.sibling.store_marked(e.sibling.load(), siblingptr);
+                e.sibling.store_marked(e.sibling.load(), siblingptr.eptr);
                 if let Err(siblingptr_) = bucket.cas_marked_inc(
                     siblingptr,
-                    e.as_marked(self)
+                    e.as_eptr(self)
                 ) {
                     siblingptr = siblingptr_;
                     continue;
@@ -1532,12 +1511,12 @@ impl<C> Equeue<C> {
             let siblingptr = bucket.load();
             debug_assert_ne!(e as *const _, siblingptr.as_ptr(self));
             e.sibling.store(siblingptr);
-            bucket.store(e.as_eptr(self));
+            bucket.store_marked(siblingptr, e.as_eptr(self));
         }
     }
 
     #[cfg(equeue_queue_mode="lockless")]
-    fn help_queue_(&self) -> HelpOp {
+    fn help_(&self) -> HelpOp {
         'retry: loop {
             // do we have a help_op to execute?
             let help_op = self.help_op.load();
@@ -1577,7 +1556,6 @@ impl<C> Equeue<C> {
             let mut help_old = self.help_old.load();
             if help_old.mark != help_op.gen {
                 // we must be one behind, if not significant state has changed 
-                // TODO do we need both 1 and 2? this is due to done being a skipped state...
                 if help_old.mark != help_op.gen.wrapping_sub(1) {
                     continue 'retry;
                 }
@@ -1620,23 +1598,9 @@ impl<C> Equeue<C> {
         }
     }
 
-//    #[cfg(equeue_queue_mode="lockless")]
-//    fn do_queue_<'a>(&self, op: Op, e: &'a Ebuf) {
-//        loop {
-//            // is there something to do already?
-//            let help_op = self.help_queue_();
-//
-//            if let Err(_) = self.try_do_queue_(help_op, op, e) {
-//                continue;
-//            }
-//
-//            break;
-//        }
-//    }
-
     #[cfg(equeue_queue_mode="lockless")]
-    fn try_do_queue_<'a>(&self, help_op: HelpOp, op: Op, e: &'a Ebuf) -> Result<HelpOp, HelpOp> {
-        // help_queue_ should always put help_op into a none state
+    fn request_help_<'a>(&self, help_op: HelpOp, op: HelpState, e: &'a Ebuf) -> Result<HelpOp, HelpOp> {
+        // help_ should always put help_op into a none state
         debug_assert!(help_op.op.is_none());
 
         let help_op_ = HelpOp {
@@ -1649,7 +1613,7 @@ impl<C> Equeue<C> {
             return Err(help_op_);
         }
 
-        Ok(self.help_queue_())
+        Ok(self.help_())
     }
 
     // Queue management
@@ -1708,89 +1672,85 @@ impl<C> Equeue<C> {
             match sibling {
                 None => {
                     // insert a new slice
-                    e.next.store_marked(e.next.load(), tailptr);
-                    e.next_back.store_marked(e.next_back.load(), back.as_marked(self));
-                    e.sibling.store_marked(e.sibling.load(), e.as_marked(self));
-                    e.sibling_back.store_marked(e.sibling_back.load(), e.as_marked(self));
+                    e.next.store_marked(e.next.load(), tailptr.eptr);
+                    e.next_back.store_marked(e.next_back.load(), back.as_eptr(self));
+                    e.sibling.store_marked(e.sibling.load(), e.as_eptr(self));
+                    e.sibling_back.store_marked(e.sibling_back.load(), e.as_eptr(self));
                 }
                 Some(sibling) => {
                     // push onto existing slice
-                    e.next.store_marked(e.next.load(), MarkedEptr::null());
-                    e.next_back.store_marked(e.next_back.load(), MarkedEptr::null());
-                    e.sibling.store_marked(e.sibling.load(), sibling.as_marked(self));
+                    e.next.store_marked(e.next.load(), Eptr::null());
+                    e.next_back.store_marked(e.next_back.load(), Eptr::null());
+                    e.sibling.store_marked(e.sibling.load(), sibling.as_eptr(self));
                 }
             }
 
             // try to insert
             #[cfg(equeue_queue_mode="lockless")]
-            {
-                // TODO if this works we shouldn't need to lock
-                //let guard = self.lock.lock();
-                loop {
-                    let help_op = self.help_queue_();
+            loop {
+                let help_op = self.help_();
 
-                    // are we trying to enqueue an event that's already been canceled?
-                    //
-                    // this may seem like a weird place for this check, but it's the
-                    // only place we lock before re-enqueueing periodic events
-                    let info = e.info.load();
-                    match info.state() {
-                        State::Alloced => {},
-                        State::InQueue => break 'retry Ok(false),
-                        State::InFlight => {},
-                        State::Nested => {
-                            // nested can only be marked for immediate execuction, but
-                            // we can end up here if we are marked nested while trying
-                            // to enqueue a periodic/delayed event
-                            //
-                            // we need to update our target and restart
-                            if e.target > now {
-                                e.target = now;
-                                continue 'retry;
-                            }
+                // are we trying to enqueue an event that's already been canceled?
+                //
+                // this may seem like a weird place for this check, but it's the
+                // only place we lock before re-enqueueing periodic events
+                let info = e.info.load();
+                match info.state() {
+                    State::Alloced => {},
+                    State::InQueue => break 'retry Ok(false),
+                    State::InFlight => {},
+                    State::Nested => {
+                        // nested can only be marked for immediate execuction, but
+                        // we can end up here if we are marked nested while trying
+                        // to enqueue a periodic/delayed event
+                        //
+                        // we need to update our target and restart
+                        if e.target > now {
+                            e.target = now;
+                            continue 'retry;
                         }
-                        State::Canceled => break 'retry Err(e),
                     }
-
-                    // did someone already change our tailsrc? queue iteration? restart
-                    if tailsrc.load() != tailptr
-                        || self.queue.load().mark != queue_mark
-                    {
-                        continue 'retry;
-                    }
-
-                    // found our insertion point, now lets try to insert
-                    let change = match sibling {
-                        None => {
-                            // insert a new slice
-                            if let Err(_) = self.try_do_queue_(
-                                help_op,
-                                Op::EnqueueSliceNextBackNext,
-                                e
-                            ) {
-                                continue;
-                            }
-
-                            tailsrc as *const _ == &self.queue as *const _
-                        }
-                        Some(sibling) => {
-                            // push onto existing slice
-                            e.sibling_back.store_marked(e.sibling_back.load(), sibling.sibling_back.load());
-
-                            if let Err(_) = self.try_do_queue_(
-                                help_op,
-                                Op::EnqueueSiblingSiblingSiblingBack,
-                                e
-                            ) {
-                                continue;
-                            }
-
-                            false
-                        }
-                    };
-
-                    break 'retry Ok(change)
+                    State::Canceled => break 'retry Err(e),
                 }
+
+                // did someone already change our tailsrc? queue iteration? restart
+                if tailsrc.load() != tailptr
+                    || self.queue.load().mark != queue_mark
+                {
+                    continue 'retry;
+                }
+
+                // found our insertion point, now lets try to insert
+                let change = match sibling {
+                    None => {
+                        // insert a new slice
+                        if let Err(_) = self.request_help_(
+                            help_op,
+                            HelpState::EnqueueSliceNextBackNext,
+                            e
+                        ) {
+                            continue;
+                        }
+
+                        tailsrc as *const _ == &self.queue as *const _
+                    }
+                    Some(sibling) => {
+                        // push onto existing slice
+                        e.sibling_back.store_marked(e.sibling_back.load(), sibling.sibling_back.load().eptr);
+
+                        if let Err(_) = self.request_help_(
+                            help_op,
+                            HelpState::EnqueueSiblingSiblingSiblingBack,
+                            e
+                        ) {
+                            continue;
+                        }
+
+                        false
+                    }
+                };
+
+                break 'retry Ok(change)
             }
             #[cfg(equeue_queue_mode="locking")]
             {
@@ -1830,10 +1790,9 @@ impl<C> Equeue<C> {
                 let change = match sibling {
                     None => {
                         // insert a new slice
-                        tailsrc.store_marked(tailptr, e.as_marked(self));
+                        tailsrc.store_marked(tailptr, e.as_eptr(self));
                         if let Some(next) = tailptr.as_ref(self) {
-                            // TODO we should prevent these somehow? at least change these to all just store
-                            next.next_back.store(e.as_marked(self));
+                            next.next_back.store_marked(next.next_back.load(), e.as_eptr(self));
                         }
 
                         tailsrc as *const _ == &self.queue as *const _
@@ -1843,12 +1802,12 @@ impl<C> Equeue<C> {
 
                         // the real need for locking here is to make sure all of
                         // the back-references are correct atomically
-                        let sibling_back = sibling.sibling_back.load()
-                            .as_ref(self).unwrap();
-                        sibling.sibling_back.store(e.as_marked(self));
+                        let sibling_backptr = sibling.sibling_back.load();
+                        let sibling_back = sibling_backptr.as_ref(self).unwrap();
+                        sibling.sibling_back.store_marked(sibling_backptr, e.as_eptr(self));
                         
-                        sibling_back.sibling.store(e.as_marked(self));
-                        e.sibling_back.store(sibling_back.as_marked(self));
+                        sibling_back.sibling.store_marked(sibling_back.sibling.load(), e.as_eptr(self));
+                        e.sibling_back.store_marked(e.sibling_back.load(), sibling_back.as_eptr(self));
 
                         false
                     }
@@ -1868,133 +1827,8 @@ impl<C> Equeue<C> {
         state: State
     ) -> (bool, Option<&'a mut Ebuf>) {
         #[cfg(equeue_queue_mode="lockless")]
-        {
-            // TODO if this works we shouldn't need to lock
-            //let guard = self.lock.lock();
-            loop {
-                let help_op = self.help_queue_();
-
-                // Either unqueue a known event, with specific id, or the head of
-                // the dequeue. This looks innocent, but it's important we do both
-                // of these checks while locked, since that protects against:
-                //
-                // 1. Canceling while dispatching
-                // 2. Canceling while canceling
-                // 3. Multiple dispatchers
-                //
-                let (e, info) = match e {
-                    Left((e, id)) => {
-                        // still the same event?
-                        let info = e.info.load();
-                        if info.id != id {
-                            return (false, None);
-                        }
-
-                        (e, info)
-                    }
-                    Right(dequeue_mark) => {
-                        // no event specified, pop from dequeue if our gen matches
-                        let dequeueptr = self.dequeue.load();
-                        let e = match dequeueptr.as_ref(self) {
-                            Some(e) if dequeueptr.mark == dequeue_mark => e,
-                            _ => return (false, None),
-                        };
-
-                        (e, e.info.load())
-                    }
-                };
-
-                // a bit different logic here, we can cancel periodic events, but
-                // we can't reclaim the memory if it's in the middle of executing
-                match info.state() {
-                    State::InQueue => {
-                        // we can disentangle the event here and reclaim the memory
-                        let nextptr = e.next.load();
-                        let next = nextptr.as_ref(self);
-                        let next_back = e.next_back.load().as_ref(self);
-                        let sibling = e.sibling.load().as_ref(self).unwrap();
-                        let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
-
-                        // we also need to remove the queue if we are the head, we can't
-                        // just point to queue here with next_back because eptrs are
-                        // limited to in-slab events
-                        let headptr = self.queue.load();
-                        let deheadptr = self.dequeue.load();
-
-                        if next_back.is_some()
-                            || headptr.as_ptr(self) == e as *const _
-                            || deheadptr.as_ptr(self) == e as *const _
-                        {
-                            if sibling as *const _ == e as *const _ {
-                                // just remove the slice
-                                if let Err(_) = self.try_do_queue_(
-                                    help_op,
-                                    Op::UnqueueSliceNextBackNext(state),
-                                    e
-                                ) {
-                                    continue;
-                                }
-                            } else {
-                                // remove from siblings
-                                if let Err(_) = self.try_do_queue_(
-                                    help_op,
-                                    Op::UnqueueSiblingSiblingNext(state),
-                                    e
-                                ) {
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // no next_back just means we are a sibling, we still need
-                            // to remove from siblings
-                            if let Err(_) = self.try_do_queue_(
-                                help_op,
-                                Op::UnqueueSiblingBackSibling(state),
-                                e
-                            ) {
-                                continue;
-                            }
-                        }
-
-                        // note we are responsible for the memory now
-                        break (true, Some(unsafe { e.claim() }))
-                    }
-                    State::Alloced => {
-                        // alloced is a weird one, if we end up here, we just need
-                        // to claim the event, and since we ensure no ids coexist
-                        // mutable references to events at the type-level, we can
-                        // be sure we have exclusive access
-                        if let Err(_) = self.try_do_queue_(
-                            help_op,
-                            Op::UpdateState(state),
-                            e
-                        ) {
-                            continue;
-                        }
-
-                        break (true, Some(unsafe { e.claim() }))
-                    }
-                    State::InFlight | State::Nested => {
-                        // if we're periodic/static and currently executing best we
-                        // can do is mark the event so it isn't re-enqueued
-                        if let Err(_) = self.try_do_queue_(
-                            help_op,
-                            Op::UpdateState(state),
-                            e
-                        ) {
-                            continue;
-                        }
-
-                        break (info.static_(), None)
-                    }
-                    State::Canceled => {
-                        break (false, None)
-                    }
-                }
-            }
-        }
-        #[cfg(equeue_queue_mode="locking")]
-        {   let guard = self.lock.lock();
+        loop {
+            let help_op = self.help_();
 
             // Either unqueue a known event, with specific id, or the head of
             // the dequeue. This looks innocent, but it's important we do both
@@ -2049,19 +1883,143 @@ impl<C> Equeue<C> {
                     {
                         if sibling as *const _ == e as *const _ {
                             // just remove the slice
+                            if let Err(_) = self.request_help_(
+                                help_op,
+                                HelpState::UnqueueSliceNextBackNext(state),
+                                e
+                            ) {
+                                continue;
+                            }
+                        } else {
+                            // remove from siblings
+                            if let Err(_) = self.request_help_(
+                                help_op,
+                                HelpState::UnqueueSiblingSiblingNext(state),
+                                e
+                            ) {
+                                continue;
+                            }
+                        }
+                    } else {
+                        // no next_back just means we are a sibling, we still need
+                        // to remove from siblings
+                        if let Err(_) = self.request_help_(
+                            help_op,
+                            HelpState::UnqueueSiblingBackSibling(state),
+                            e
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    // note we are responsible for the memory now
+                    break (true, Some(unsafe { e.claim() }))
+                }
+                State::Alloced => {
+                    // alloced is a weird one, if we end up here, we just need
+                    // to claim the event, and since we ensure no ids coexist
+                    // mutable references to events at the type-level, we can
+                    // be sure we have exclusive access
+                    if let Err(_) = self.request_help_(
+                        help_op,
+                        HelpState::UpdateState(state),
+                        e
+                    ) {
+                        continue;
+                    }
+
+                    break (true, Some(unsafe { e.claim() }))
+                }
+                State::InFlight | State::Nested => {
+                    // if we're periodic/static and currently executing best we
+                    // can do is mark the event so it isn't re-enqueued
+                    if let Err(_) = self.request_help_(
+                        help_op,
+                        HelpState::UpdateState(state),
+                        e
+                    ) {
+                        continue;
+                    }
+
+                    break (info.static_(), None)
+                }
+                State::Canceled => {
+                    break (false, None)
+                }
+            }
+        }
+        #[cfg(equeue_queue_mode="locking")]
+        {   let guard = self.lock.lock();
+
+            // Either unqueue a known event, with specific id, or the head of
+            // the dequeue. This looks innocent, but it's important we do both
+            // of these checks while locked, since that protects against:
+            //
+            // 1. Canceling while dispatching
+            // 2. Canceling while canceling
+            // 3. Multiple dispatchers
+            //
+            let (e, info) = match e {
+                Left((e, id)) => {
+                    // still the same event?
+                    let info = e.info.load();
+                    if info.id != id {
+                        return (false, None);
+                    }
+
+                    (e, info)
+                }
+                Right(dequeue_mark) => {
+                    // no event specified, pop from dequeue if our gen matches
+                    let dequeueptr = self.dequeue.load();
+                    let e = match dequeueptr.as_ref(self) {
+                        Some(e) if dequeueptr.mark == dequeue_mark => e,
+                        _ => return (false, None),
+                    };
+
+                    (e, e.info.load())
+                }
+            };
+
+            // a bit different logic here, we can cancel periodic events, but
+            // we can't reclaim the memory if it's in the middle of executing
+            match info.state() {
+                State::InQueue => {
+                    // we can disentangle the event here and reclaim the memory
+                    let nextptr = e.next.load();
+                    let next = nextptr.as_ref(self);
+                    let next_backptr = e.next_back.load();
+                    let next_back = next_backptr.as_ref(self);
+                    let siblingptr = e.sibling.load();
+                    let sibling = siblingptr.as_ref(self).unwrap();
+                    let sibling_backptr = e.sibling_back.load();
+                    let sibling_back = sibling_backptr.as_ref(self).unwrap();
+
+                    // we also need to remove the queue if we are the head, we can't
+                    // just point to queue here with next_back because eptrs are
+                    // limited to in-slab events
+                    let headptr = self.queue.load();
+                    let deheadptr = self.dequeue.load();
+
+                    if next_back.is_some()
+                        || headptr.as_ptr(self) == e as *const _
+                        || deheadptr.as_ptr(self) == e as *const _
+                    {
+                        if sibling as *const _ == e as *const _ {
+                            // just remove the slice
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, nextptr);
+                                self.queue.store_marked(headptr, nextptr.eptr);
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, nextptr);
+                                self.dequeue.store_marked(deheadptr, nextptr.eptr);
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), nextptr);
+                                next_back.next.store_marked(next_back.next.load(), nextptr.eptr);
                             }
                             if let Some(next) = next {
-                                next.next_back.store(next_back.as_marked(self));
+                                next.next_back.store_marked(next.next_back.load(), next_back.as_eptr(self));
                             }
                         } else {
                             // remove from siblings
@@ -2071,30 +2029,30 @@ impl<C> Equeue<C> {
                             // the sibling's next pointer, which could be a race condition
                             // if we aren't locked
                             let sibling = unsafe { sibling.claim() };
-                            sibling.next.store_marked(sibling.next.load(), nextptr);
-                            sibling.next_back.store(next_back.as_marked(self));
+                            sibling.next.store_marked(sibling.next.load(), nextptr.eptr);
+                            sibling.next_back.store_marked(sibling.next_back.load(), next_back.as_eptr(self));
 
                             // update next_back's next/queue head first to avoid invalidating traversals
                             if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, sibling.as_marked(self));
+                                self.queue.store_marked(headptr, sibling.as_eptr(self));
                             }
                             if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, sibling.as_marked(self));
+                                self.dequeue.store_marked(deheadptr, sibling.as_eptr(self));
                             }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), sibling.as_marked(self));
+                                next_back.next.store_marked(next_back.next.load(), sibling.as_eptr(self));
                             }
                             if let Some(next) = next {
-                                next.next_back.store(sibling.as_marked(self));
+                                next.next_back.store_marked(next.next_back.load(), sibling.as_eptr(self));
                             }
                         }
                     }
 
-                    sibling_back.sibling.store(sibling.as_marked(self));
-                    sibling.sibling_back.store(sibling_back.as_marked(self));
+                    sibling_back.sibling.store_marked(sibling_backptr, sibling.as_eptr(self));
+                    sibling.sibling_back.store_marked(siblingptr, sibling_back.as_eptr(self));
 
                     // mark as removed
-                    e.next.store_marked_inc(nextptr, MarkedEptr::null());
+                    e.next.store_marked_inc(nextptr, Eptr::null());
                     // mark as not-pending
                     e.info.store(e.info.load().set_state(state));
                     
@@ -2167,31 +2125,27 @@ impl<C> Equeue<C> {
 
             // try to unroll events
             #[cfg(equeue_queue_mode="lockless")]
-            {
-                // TODO if this works we shouldn't need to lock
-                //let guard = self.lock.lock();
-                loop {
-                    let help_op = self.help_queue_();
+            loop {
+                let help_op = self.help_();
 
-                    // did someone already change our tailsrc? dequeue? queue? restart
-                    if tailsrc.load() != tailptr
-                        || self.dequeue.load() != deheadptr
-                        || self.queue.load() != headptr
-                    {
-                        continue 'retry;
-                    }
-
-                    // cut our unrolled queue
-                    if let Err(_) = self.try_do_queue_(
-                        help_op,
-                        Op::DequeueDequeue,
-                        back.unwrap()
-                    ) {
-                        continue;
-                    }
-
-                    break 'retry deheadptr.mark.wrapping_add(1);
+                // did someone already change our tailsrc? dequeue? queue? restart
+                if tailsrc.load() != tailptr
+                    || self.dequeue.load() != deheadptr
+                    || self.queue.load() != headptr
+                {
+                    continue 'retry;
                 }
+
+                // cut our unrolled queue
+                if let Err(_) = self.request_help_(
+                    help_op,
+                    HelpState::DequeueDequeue,
+                    back.unwrap()
+                ) {
+                    continue;
+                }
+
+                break 'retry deheadptr.mark.wrapping_add(1);
             }
             #[cfg(equeue_queue_mode="locking")]
             {   let guard = self.lock.lock();
@@ -2207,19 +2161,19 @@ impl<C> Equeue<C> {
                 // point dequeue to the head of ready events
                 self.dequeue.store_marked(
                     deheadptr.set_mark(deheadptr.mark.wrapping_add(1)),
-                    headptr
+                    headptr.eptr
                 );
                 // point queue to the tail of ready events
                 self.queue.store_marked(
                     headptr.set_mark(headptr.mark.wrapping_add(1)),
-                    tailptr
+                    tailptr.eptr
                 );
 
                 // cut our unrolled queue
                 if let Some(tail) = tailptr.as_ref(self) {
                     tail.next_back.store(MarkedEptr::null());
                 }
-                back.unwrap().next.store_marked_inc(tailptr, MarkedEptr::null());
+                back.unwrap().next.store_marked_inc(tailptr, Eptr::null());
 
                 break 'retry deheadptr.mark.wrapping_add(1);
             }
@@ -2236,25 +2190,21 @@ impl<C> Equeue<C> {
         F: FnMut(Info) -> Option<State>
     {
         #[cfg(equeue_queue_mode="lockless")]
-        {
-            // TODO if this works we shouldn't need to lock
-            //let guard = self.lock.lock();
-            loop {
-                let help_op = self.help_queue_();
+        loop {
+            let help_op = self.help_();
 
-                let info = e.info.load();
-                if let Some(state_) = f(info) {
-                    if let Err(_) = self.try_do_queue_(
-                        help_op,
-                        Op::UpdateState(state_),
-                        e
-                    ) {
-                        continue;
-                    }
+            let info = e.info.load();
+            if let Some(state_) = f(info) {
+                if let Err(_) = self.request_help_(
+                    help_op,
+                    HelpState::UpdateState(state_),
+                    e
+                ) {
+                    continue;
                 }
-
-                break info;
             }
+
+            break info;
         }
         #[cfg(equeue_queue_mode="locking")]
         {
@@ -2273,25 +2223,21 @@ impl<C> Equeue<C> {
         F: FnMut(Info) -> Option<State>
     {
         #[cfg(equeue_queue_mode="lockless")]
-        {
-            // TODO if this works we shouldn't need to lock
-            //let guard = self.lock.lock();
-            loop {
-                let help_op = self.help_queue_();
+        loop {
+            let help_op = self.help_();
 
-                let info = e.info.load();
-                if let Some(state_) = f(info) {
-                    if let Err(_) = self.try_do_queue_(
-                        help_op,
-                        Op::UpdateStateInc(state_),
-                        e
-                    ) {
-                        continue;
-                    }
+            let info = e.info.load();
+            if let Some(state_) = f(info) {
+                if let Err(_) = self.request_help_(
+                    help_op,
+                    HelpState::UpdateStateInc(state_),
+                    e
+                ) {
+                    continue;
                 }
-
-                break info;
             }
+
+            break info;
         }
         #[cfg(equeue_queue_mode="locking")]
         {
@@ -2310,9 +2256,9 @@ impl<C> Equeue<C> {
         }
     }
 
-    fn update_break_<F>(&self, mut f: F) -> bool
+    fn update_break_<F>(&self, mut f: F) -> u8
     where
-        F: FnMut(bool) -> Option<bool>
+        F: FnMut(u8) -> Option<u8>
     {
         #[cfg(equeue_break_mode="lockless")]
         {
@@ -2512,7 +2458,7 @@ impl<C: Clock> Equeue<C> {
         'retry: loop {
             // wait, if break is requested we need to process
             // it immediately
-            if self.break_.load() {
+            if self.break_.load() > 0 {
                 return Some(Delta::zero());
             }
 
@@ -2610,11 +2556,7 @@ impl<C: Clock+Sema> Equeue<C> {
             self.dispatch_ready();
 
             // was break requested?
-            if
-                self.update_break_(|break_| {
-                    if break_ { Some(false) } else { None }
-                })
-            {
+            if self.update_break_(|break_| break_.checked_sub(1)) > 0 {
                 return Dispatch::Break;
             }
 
@@ -2663,10 +2605,7 @@ impl<C: Clock+Sema> Equeue<C> {
 impl<C: Signal> Equeue<C> {
     // request dispatch to exit once done dispatching events
     pub fn break_(&self) {
-        self.update_break_(|break_| {
-            if break_ { None } else { Some(true) }
-        });
-
+        self.update_break_(|break_| Some(break_ + 1));
         self.clock.signal();
     }
 }
@@ -2852,7 +2791,6 @@ impl<C: Clock+Signal> Equeue<C> {
 }
 
 
-// TODO can we make Event accept ?Sized? The issue is not the allocation, 
 // the issue is that we'd need to store a fat pointer somehow
 /// Event handle
 #[derive(Debug)]
@@ -3381,11 +3319,7 @@ impl<C: Clock+AsyncSema> Equeue<C> {
             self.dispatch_ready();
 
             // was break requested?
-            if
-                self.update_break_(|break_| {
-                    if break_ { Some(false) } else { None }
-                })
-            {
+            if self.update_break_(|break_| break_.checked_sub(1)) > 0 {
                 return Dispatch::Break;
             }
 
