@@ -54,5 +54,5 @@ structopt = "0.3.25"
 
 # test targets
 [[test]]
-name = "test_loom"
+name = "loom"
 required-features = ["loom"]

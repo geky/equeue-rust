@@ -8,11 +8,11 @@ all build:
 .PHONY: test
 test:
 	cargo test --tests
-	LOOM_MAX_PREEMPTIONS=1 cargo test --test test_loom --features loom
+	LOOM_MAX_PREEMPTIONS=1 cargo test --test loom --features loom
 
 .PHONY: test-loom
 test-loom:
-	LOOM_MAX_PREEMPTIONS=2 cargo test --test test_loom --features loom
+	LOOM_MAX_PREEMPTIONS=2 cargo test --test loom --features loom
 
 .PHONY: build-configs
 build-configs:
