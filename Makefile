@@ -80,10 +80,11 @@ bench-code-size:
 		-n 0 \
 		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
 			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
-		> target/bench/code-size/lockless-alloc-break.csv)
+		> target/bench/code-size/lockless-alloc.csv)
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
-		EQUEUE_ALLOC_MODE=lockless \
+		EQUEUE_ALLOC_MODE=locking \
+		EQUEUE_BREAK_MODE=lockless \
 		cargo bloat \
 		--no-default-features \
 		--profile small \
@@ -93,9 +94,9 @@ bench-code-size:
 		-n 0 \
 		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
 			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
-		> target/bench/code-size/lockless-alloc.csv)
+		> target/bench/code-size/lockless-break.csv)
 	$(strip \
-		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_MODE=locking \
 		cargo bloat \
 		--no-default-features \
 		--profile small \
@@ -124,17 +125,18 @@ bench-throughput:
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/throughput/lockless-alloc-break.csv )
+		> target/bench/throughput/lockless-alloc.csv )
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
-		EQUEUE_ALLOC_MODE=lockless \
+		EQUEUE_ALLOC_MODE=locking \
+		EQUEUE_BREAK_MODE=lockless \
 		cargo bench --features criterion --benches -- --noplot )
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/throughput/lockless-alloc.csv )
+		> target/bench/throughput/lockless-break.csv )
 	$(strip \
-		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_MODE=locking \
 		cargo bench --features criterion --benches -- --noplot )
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
@@ -148,16 +150,16 @@ bench: bench-code-size bench-throughput
 graph-code-size:
 	$(strip ./scripts/graph-code-size.py target/bench/code-size.svg \
 		locking=target/bench/code-size/locking.csv \
+		lockless-break=target/bench/code-size/lockless-break.csv \
 		lockless-alloc=target/bench/code-size/lockless-alloc.csv \
-		lockless-alloc-break=target/bench/code-size/lockless-alloc-break.csv \
 		lockless=target/bench/code-size/lockless.csv )
 
 .PHONY: graph-throughput
 graph-throughput:
 	$(strip ./scripts/graph-throughput.py target/bench/throughput.svg \
 		locking=target/bench/throughput/locking.csv \
+		lockless-break=target/bench/throughput/lockless-break.csv \
 		lockless-alloc=target/bench/throughput/lockless-alloc.csv \
-		lockless-alloc-break=target/bench/throughput/lockless-alloc-break.csv \
 		lockless=target/bench/throughput/lockless.csv )
 
 .PHONY: graph

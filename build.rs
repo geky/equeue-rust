@@ -70,9 +70,16 @@ fn main() {
         });
     println!("cargo:rustc-cfg=equeue_udeptr_width=\"{}\"", udeptr_width);
 
+    // override EQUEUE_MODE, the default locking mode for various operations
+    println!("cargo:rerun-if-env-changed=EQUEUE_MODE");
+
     // override EQUEUE_QUEUE_MODE
     println!("cargo:rerun-if-env-changed=EQUEUE_QUEUE_MODE");
-    match env::var("EQUEUE_QUEUE_MODE").as_deref() {
+    match
+        env::var("EQUEUE_QUEUE_MODE")
+            .or_else(|_| env::var("EQUEUE_MODE"))
+            .as_deref()
+    {
         Ok("lockless") | Err(_) => {
             println!("cargo:rustc-cfg=equeue_queue_mode=\"lockless\"");
         }
@@ -88,7 +95,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EQUEUE_ALLOC_MODE");
     match 
         env::var("EQUEUE_ALLOC_MODE")
-            .or_else(|_| env::var("EQUEUE_QUEUE_MODE"))
+            .or_else(|_| env::var("EQUEUE_MODE"))
             .as_deref()
     {
         Ok("lockless") | Err(_) => {
@@ -106,7 +113,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EQUEUE_BREAK_MODE");
     match
         env::var("EQUEUE_ALLOC_MODE")
-            .or_else(|_| env::var("EQUEUE_QUEUE_MODE"))
+            .or_else(|_| env::var("EQUEUE_MODE"))
             .as_deref()
     {
         Ok("lockless") | Err(_) => {
