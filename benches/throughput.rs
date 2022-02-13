@@ -2,8 +2,6 @@
 use std::thread;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::iter;
 use std::env;
@@ -22,7 +20,7 @@ fn bench_throughput(c: &mut Criterion) {
     #[allow(non_snake_case)]
     let EQUEUE_THROUGHPUT_COUNT = env::var("EQUEUE_THROUGHPUT_COUNT")
         .map(|throughput_count| throughput_count.parse().unwrap())
-        .unwrap_or(100000);
+        .unwrap_or(1000000);
 
     #[allow(non_snake_case)]
     let EQUEUE_THROUGHPUT_CORES = env::var("EQUEUE_THROUGHPUT_CORES")
@@ -53,22 +51,17 @@ fn bench_throughput(c: &mut Criterion) {
             let (kick_s, kick_r) = mpsc::channel::<bool>();
             let (done_s, done_r) = mpsc::channel::<()>();
             let done_s = Mutex::new(done_s);
-            let count = AtomicU64::new(0);
             kicks.push(kick_s);
             dones.push(done_r);
             threads.push(thread::spawn({
                 let q = q.clone();
                 move || {
                     while kick_r.recv().unwrap() {
-                        count.store(0, Ordering::SeqCst);
-
                         for _ in 0..EQUEUE_THROUGHPUT_COUNT/n {
-                            q.call(|| {
-                                if count.fetch_add(1, Ordering::SeqCst)+1 == (EQUEUE_THROUGHPUT_COUNT/n)-1 {
-                                    done_s.lock().unwrap().send(()).unwrap();
-                                }
-                            }).unwrap();
+                            q.call(|| {}).unwrap();
                         }
+
+                        done_s.lock().unwrap().send(()).unwrap();
                     }
                 }
             }));
