@@ -631,11 +631,12 @@ struct Info {
 
 impl Debug for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // these really need to be in hex to be readable
         f.debug_struct("Info")
             .field("gen", &self.gen)
             .field("id", &self.id)
-            .field("state", &format_args!("{:#x}", self.state))
+            .field("state", &self.state())
+            .field("static", &self.static_())
+            .field("once", &self.once())
             .field("npw2", &self.npw2)
             .finish()
     }
@@ -643,11 +644,11 @@ impl Debug for Info {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum State {
-    Alloced,
-    InQueue,
-    InFlight,
-    Nested,
-    Canceled,
+    Alloced  = 0,
+    InQueue  = 1,
+    InFlight = 2,
+    Nested   = 3,
+    Canceled = 4,
 }
 
 impl State {
@@ -674,7 +675,7 @@ impl State {
 }
 
 impl Info {
-    fn new(id: ugen, static_: bool, once: bool, state: State, npw2: u8) -> Info {
+    fn new(id: ugen, state: State, static_: bool, once: bool, npw2: u8) -> Info {
         Info {
             gen: 0,
             id: id,
@@ -862,37 +863,107 @@ impl<T> AsEptr for Option<&Atomic<MarkedEptr<T>, AtomicUdeptr>> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u8)]
 enum HelpState {
-    EnqueueSliceNextBackNext,             // -.
-    EnqueueSliceNextNextBack,             // <'---.
-    EnqueueSiblingSiblingSiblingBack,     // -.   |
-    EnqueueSiblingSiblingBackSibling,     // <'---+
-                                          //      |
-    UnqueueSliceNextBackNext(State),      // -.   |
-    UnqueueSliceNextNextBack(State),      // <'-. |
-    UnqueueSiblingSiblingNext(State),     // -. | |
-    UnqueueSiblingSiblingNextBack(State), // <' | |
-    UnqueueSiblingNextBackNext(State),    // <' | |
-    UnqueueSiblingNextNextBack(State),    // <' | |
-    UnqueueSiblingBackSibling(State),     // <'<' |
-    UnqueueSiblingSiblingBack(State),     // <'   |
-    UnqueueNext(State),                   // <'---+
-                                          //      |
-    DequeueDequeue,                       // -.   |
-    DequeueQueue,                         // <'   |
-    DequeueNextBack,                      // <'   |
-    DequeueBackNextNextBack,              // <'   |
-    DequeueBackNext,                      // <'   |
-                                          //      |
-    UpdateState(State),                   // <----'
-    UpdateStateInc(State),                //
+    Done                             = 0,  // <------.
+                                           //        |
+    EnqueueSliceNextBackNext         = 1,  // -.     |
+    EnqueueSliceNextNextBack         = 2,  // <'---. |
+    EnqueueSiblingSiblingSiblingBack = 3,  // -.   | |
+    EnqueueSiblingSiblingBackSibling = 4,  // <'---+ |
+                                           //      | |
+    UnqueueSliceNextBackNext         = 5,  // -.   | |
+    UnqueueSliceNextNextBack         = 6,  // <'-. | |
+    UnqueueSiblingSiblingNext        = 7,  // -. | | |
+    UnqueueSiblingSiblingNextBack    = 8,  // <' | | |
+    UnqueueSiblingNextBackNext       = 9,  // <' | | |
+    UnqueueSiblingNextNextBack       = 10, // <' | | |
+    UnqueueSiblingBackSibling        = 11, // <'<' | |
+    UnqueueSiblingSiblingBack        = 12, // <'   | |
+    UnqueueNext                      = 13, // <'---+ |
+                                           //      | |
+    DequeueDequeue                   = 14, // -.   | |
+    DequeueQueue                     = 15, // <'   | |
+    DequeueNextBack                  = 16, // <'   | |
+    DequeueBackNextNextBack          = 17, // <'   | |
+    DequeueBackNext                  = 18, // <'---|-+
+                                           //      | |
+    UpdateState                      = 19, // <----'-+
+    UpdateStateInc                   = 20, // -------'
 }
 
 #[cfg(equeue_queue_mode="lockless")]
-#[derive(Debug, Copy, Clone)]
+impl HelpState {
+    fn from_u8(state: u8) -> HelpState {
+        match state {
+            0  => HelpState::Done,
+            1  => HelpState::EnqueueSliceNextBackNext,
+            2  => HelpState::EnqueueSliceNextNextBack,
+            3  => HelpState::EnqueueSiblingSiblingSiblingBack,
+            4  => HelpState::EnqueueSiblingSiblingBackSibling,
+            5  => HelpState::UnqueueSliceNextBackNext,
+            6  => HelpState::UnqueueSliceNextNextBack,
+            7  => HelpState::UnqueueSiblingSiblingNext,
+            8  => HelpState::UnqueueSiblingSiblingNextBack,
+            9  => HelpState::UnqueueSiblingNextBackNext,
+            10 => HelpState::UnqueueSiblingNextNextBack,
+            11 => HelpState::UnqueueSiblingBackSibling,
+            12 => HelpState::UnqueueSiblingSiblingBack,
+            13 => HelpState::UnqueueNext,
+            14 => HelpState::DequeueDequeue,
+            15 => HelpState::DequeueQueue,
+            16 => HelpState::DequeueNextBack,
+            17 => HelpState::DequeueBackNextNextBack,
+            18 => HelpState::DequeueBackNext,
+            19 => HelpState::UpdateState,
+            20 => HelpState::UpdateStateInc,
+            _  => unreachable!(),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            HelpState::Done                             => 0,
+            HelpState::EnqueueSliceNextBackNext         => 1,
+            HelpState::EnqueueSliceNextNextBack         => 2,
+            HelpState::EnqueueSiblingSiblingSiblingBack => 3,
+            HelpState::EnqueueSiblingSiblingBackSibling => 4,
+            HelpState::UnqueueSliceNextBackNext         => 5,
+            HelpState::UnqueueSliceNextNextBack         => 6,
+            HelpState::UnqueueSiblingSiblingNext        => 7,
+            HelpState::UnqueueSiblingSiblingNextBack    => 8,
+            HelpState::UnqueueSiblingNextBackNext       => 9,
+            HelpState::UnqueueSiblingNextNextBack       => 10,
+            HelpState::UnqueueSiblingBackSibling        => 11,
+            HelpState::UnqueueSiblingSiblingBack        => 12,
+            HelpState::UnqueueNext                      => 13,
+            HelpState::DequeueDequeue                   => 14,
+            HelpState::DequeueQueue                     => 15,
+            HelpState::DequeueNextBack                  => 16,
+            HelpState::DequeueBackNextNextBack          => 17,
+            HelpState::DequeueBackNext                  => 18,
+            HelpState::UpdateState                      => 19,
+            HelpState::UpdateStateInc                   => 20,
+        }
+    }
+}
+
+#[cfg(equeue_queue_mode="lockless")]
+#[derive(Copy, Clone)]
 struct HelpOp {
     gen: ugen,
-    op: Option<HelpState>,
+    state: u8,
     eptr: Eptr<Ebuf>,
+}
+
+#[cfg(equeue_queue_mode="lockless")]
+impl Debug for HelpOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HelpOp")
+            .field("gen", &self.gen)
+            .field("state", &self.state())
+            .field("eptr", &self.eptr)
+            .field("estate", &self.estate())
+            .finish()
+    }
 }
 
 #[cfg(equeue_queue_mode="lockless")]
@@ -900,8 +971,52 @@ impl HelpOp {
     const fn done() -> HelpOp {
         HelpOp {
             gen: 0,
-            op: None,
+            state: 0,
             eptr: Eptr::null(),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.state() == HelpState::Done
+    }
+
+    fn state(&self) -> HelpState {
+        HelpState::from_u8(self.state & 0x1f)
+    }
+
+    fn estate(&self) -> State {
+        State::from_u8(self.state >> 5)
+    }
+
+    fn set_state(self, state: HelpState) -> HelpOp {
+        HelpOp {
+            gen: self.gen,
+            state: (self.state & !0x1f) | state.as_u8(),
+            eptr: self.eptr,
+        }
+    }
+
+    fn set_estate(self, estate: State) -> HelpOp {
+        HelpOp {
+            gen: self.gen,
+            state: (self.state & !0xe0) | (estate.as_u8() << 5),
+            eptr: self.eptr,
+        }
+    }
+
+    fn set_eptr(self, eptr: Eptr<Ebuf>) -> HelpOp {
+        HelpOp {
+            gen: self.gen,
+            state: self.state,
+            eptr: eptr,
+        }
+    }
+
+    fn inc(self) -> HelpOp {
+        HelpOp {
+            gen: self.gen.wrapping_add(1),
+            state: self.state,
+            eptr: self.eptr,
         }
     }
 
@@ -909,7 +1024,8 @@ impl HelpOp {
         &self,
         q: &'a Equeue<C>
     ) -> Option<&'a Atomic<Marked, AtomicUdeptr>> {
-        match self.op.unwrap() {
+        match self.state() {
+            HelpState::Done => unreachable!(),
             HelpState::EnqueueSliceNextBackNext => {
                 self.eptr.as_ref(q).unwrap()
                     .next_back.load().as_ref(q)
@@ -930,47 +1046,47 @@ impl HelpOp {
                     .sibling_back.load().as_ref(q)
                     .map(|sibling_back| sibling_back.as_atom())
             }
-            HelpState::UnqueueSliceNextBackNext(_) => {
+            HelpState::UnqueueSliceNextBackNext => {
                 self.eptr.as_ref(q).unwrap()
                     .next_back.load().as_ref(q)
                     .map(|next_back| next_back.as_atom())
             }
-            HelpState::UnqueueSliceNextNextBack(_) => {
+            HelpState::UnqueueSliceNextNextBack => {
                 self.eptr.as_ref(q).unwrap()
                     .next.load().as_ref(q)
                     .map(|e| e.next_back.as_atom())
             }
-            HelpState::UnqueueSiblingSiblingNext(_) => {
+            HelpState::UnqueueSiblingSiblingNext => {
                 self.eptr.as_ref(q).unwrap()
                     .sibling.load().as_ref(q)
                     .map(|e| e.next.as_atom())
             }
-            HelpState::UnqueueSiblingSiblingNextBack(_) => {
+            HelpState::UnqueueSiblingSiblingNextBack => {
                 self.eptr.as_ref(q).unwrap()
                     .sibling.load().as_ref(q)
                     .map(|e| e.next_back.as_atom())
             }
-            HelpState::UnqueueSiblingNextBackNext(_) => {
+            HelpState::UnqueueSiblingNextBackNext => {
                 self.eptr.as_ref(q).unwrap()
                     .next_back.load().as_ref(q)
                     .map(|next_back| next_back.as_atom())
             }
-            HelpState::UnqueueSiblingNextNextBack(_) => {
+            HelpState::UnqueueSiblingNextNextBack => {
                 self.eptr.as_ref(q).unwrap()
                     .next.load().as_ref(q)
                     .map(|e| e.next_back.as_atom())
             }
-            HelpState::UnqueueSiblingBackSibling(_) => {
+            HelpState::UnqueueSiblingBackSibling => {
                 self.eptr.as_ref(q).unwrap()
                     .sibling_back.load().as_ref(q)
                     .map(|sibling_back| sibling_back.as_atom())
             }
-            HelpState::UnqueueSiblingSiblingBack(_) => {
+            HelpState::UnqueueSiblingSiblingBack => {
                 self.eptr.as_ref(q).unwrap()
                     .sibling.load().as_ref(q)
                     .map(|e| e.sibling_back.as_atom())
             }
-            HelpState::UnqueueNext(_) => {
+            HelpState::UnqueueNext => {
                 Some(self.eptr.as_ref(q).unwrap().next.as_atom())
             }
             HelpState::DequeueDequeue => {
@@ -991,10 +1107,10 @@ impl HelpOp {
             HelpState::DequeueBackNext => {
                 Some(self.eptr.as_ref(q).unwrap().next.as_atom())
             }
-            HelpState::UpdateState(_) => {
+            HelpState::UpdateState => {
                 Some(self.eptr.as_ref(q).unwrap().info.as_atom())
             }
-            HelpState::UpdateStateInc(_) => {
+            HelpState::UpdateStateInc => {
                 Some(self.eptr.as_ref(q).unwrap().info.as_atom())
             }
         }
@@ -1005,7 +1121,8 @@ impl HelpOp {
         q: &Equeue<C>,
         help_old: Marked
     ) -> Marked {
-        match self.op.unwrap() {
+        match self.state() {
+            HelpState::Done => unreachable!(),
             HelpState::EnqueueSliceNextBackNext => {
                 help_old.as_marked::<Ebuf>()
                     .set_eptr(self.eptr)
@@ -1026,32 +1143,32 @@ impl HelpOp {
                     .set_eptr(self.eptr)
                     .as_marked().inc()
             }
-            HelpState::UnqueueSliceNextBackNext(_) => {
+            HelpState::UnqueueSliceNextBackNext => {
                 help_old.as_marked::<Ebuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSliceNextNextBack(_) => {
+            HelpState::UnqueueSliceNextNextBack => {
                 help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingSiblingNext(_) => {
+            HelpState::UnqueueSiblingSiblingNext => {
                 help_old.as_marked::<Ebuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingSiblingNextBack(_) => {
+            HelpState::UnqueueSiblingSiblingNextBack => {
                 help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingNextBackNext(_) => {
+            HelpState::UnqueueSiblingNextBackNext => {
                 help_old.as_marked::<Ebuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingNextNextBack(_) => {
+            HelpState::UnqueueSiblingNextNextBack => {
                 help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
                     .set_eptr(
                         self.eptr.as_ref(q).unwrap().sibling.load().as_ref(q)
@@ -1060,17 +1177,17 @@ impl HelpOp {
                     )
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingBackSibling(_) => {
+            HelpState::UnqueueSiblingBackSibling => {
                 help_old.as_marked::<Ebuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueSiblingSiblingBack(_) => {
+            HelpState::UnqueueSiblingSiblingBack => {
                 help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load())
                     .as_marked().inc()
             }
-            HelpState::UnqueueNext(_) => {
+            HelpState::UnqueueNext => {
                 help_old.as_marked::<Ebuf>()
                     .set_eptr(Eptr::null())
                     .as_marked().inc()
@@ -1111,50 +1228,53 @@ impl HelpOp {
                     .set_eptr(Eptr::null())
                     .as_marked().inc()
             }
-            HelpState::UpdateState(state) => {
+            HelpState::UpdateState => {
                 help_old.as_info()
-                    .set_state(state)
+                    .set_state(self.estate())
                     .as_marked().inc()
             }
-            HelpState::UpdateStateInc(state) => {
+            HelpState::UpdateStateInc => {
                 help_old.as_info()
                     .inc_id()
                     .set_static(false)
                     .set_once(false)
-                    .set_state(state)
+                    .set_state(self.estate())
                     .as_marked().inc()
             }
         }
     }
 
-    fn next(
-        &self,
-    ) -> Option<HelpState> {
-        match self.op.unwrap() {
-            HelpState::EnqueueSliceNextBackNext             => Some(HelpState::EnqueueSliceNextNextBack),             // -.
-            HelpState::EnqueueSliceNextNextBack             => Some(HelpState::UpdateState(State::InQueue)),          // <'---.
-            HelpState::EnqueueSiblingSiblingSiblingBack     => Some(HelpState::EnqueueSiblingSiblingBackSibling),     // -.   |
-            HelpState::EnqueueSiblingSiblingBackSibling     => Some(HelpState::UpdateState(State::InQueue)),          // <'---+
-                                                                                                                      //      |
-            HelpState::UnqueueSliceNextBackNext(state)      => Some(HelpState::UnqueueSliceNextNextBack(state)),      // -.   |
-            HelpState::UnqueueSliceNextNextBack(state)      => Some(HelpState::UnqueueSiblingBackSibling(state)),     // <'-. |
-            HelpState::UnqueueSiblingSiblingNext(state)     => Some(HelpState::UnqueueSiblingSiblingNextBack(state)), // -. | |
-            HelpState::UnqueueSiblingSiblingNextBack(state) => Some(HelpState::UnqueueSiblingNextBackNext(state)),    // <' | |
-            HelpState::UnqueueSiblingNextBackNext(state)    => Some(HelpState::UnqueueSiblingNextNextBack(state)),    // <' | |
-            HelpState::UnqueueSiblingNextNextBack(state)    => Some(HelpState::UnqueueSiblingBackSibling(state)),     // <' | |
-            HelpState::UnqueueSiblingBackSibling(state)     => Some(HelpState::UnqueueSiblingSiblingBack(state)),     // <'<' |
-            HelpState::UnqueueSiblingSiblingBack(state)     => Some(HelpState::UnqueueNext(state)),                   // <'   |
-            HelpState::UnqueueNext(state)                   => Some(HelpState::UpdateState(state)),                   // <'---+
-                                                                                                                      //      |
-            HelpState::DequeueDequeue                       => Some(HelpState::DequeueQueue),                         // -.   |
-            HelpState::DequeueQueue                         => Some(HelpState::DequeueNextBack),                      // <'   |
-            HelpState::DequeueNextBack                      => Some(HelpState::DequeueBackNextNextBack),              // <'   |
-            HelpState::DequeueBackNextNextBack              => Some(HelpState::DequeueBackNext),                      // <'   |
-            HelpState::DequeueBackNext                      => None,                                                  // <'   |
-                                                                                                                      //      |
-            HelpState::UpdateState(_)                       => None,                                                  // <----'
-            HelpState::UpdateStateInc(_)                    => None,                                                  //
-        }
+    fn next(&self) -> HelpOp {
+        let state_ = match self.state() {
+            HelpState::Done                             => HelpState::Done,                             // <------.
+                                                                                                        //        |
+            HelpState::EnqueueSliceNextBackNext         => HelpState::EnqueueSliceNextNextBack,         // -.     |
+            HelpState::EnqueueSliceNextNextBack         => HelpState::UpdateState,                      // <'---. |
+            HelpState::EnqueueSiblingSiblingSiblingBack => HelpState::EnqueueSiblingSiblingBackSibling, // -.   | |
+            HelpState::EnqueueSiblingSiblingBackSibling => HelpState::UpdateState,                      // <'---+ |
+                                                                                                        //      | |
+            HelpState::UnqueueSliceNextBackNext         => HelpState::UnqueueSliceNextNextBack,         // -.   | |
+            HelpState::UnqueueSliceNextNextBack         => HelpState::UnqueueSiblingBackSibling,        // <'-. | |
+            HelpState::UnqueueSiblingSiblingNext        => HelpState::UnqueueSiblingSiblingNextBack,    // -. | | |
+            HelpState::UnqueueSiblingSiblingNextBack    => HelpState::UnqueueSiblingNextBackNext,       // <' | | |
+            HelpState::UnqueueSiblingNextBackNext       => HelpState::UnqueueSiblingNextNextBack,       // <' | | |
+            HelpState::UnqueueSiblingNextNextBack       => HelpState::UnqueueSiblingBackSibling,        // <' | | |
+            HelpState::UnqueueSiblingBackSibling        => HelpState::UnqueueSiblingSiblingBack,        // <'<' | |
+            HelpState::UnqueueSiblingSiblingBack        => HelpState::UnqueueNext,                      // <'   | |
+            HelpState::UnqueueNext                      => HelpState::UpdateState,                      // <'---+ |
+                                                                                                        //      | |
+            HelpState::DequeueDequeue                   => HelpState::DequeueQueue,                     // -.   | |
+            HelpState::DequeueQueue                     => HelpState::DequeueNextBack,                  // <'   | |
+            HelpState::DequeueNextBack                  => HelpState::DequeueBackNextNextBack,          // <'   | |
+            HelpState::DequeueBackNextNextBack          => HelpState::DequeueBackNext,                  // <'   | |
+            HelpState::DequeueBackNext                  => HelpState::Done,                             // <'---|-+
+                                                                                                        //      | |
+            HelpState::UpdateState                      => HelpState::Done,                             // <----'-+
+            HelpState::UpdateStateInc                   => HelpState::Done,                             // -------'
+        };
+
+        if state_ == HelpState::Done { *self } else { self.inc() }
+            .set_state(state_)
     }
 }
 
@@ -1512,7 +1632,7 @@ impl<C> Equeue<C> {
                     next_back: Atomic::new(MarkedEptr::null()),
                     sibling: Atomic::new(MarkedEptr::null()),
                     sibling_back: Atomic::new(MarkedEptr::null()),
-                    info: Atomic::new(Info::new(0, false, false, State::InFlight, npw2)),
+                    info: Atomic::new(Info::new(0, State::InFlight, false, false, npw2)),
 
                     cb: None,
                     drop: None,
@@ -1582,7 +1702,7 @@ impl<C> Equeue<C> {
         'retry: loop {
             // do we have a help_op to execute?
             let help_op = self.help_op.load();
-            if help_op.op.is_none() {
+            if help_op.is_done() {
                 return help_op;
             }
 
@@ -1644,13 +1764,7 @@ impl<C> Equeue<C> {
                 }
             }
 
-            let op_ = help_op.next();
-            let help_op_ = HelpOp {
-                gen: help_op.gen.wrapping_add(if op_.is_some() { 1 } else { 0 }),
-                op: op_,
-                eptr: help_op.eptr,
-            };
-
+            let help_op_ = help_op.next();
             if let Err(_) = self.help_op.cas(help_op, help_op_) {
                 continue 'retry;
             }
@@ -1658,16 +1772,21 @@ impl<C> Equeue<C> {
     }
 
     #[cfg(equeue_queue_mode="lockless")]
-    fn request_help_<'a>(&self, help_op: HelpOp, op: HelpState, e: &'a Ebuf) -> Result<HelpOp, HelpOp> {
+    fn request_help_<'a>(
+        &self,
+        help_op: HelpOp,
+        state: HelpState,
+        e: &'a Ebuf,
+        estate: State
+    ) -> Result<HelpOp, HelpOp> {
         // help_ should always put help_op into a none state
-        debug_assert!(help_op.op.is_none());
+        debug_assert!(help_op.is_done());
 
-        let help_op_ = HelpOp {
-            gen: help_op.gen.wrapping_add(1),
-            op: Some(op),
-            eptr: e.as_eptr(self)
-        };
-
+        let help_op_ = help_op
+            .set_state(state)
+            .set_eptr(e.as_eptr(self))
+            .set_estate(estate)
+            .inc();
         if let Err(help_op_) = self.help_op.cas(help_op, help_op_) {
             return Err(help_op_);
         }
@@ -1784,7 +1903,8 @@ impl<C> Equeue<C> {
                         if let Err(_) = self.request_help_(
                             help_op,
                             HelpState::EnqueueSliceNextBackNext,
-                            e
+                            e,
+                            State::InQueue
                         ) {
                             continue;
                         }
@@ -1798,7 +1918,8 @@ impl<C> Equeue<C> {
                         if let Err(_) = self.request_help_(
                             help_op,
                             HelpState::EnqueueSiblingSiblingSiblingBack,
-                            e
+                            e,
+                            State::InQueue
                         ) {
                             continue;
                         }
@@ -1942,8 +2063,9 @@ impl<C> Equeue<C> {
                             // just remove the slice
                             if let Err(_) = self.request_help_(
                                 help_op,
-                                HelpState::UnqueueSliceNextBackNext(state),
-                                e
+                                HelpState::UnqueueSliceNextBackNext,
+                                e,
+                                state
                             ) {
                                 continue;
                             }
@@ -1951,8 +2073,9 @@ impl<C> Equeue<C> {
                             // remove from siblings
                             if let Err(_) = self.request_help_(
                                 help_op,
-                                HelpState::UnqueueSiblingSiblingNext(state),
-                                e
+                                HelpState::UnqueueSiblingSiblingNext,
+                                e,
+                                state
                             ) {
                                 continue;
                             }
@@ -1962,8 +2085,9 @@ impl<C> Equeue<C> {
                         // to remove from siblings
                         if let Err(_) = self.request_help_(
                             help_op,
-                            HelpState::UnqueueSiblingBackSibling(state),
-                            e
+                            HelpState::UnqueueSiblingBackSibling,
+                            e,
+                            state
                         ) {
                             continue;
                         }
@@ -1979,8 +2103,9 @@ impl<C> Equeue<C> {
                     // be sure we have exclusive access
                     if let Err(_) = self.request_help_(
                         help_op,
-                        HelpState::UpdateState(state),
-                        e
+                        HelpState::UpdateState,
+                        e,
+                        state
                     ) {
                         continue;
                     }
@@ -1992,8 +2117,9 @@ impl<C> Equeue<C> {
                     // can do is mark the event so it isn't re-enqueued
                     if let Err(_) = self.request_help_(
                         help_op,
-                        HelpState::UpdateState(state),
-                        e
+                        HelpState::UpdateState,
+                        e,
+                        state
                     ) {
                         continue;
                     }
@@ -2182,7 +2308,8 @@ impl<C> Equeue<C> {
                 if let Err(_) = self.request_help_(
                     help_op,
                     HelpState::DequeueDequeue,
-                    back.unwrap()
+                    back.unwrap(),
+                    State::InQueue,
                 ) {
                     continue;
                 }
@@ -2241,8 +2368,9 @@ impl<C> Equeue<C> {
             if let Some(state_) = f(info) {
                 if let Err(_) = self.request_help_(
                     help_op,
-                    HelpState::UpdateState(state_),
-                    e
+                    HelpState::UpdateState,
+                    e,
+                    state_
                 ) {
                     continue;
                 }
@@ -2274,8 +2402,9 @@ impl<C> Equeue<C> {
             if let Some(state_) = f(info) {
                 if let Err(_) = self.request_help_(
                     help_op,
-                    HelpState::UpdateStateInc(state_),
-                    e
+                    HelpState::UpdateStateInc,
+                    e,
+                    state_
                 ) {
                     continue;
                 }
