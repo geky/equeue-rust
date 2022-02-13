@@ -44,7 +44,14 @@ size:
 		--no-default-features \
 		--profile small \
 		--example code_size \
-		--filter equeue )
+		--filter equeue \
+		--message-format json \
+		-n 0 \
+		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
+			"'| reverse | .[] | "\(.size) \(.name)"' \
+		| awk 'NR==1 {printf "%7s %s\n","text","function"}'" \
+			"'{sum+=$$1; printf "%7d %s\n",$$1,substr($$0,length($$1)+2)}'" \
+			"'END {printf "%7d %s\n",sum,"TOTAL"}' )
 
 .PHONY: bench-code-size
 bench-code-size:
@@ -57,7 +64,8 @@ bench-code-size:
 		--filter equeue \
 		--message-format json \
 		-n 0 \
-		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
+			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
 		> target/bench/code-size/lockless.csv)
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
@@ -70,7 +78,8 @@ bench-code-size:
 		--filter equeue \
 		--message-format json \
 		-n 0 \
-		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
+			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
 		> target/bench/code-size/lockless-alloc-break.csv)
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
@@ -82,7 +91,8 @@ bench-code-size:
 		--filter equeue \
 		--message-format json \
 		-n 0 \
-		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
+			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
 		> target/bench/code-size/lockless-alloc.csv)
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
@@ -93,7 +103,8 @@ bench-code-size:
 		--filter equeue \
 		--message-format json \
 		-n 0 \
-		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		| jq -r '.functions | map(select(.name | contains("Debug") | not))'" \
+			"'| (.[0] | keys), (.[] | map(values)) | @csv' \
 		> target/bench/code-size/locking.csv)
 
 .PHONY: bench-throughput
