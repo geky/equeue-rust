@@ -5,15 +5,6 @@ all build:
 	cargo build --tests
 	cargo build --examples
 
-.PHONY: test
-test:
-	cargo test --tests
-	LOOM_MAX_PREEMPTIONS=1 cargo test --test loom --features loom
-
-.PHONY: test-loom
-test-loom:
-	LOOM_MAX_PREEMPTIONS=2 cargo test --test loom --features loom
-
 .PHONY: build-configs
 build-configs:
 	cargo build --no-default-features
@@ -28,6 +19,15 @@ build-configs:
 	cargo build --features async-std
 	cargo build --features tokio
 
+.PHONY: test
+test:
+	cargo test --tests
+	LOOM_MAX_PREEMPTIONS=1 cargo test --test loom --features loom
+
+.PHONY: test-loom
+test-loom:
+	LOOM_MAX_PREEMPTIONS=2 cargo test --test loom --features loom
+
 .PHONY: test-configs
 test-configs: build-configs
 	cargo test --tests
@@ -38,6 +38,10 @@ test-configs: build-configs
 	cargo test --tests --features async-io
 	cargo test --tests --features async-std
 	cargo test --tests --features tokio
+
+.PHONY: bench
+bench:
+	cargo bench --features criterion --benches -- --noplot
 
 .PHONY: docs
 docs:

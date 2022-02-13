@@ -980,7 +980,8 @@ impl HelpOp {
                 Some(q.queue.as_atom())
             }
             HelpState::DequeueNextBack => {
-                Some(q.dequeue.load().as_ref(q).unwrap().next_back.as_atom())
+                q.dequeue.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::DequeueBackNextNextBack => {
                 self.eptr.as_ref(q).unwrap()
