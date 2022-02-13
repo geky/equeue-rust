@@ -207,13 +207,20 @@ impl Debug for Delta {
 }
 
 impl Delta {
+    const _ASSERT_NICHE: bool = {
+        assert!(size_of::<Option<Delta>>() == size_of::<itick>());
+        true
+    };
+
     #[inline]
     pub const fn zero() -> Delta {
+        debug_assert!(Self::_ASSERT_NICHE);
         Self(unsafe { NonZeroItick::new_unchecked(!0) })
     }
 
     #[inline]
     pub const fn new(t: itick) -> Option<Delta> {
+        debug_assert!(Self::_ASSERT_NICHE);
         if t >= 0 {
             Some(unsafe { Self::new_unchecked(t) })
         } else {
@@ -223,6 +230,7 @@ impl Delta {
 
     #[inline]
     pub const unsafe fn new_unchecked(t: itick) -> Delta {
+        debug_assert!(Self::_ASSERT_NICHE);
         Self(NonZeroItick::new_unchecked(!t))
     }
 
@@ -362,8 +370,6 @@ impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
     fn new(t: T) -> Self {
         // compile-time assert
         debug_assert!(Self::_ASSERT_FITS);
-        // run-time assert (I don't trust the compile-time assert yet)
-        debug_assert!(size_of::<T>() <= size_of::<S::U>());
 
         Self(
             S::new(unsafe { transmute_copy(&t) }),
@@ -396,11 +402,10 @@ impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
 
 
 /// Slab-internal pointer, with internalized generation count
-#[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(transparent)]
-struct Eptr(ueptr);
+struct Eptr<T>(ueptr, PhantomData<*const T>);
 
-impl Debug for Eptr {
+impl<T> Debug for Eptr<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("Eptr")
@@ -409,55 +414,76 @@ impl Debug for Eptr {
     }
 }
 
-impl Eptr {
-    const fn null() -> Eptr {
-        Eptr(0)
+impl<T> Clone for Eptr<T> {
+    fn clone(&self) -> Eptr<T> {
+        Eptr(self.0, self.1)
+    }
+}
+
+impl<T> Copy for Eptr<T> {}
+
+impl<T> PartialEq for Eptr<T> {
+    fn eq(&self, other: &Eptr<T>) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T> Eq for Eptr<T> {}
+
+unsafe impl<T> Send for Eptr<T> {}
+unsafe impl<T> Sync for Eptr<T> {}
+
+impl<T> Eptr<T> {
+    const fn null() -> Eptr<T> {
+        Eptr(0, PhantomData)
     }
 
-    fn from_ebuf<C>(q: &Equeue<C>, e: &Ebuf) -> Eptr {
-        Eptr(unsafe {
-            ((e as *const Ebuf as *const u8)
-                .offset_from(q.slab.as_ptr())
-                as usize
-                / align_of::<Ebuf>())
-                as ueptr
-        })
-    }
-
-    fn as_ptr<C>(self, q: &Equeue<C>) -> *const Ebuf {
-        match self.0 {
-            0 => ptr::null(),
-            _ => (
-                &q.slab[self.0 as usize * align_of::<Ebuf>()]
-                    as *const _ as *const Ebuf
+    fn from_ref<C>(q: &Equeue<C>, e: &T) -> Eptr<T> {
+        if e as *const _ == &q.queue as *const _ as *const _ {
+            Eptr(1, PhantomData)
+        } else if e as *const _ == &q.dequeue as *const _ as *const _ {
+            Eptr(2, PhantomData)
+        } else {
+            Eptr(
+                unsafe {
+                    ((e as *const _ as *const u8)
+                        .offset_from(q.slab.as_ptr())
+                        as usize
+                        / size_of::<udeptr>())
+                        as ueptr
+                },
+                PhantomData
             )
         }
     }
 
-    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
-        unsafe { self.as_ptr(q).as_ref() }
+    fn as_ptr<C>(self, q: &Equeue<C>) -> *const T {
+        match self.0 {
+            0 => ptr::null(),
+            1 => &q.queue as *const _ as *const T,
+            2 => &q.dequeue as *const _ as *const T,
+            _ => (
+                &q.slab[self.0 as usize * size_of::<udeptr>()]
+                    as *const _ as *const T
+            )
+        }
     }
 
-    fn as_marked(self) -> MarkedEptr {
-        MarkedEptr {
-            mark: 0,
-            gen: 0,
-            eptr: self,
-        }
+    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a T> {
+        unsafe { self.as_ptr(q).as_ref() }
     }
 }
 
 /// A marked eptr, used to double-check non-locking parts
 /// of the data structures
-#[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(C)] // we need a specific order to transmute between marked types
-struct MarkedEptr {
+struct MarkedEptr<T> {
     gen: ugen,
     mark: ugen,
-    eptr: Eptr,
+    eptr: Eptr<T>,
 }
 
-impl Debug for MarkedEptr {
+impl<T> Debug for MarkedEptr<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
         f.debug_tuple("MarkedEptr")
@@ -468,8 +494,30 @@ impl Debug for MarkedEptr {
     }
 }
 
-impl MarkedEptr {
-    const fn null() -> MarkedEptr {
+impl<T> Clone for MarkedEptr<T> {
+    fn clone(&self) -> Self {
+        MarkedEptr {
+            gen: self.gen,
+            mark: self.mark,
+            eptr: self.eptr,
+        }
+    }
+}
+
+impl<T> Copy for MarkedEptr<T> {}
+
+impl<T> PartialEq for MarkedEptr<T> {
+    fn eq(&self, other: &MarkedEptr<T>) -> bool {
+        self.gen == other.gen
+            && self.mark == other.mark
+            && self.eptr == other.eptr
+    }
+}
+
+impl<T> Eq for MarkedEptr<T> {}
+
+impl<T> MarkedEptr<T> {
+    const fn null() -> MarkedEptr<T> {
         MarkedEptr {
             gen: 0,
             mark: 0,
@@ -477,15 +525,15 @@ impl MarkedEptr {
         }
     }
 
-    fn as_ptr<C>(self, q: &Equeue<C>) -> *const Ebuf {
+    fn as_ptr<C>(self, q: &Equeue<C>) -> *const T {
         self.eptr.as_ptr(q)
     }
 
-    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(self, q: &'a Equeue<C>) -> Option<&'a T> {
         self.eptr.as_ref(q)
     }
 
-    fn inc(self) -> MarkedEptr {
+    fn inc(self) -> Self {
         MarkedEptr {
             gen: self.gen.wrapping_add(1),
             mark: self.mark,
@@ -493,7 +541,7 @@ impl MarkedEptr {
         }
     }
 
-    fn set_eptr(self, other: Eptr) -> MarkedEptr {
+    fn set_eptr(self, other: Eptr<T>) -> MarkedEptr<T> {
         MarkedEptr {
             gen: self.gen,
             mark: self.mark,
@@ -501,7 +549,7 @@ impl MarkedEptr {
         }
     }
 
-    fn cp_eptr(self, other: MarkedEptr) -> MarkedEptr {
+    fn cp_eptr(self, other: MarkedEptr<T>) -> MarkedEptr<T> {
         MarkedEptr {
             gen: self.gen,
             mark: self.mark,
@@ -509,12 +557,16 @@ impl MarkedEptr {
         }
     }
 
-    fn set_mark(self, mark: ugen) -> MarkedEptr {
+    fn set_mark(self, mark: ugen) -> MarkedEptr<T> {
         MarkedEptr {
             gen: self.gen,
             mark: mark,
             eptr: self.eptr,
         }
+    }
+
+    fn as_marked<U>(self) -> MarkedEptr<U> {
+        unsafe { transmute_copy(&self) }
     }
 
     fn as_info(self) -> Info {
@@ -523,14 +575,14 @@ impl MarkedEptr {
 }
 
 // interactions with atomics
-impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
-    fn store_marked(&self, old: MarkedEptr, new: Eptr) -> MarkedEptr {
+impl<T, S: AtomicStorage> Atomic<MarkedEptr<T>, S> {
+    fn store_marked(&self, old: MarkedEptr<T>, new: Eptr<T>) -> MarkedEptr<T> {
         let new = old.set_eptr(new);
         self.store(new);
         new
     }
 
-    fn store_marked_inc(&self, old: MarkedEptr, new: Eptr) -> MarkedEptr {
+    fn store_marked_inc(&self, old: MarkedEptr<T>, new: Eptr<T>) -> MarkedEptr<T> {
         let new = old.set_eptr(new).inc();
         self.store(new);
         new
@@ -540,7 +592,7 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked(&self, old: MarkedEptr, new: Eptr) -> Result<MarkedEptr, MarkedEptr> {
+    fn cas_marked(&self, old: MarkedEptr<T>, new: Eptr<T>) -> Result<MarkedEptr<T>, MarkedEptr<T>> {
         let new = old.set_eptr(new);
         self.cas(old, new)
     }
@@ -549,11 +601,22 @@ impl<S: AtomicStorage> Atomic<MarkedEptr, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked_inc(&self, old: MarkedEptr, new: Eptr) -> Result<MarkedEptr, MarkedEptr> {
+    fn cas_marked_inc(&self, old: MarkedEptr<T>, new: Eptr<T>) -> Result<MarkedEptr<T>, MarkedEptr<T>> {
         let new = old.set_eptr(new).inc();
         self.cas(old, new)
+    }
+
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Atomic<MarkedEptr<T>, S>> {
+        Eptr::from_ref(q, self)
+    }
+
+    fn as_atom<'a>(&'a self) -> &'a Atomic<Marked, S> {
+        unsafe { &*(self as *const _ as *const Atomic<Marked, S>) }
     }
 }
+
+// this is just an alias for a generic marked thing
+type Marked = MarkedEptr<()>;
 
 
 /// Several event fields are crammed in here to avoid wasting space
@@ -680,15 +743,15 @@ impl Info {
         }
     }
 
-    fn as_marked(self) -> MarkedEptr {
+    fn as_marked<U>(self) -> MarkedEptr<U> {
         unsafe { transmute_copy(&self) }
     }
 }
 
 // interactions with atomics
 impl<S: AtomicStorage> Atomic<Info, S> {
-    fn as_atomic_marked<'a>(&'a self) -> &'a Atomic<MarkedEptr, S> {
-        unsafe { &*(self as *const _ as *const Atomic<MarkedEptr, S>) }
+    fn as_atom<'a>(&'a self) -> &'a Atomic<Marked, S> {
+        unsafe { &*(self as *const _ as *const Atomic<Marked, S>) }
     }
 }
 
@@ -696,10 +759,10 @@ impl<S: AtomicStorage> Atomic<Info, S> {
 /// Internal event header
 #[derive(Debug)]
 struct Ebuf {
-    next: Atomic<MarkedEptr, AtomicUdeptr>,
-    next_back: Atomic<MarkedEptr, AtomicUdeptr>,
-    sibling: Atomic<MarkedEptr, AtomicUdeptr>,
-    sibling_back: Atomic<MarkedEptr, AtomicUdeptr>,
+    next: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
+    next_back: Atomic<MarkedEptr<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>, AtomicUdeptr>,
+    sibling: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
+    sibling_back: Atomic<MarkedEptr<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>, AtomicUdeptr>,
     info: Atomic<Info, AtomicUdeptr>,
 
     cb: Option<fn(*mut u8)>,
@@ -711,8 +774,18 @@ struct Ebuf {
 }
 
 impl Ebuf {
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr {
-        Eptr::from_ebuf(q, self)
+    const ALIGN: usize = {
+        let align = max_const_usize(
+            align_of::<Ebuf>(),
+            size_of::<udeptr>(),
+        );
+        assert!(align >= align_of::<*const ()>());
+        assert!(align >= align_of::<AtomicUdeptr>());
+        align
+    };
+
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Ebuf> {
+        Eptr::from_ref(q, self)
     }
 
     // info access
@@ -721,7 +794,7 @@ impl Ebuf {
     }
 
     fn size(&self) -> usize {
-        align_of::<Ebuf>() << self.npw2()
+        Ebuf::ALIGN << self.npw2()
     }
 
     // access to the trailing buffer
@@ -759,12 +832,24 @@ impl Ebuf {
 }
 
 // some convenience extensions to Option<&Ebuf>
-trait OptionEbuf<'a> {
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr;
+trait AsEptr {
+    type Target;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target>;
 }
 
-impl<'a> OptionEbuf<'a> for Option<&'a Ebuf> {
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr {
+impl AsEptr for Option<&Ebuf> {
+    type Target = Ebuf;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target> {
+        match self {
+            Some(e) => e.as_eptr(q),
+            None => Eptr::null(),
+        }
+    }
+}
+
+impl<T> AsEptr for Option<&Atomic<MarkedEptr<T>, AtomicUdeptr>> {
+    type Target = Atomic<MarkedEptr<T>, AtomicUdeptr>;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target> {
         match self {
             Some(e) => e.as_eptr(q),
             None => Eptr::null(),
@@ -794,6 +879,7 @@ enum HelpState {
                                           //      |
     DequeueDequeue,                       // -.   |
     DequeueQueue,                         // <'   |
+    DequeueNextBack,                      // <'   |
     DequeueBackNextNextBack,              // <'   |
     DequeueBackNext,                      // <'   |
                                           //      |
@@ -806,7 +892,7 @@ enum HelpState {
 struct HelpOp {
     gen: ugen,
     op: Option<HelpState>,
-    eptr: Eptr,
+    eptr: Eptr<Ebuf>,
 }
 
 #[cfg(equeue_queue_mode="lockless")]
@@ -819,197 +905,170 @@ impl HelpOp {
         }
     }
 
-    fn help_eptr<C>(
+    fn atom<'a, C>(
         &self,
-        q: &Equeue<C>
-    ) -> Eptr {
+        q: &'a Equeue<C>
+    ) -> Option<&'a Atomic<Marked, AtomicUdeptr>> {
         match self.op.unwrap() {
             HelpState::EnqueueSliceNextBackNext => {
-                self.eptr.as_ref(q).unwrap().next_back.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next_back.load().as_ref(q)
+                    .map(|next_back| next_back.as_atom())
             }
             HelpState::EnqueueSliceNextNextBack => {
-                self.eptr.as_ref(q).unwrap().next.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::EnqueueSiblingSiblingSiblingBack => {
-                self.eptr.as_ref(q).unwrap().sibling.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling.load().as_ref(q)
+                    .map(|e| e.sibling_back.as_atom())
             }
             HelpState::EnqueueSiblingSiblingBackSibling => {
-                self.eptr.as_ref(q).unwrap().sibling_back.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling_back.load().as_ref(q)
+                    .map(|sibling_back| sibling_back.as_atom())
             }
             HelpState::UnqueueSliceNextBackNext(_) => {
-                self.eptr.as_ref(q).unwrap().next_back.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next_back.load().as_ref(q)
+                    .map(|next_back| next_back.as_atom())
             }
             HelpState::UnqueueSliceNextNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().next.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::UnqueueSiblingSiblingNext(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling.load().as_ref(q)
+                    .map(|e| e.next.as_atom())
             }
             HelpState::UnqueueSiblingSiblingNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::UnqueueSiblingNextBackNext(_) => {
-                self.eptr.as_ref(q).unwrap().next_back.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next_back.load().as_ref(q)
+                    .map(|next_back| next_back.as_atom())
             }
             HelpState::UnqueueSiblingNextNextBack(_) => {
-                self.eptr.as_ref(q).unwrap().next.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::UnqueueSiblingBackSibling(_) => {
-                self.eptr.as_ref(q).unwrap().sibling_back.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling_back.load().as_ref(q)
+                    .map(|sibling_back| sibling_back.as_atom())
             }
             HelpState::UnqueueSiblingSiblingBack(_) => {
-                self.eptr.as_ref(q).unwrap().sibling.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .sibling.load().as_ref(q)
+                    .map(|e| e.sibling_back.as_atom())
             }
             HelpState::UnqueueNext(_) => {
-                self.eptr
+                Some(self.eptr.as_ref(q).unwrap().next.as_atom())
             }
             HelpState::DequeueDequeue => {
-                Eptr::null()
+                Some(q.dequeue.as_atom())
             }
             HelpState::DequeueQueue => {
-                Eptr::null()
+                Some(q.queue.as_atom())
+            }
+            HelpState::DequeueNextBack => {
+                Some(q.dequeue.load().as_ref(q).unwrap().next_back.as_atom())
             }
             HelpState::DequeueBackNextNextBack => {
-                self.eptr.as_ref(q).unwrap().next.load().eptr
+                self.eptr.as_ref(q).unwrap()
+                    .next.load().as_ref(q)
+                    .map(|e| e.next_back.as_atom())
             }
             HelpState::DequeueBackNext => {
-                self.eptr
+                Some(self.eptr.as_ref(q).unwrap().next.as_atom())
             }
             HelpState::UpdateState(_) => {
-                self.eptr
+                Some(self.eptr.as_ref(q).unwrap().info.as_atom())
             }
             HelpState::UpdateStateInc(_) => {
-                self.eptr
+                Some(self.eptr.as_ref(q).unwrap().info.as_atom())
             }
         }
     }
 
-    // TODO would it simplify things to use Eptr-granular Eptrs? And make -1 and -2 queue and dequeue?
-    #[cfg(equeue_queue_mode="lockless")]
-    fn help_atom<'a, C>(
-        &self,
-        q: &'a Equeue<C>,
-        help_eptr: Eptr,
-    ) -> Option<&'a Atomic<MarkedEptr, AtomicUdeptr>> {
-        match self.op.unwrap() {
-            HelpState::EnqueueSliceNextBackNext => {
-                match help_eptr.as_ebuf(q) {
-                    Some(e) => Some(&e.next),
-                    None    => Some(&q.queue),
-                }
-            }
-            HelpState::EnqueueSliceNextNextBack => {
-                help_eptr.as_ebuf(q).map(|e| &e.next_back)
-            }
-            HelpState::EnqueueSiblingSiblingSiblingBack => {
-                help_eptr.as_ebuf(q).map(|e| &e.sibling_back)
-            }
-            HelpState::EnqueueSiblingSiblingBackSibling => {
-                help_eptr.as_ebuf(q).map(|e| &e.sibling)
-            }
-            HelpState::UnqueueSliceNextBackNext(_) => {
-                match help_eptr.as_ebuf(q) {
-                    Some(e)                                 => Some(&e.next),
-                    _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
-                    _ if q.dequeue.load().eptr == self.eptr => Some(&q.dequeue),
-                    None                                    => None,
-                }
-            }
-            HelpState::UnqueueSliceNextNextBack(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.next_back)
-            }
-            HelpState::UnqueueSiblingSiblingNext(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.next)
-            }
-            HelpState::UnqueueSiblingSiblingNextBack(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.next_back)
-            }
-            HelpState::UnqueueSiblingNextBackNext(_) => {
-                match help_eptr.as_ebuf(q) {
-                    Some(e)                                 => Some(&e.next),
-                    _ if q.queue.load().eptr == self.eptr   => Some(&q.queue),
-                    _ if q.dequeue.load().eptr == self.eptr => Some(&q.dequeue),
-                    None                                    => None,
-                }
-            }
-            HelpState::UnqueueSiblingNextNextBack(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.next_back)
-            }
-            HelpState::UnqueueSiblingBackSibling(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.sibling)
-            }
-            HelpState::UnqueueSiblingSiblingBack(_) => {
-                help_eptr.as_ebuf(q).map(|e| &e.sibling_back)
-            }
-            HelpState::UnqueueNext(_) => {
-                Some(&help_eptr.as_ebuf(q).unwrap().next)
-            }
-            HelpState::DequeueDequeue => {
-                Some(&q.dequeue)
-            }
-            HelpState::DequeueQueue => {
-                Some(&q.queue)
-            }
-            HelpState::DequeueBackNextNextBack => {
-                help_eptr.as_ebuf(q).map(|e| &e.next_back)
-            }
-            HelpState::DequeueBackNext => {
-                Some(&help_eptr.as_ebuf(q).unwrap().next)
-            }
-            HelpState::UpdateState(_) => {
-                Some(help_eptr.as_ebuf(q).unwrap().info.as_atomic_marked())
-            }
-            HelpState::UpdateStateInc(_) => {
-                Some(help_eptr.as_ebuf(q).unwrap().info.as_atomic_marked())
-            }
-        }
-    }
-
-    #[cfg(equeue_queue_mode="lockless")]
-    fn help_new<C>(
+    fn new<C>(
         &self,
         q: &Equeue<C>,
-        help_old: MarkedEptr
-    ) -> MarkedEptr {
+        help_old: Marked
+    ) -> Marked {
         match self.op.unwrap() {
             HelpState::EnqueueSliceNextBackNext => {
-                help_old.set_eptr(self.eptr).inc()
+                help_old.as_marked::<Ebuf>()
+                    .set_eptr(self.eptr)
+                    .as_marked().inc()
             }
             HelpState::EnqueueSliceNextNextBack => {
-                help_old.set_eptr(self.eptr).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .set_eptr(self.eptr.as_ref(q).unwrap().next.as_eptr(q))
+                    .as_marked().inc()
             }
             HelpState::EnqueueSiblingSiblingSiblingBack => {
-                help_old.set_eptr(self.eptr).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .set_eptr(self.eptr.as_ref(q).unwrap().sibling.as_eptr(q))
+                    .as_marked().inc()
             }
             HelpState::EnqueueSiblingSiblingBackSibling => {
-                help_old.set_eptr(self.eptr).inc()
+                help_old.as_marked::<Ebuf>()
+                    .set_eptr(self.eptr)
+                    .as_marked().inc()
             }
             HelpState::UnqueueSliceNextBackNext(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSliceNextNextBack(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingNext(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next.load()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingNextBack(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load()).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingNextBackNext(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingNextNextBack(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .set_eptr(self.eptr.as_ref(q).unwrap().sibling.load().as_ref(q).unwrap().next.as_eptr(q))
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingBackSibling(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingBack(_) => {
-                help_old.cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load()).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load())
+                    .as_marked().inc()
             }
             HelpState::UnqueueNext(_) => {
-                help_old.set_eptr(Eptr::null()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .set_eptr(Eptr::null())
+                    .as_marked().inc()
             }
             // The only reason we need a redundant mark here for queue and dequeue
             // is so that we can invalidate traversals correctly. If we only had
@@ -1021,28 +1080,36 @@ impl HelpOp {
             // doesn't work with this FSM scheme.
             //
             HelpState::DequeueDequeue => {
-                help_old
+                help_old.as_marked::<Ebuf>()
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(q.queue.load())
-                    .inc()
+                    .as_marked().inc()
             }
             HelpState::DequeueQueue => {
-                help_old
+                help_old.as_marked::<Ebuf>()
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
-                    .inc()
+                    .as_marked().inc()
+            }
+            HelpState::DequeueNextBack => {
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .set_eptr(q.dequeue.as_eptr(q))
+                    .as_marked().inc()
             }
             HelpState::DequeueBackNextNextBack => {
-                help_old.set_eptr(Eptr::null()).inc()
+                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                    .set_eptr(q.queue.as_eptr(q))
+                    .as_marked().inc()
             }
             HelpState::DequeueBackNext => {
-                help_old.set_eptr(Eptr::null()).inc()
+                help_old.as_marked::<Ebuf>()
+                    .set_eptr(Eptr::null())
+                    .as_marked().inc()
             }
             HelpState::UpdateState(state) => {
                 help_old.as_info()
                     .set_state(state)
-                    .as_marked()
-                    .inc()
+                    .as_marked().inc()
             }
             HelpState::UpdateStateInc(state) => {
                 help_old.as_info()
@@ -1050,14 +1117,12 @@ impl HelpOp {
                     .set_static(false)
                     .set_once(false)
                     .set_state(state)
-                    .as_marked()
-                    .inc()
+                    .as_marked().inc()
             }
         }
     }
 
-    #[cfg(equeue_queue_mode="lockless")]
-    fn help_next(
+    fn next(
         &self,
     ) -> Option<HelpState> {
         match self.op.unwrap() {
@@ -1077,7 +1142,8 @@ impl HelpOp {
             HelpState::UnqueueNext(state)                   => Some(HelpState::UpdateState(state)),                   // <'---+
                                                                                                                       //      |
             HelpState::DequeueDequeue                       => Some(HelpState::DequeueQueue),                         // -.   |
-            HelpState::DequeueQueue                         => Some(HelpState::DequeueBackNextNextBack),              // <'   |
+            HelpState::DequeueQueue                         => Some(HelpState::DequeueNextBack),                      // <'   |
+            HelpState::DequeueNextBack                      => Some(HelpState::DequeueBackNextNextBack),              // <'   |
             HelpState::DequeueBackNextNextBack              => Some(HelpState::DequeueBackNext),                      // <'   |
             HelpState::DequeueBackNext                      => None,                                                  // <'   |
                                                                                                                       //      |
@@ -1101,14 +1167,13 @@ pub struct Equeue<
     #[cfg(feature="alloc")] alloced: bool,
 
     // queue management
-    queue: Atomic<MarkedEptr, AtomicUdeptr>,
-    dequeue: Atomic<MarkedEptr, AtomicUdeptr>,
+    queue: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
+    dequeue: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
     break_: Atomic<u8, AtomicUeptr>,
     precision: u8,
 
     #[cfg(equeue_queue_mode="lockless")] help_op: Atomic<HelpOp, AtomicUdeptr>,
-    #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic<MarkedEptr, AtomicUdeptr>,
-    #[cfg(equeue_queue_mode="lockless")] help_old: Atomic<MarkedEptr, AtomicUdeptr>,
+    #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic<MarkedEptr<Atomic<Marked, AtomicUdeptr>>, AtomicUdeptr>,
 
     // other things
     clock: C,
@@ -1180,15 +1245,11 @@ impl<C> Config<C> {
 
 impl<C> Equeue<C> {
     pub fn with_config(config: Config<C>) -> Equeue<C> {
-        // some sanity checks
-        debug_assert!(align_of::<Ebuf>() >= align_of::<usize>());
-        debug_assert_eq!(size_of::<Option<Delta>>(), size_of::<itick>());
-
         let (buffer, alloced) = match config.buffer {
             #[cfg(feature="alloc")]
             Some(Left(size)) => {
-                let size = aligndown(size, align_of::<Ebuf>());
-                let layout = Layout::from_size_align(size, align_of::<Ebuf>()).unwrap();
+                let size = aligndown(size, Ebuf::ALIGN);
+                let layout = Layout::from_size_align(size, Ebuf::ALIGN).unwrap();
                 let buffer = unsafe { alloc(layout) };
                 assert!(!buffer.is_null());
 
@@ -1205,8 +1266,8 @@ impl<C> Equeue<C> {
 
         // align buffer
         let range = buffer.as_ptr_range();
-        let start = alignup(range.start as usize, align_of::<Ebuf>()) - range.start as usize;
-        let end = aligndown(range.end as usize, align_of::<Ebuf>()) - range.start as usize;
+        let start = alignup(range.start as usize, Ebuf::ALIGN) - range.start as usize;
+        let end = aligndown(range.end as usize, Ebuf::ALIGN) - range.start as usize;
         let buffer = buffer.get_mut(start..end).unwrap();
 
         // go ahead and zero our buffer, this makes it easier to manage bucket
@@ -1216,13 +1277,10 @@ impl<C> Equeue<C> {
         Equeue {
             slab: buffer,
             #[cfg(feature="alloc")] alloced: alloced,
-            // there's already a bit of finagling here to fit sizes in ueptrs,
-            // slab_front is used for bytes, but should never exceed ~log2(width)
-            // while slab_back is used for ebufs, which have a larger alignment
-            slab_front: Atomic::new(0),
-            slab_back: Atomic::new(
-                ueptr::try_from(buffer.len() / align_of::<Ebuf>()).unwrap()
-            ),
+            // Go ahead and allocate 3 buckets, this is actually so we can
+            // reserve eptrs 0,1,2 for null, queue, and dequeue
+            slab_front: Atomic::new(3),
+            slab_back: Atomic::new(ueptr::try_from(buffer.len() / size_of::<udeptr>()).unwrap()),
 
             queue: Atomic::new(MarkedEptr::null()),
             dequeue: Atomic::new(MarkedEptr::null()),
@@ -1231,7 +1289,6 @@ impl<C> Equeue<C> {
 
             #[cfg(equeue_queue_mode="lockless")] help_op: Atomic::new(HelpOp::done()),
             #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic::new(MarkedEptr::null()),
-            #[cfg(equeue_queue_mode="lockless")] help_old: Atomic::new(MarkedEptr::null()),
 
             clock: config.clock
                 .map_left(|f| f())
@@ -1267,7 +1324,7 @@ impl<C> Drop for Equeue<C> {
         // intermediary states for static events/futures.
         //
         // it's up to dealloc_ to make sure drop is cleared after called
-        let mut i = self.slab_back.load() as usize * align_of::<Ebuf>();
+        let mut i = self.slab_back.load() as usize * size_of::<udeptr>();
         while let Some(e) = self.slab.get(i) {
             let e = unsafe { &*(e as *const _ as *const Ebuf) };
             let e = unsafe { e.claim() };
@@ -1286,7 +1343,7 @@ impl<C> Drop for Equeue<C> {
         // free allocated buffer?
         #[cfg(feature="alloc")]
         if self.alloced {
-            let layout = Layout::from_size_align(self.slab.len(), align_of::<Ebuf>()).unwrap();
+            let layout = Layout::from_size_align(self.slab.len(), Ebuf::ALIGN).unwrap();
             unsafe { dealloc(self.slab.as_ptr() as *mut u8, layout) };
         }
     }
@@ -1298,12 +1355,12 @@ impl<C> Equeue<C> {
             .contains(&(e.deref() as *const _ as *const u8))
     }
 
-    fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEptr, AtomicUdeptr>] {
-        let slab_front = self.slab_front.load() as usize;
+    fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>] {
+        let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
         unsafe {
             slice::from_raw_parts(
-                self.slab.as_ptr() as *const Atomic<MarkedEptr, AtomicUdeptr>,
-                slab_front / size_of::<Atomic<MarkedEptr, AtomicUdeptr>>()
+                self.slab.as_ptr() as *const Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
+                slab_front / size_of::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
             )
         }
     }
@@ -1313,15 +1370,15 @@ impl<C> Equeue<C> {
     fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
         // this looks arbitrary, but Ebuf should have a pretty reasonable
         // alignment since it contains both function pointers and AtomicUdeptrs
-        assert!(layout.align() <= align_of::<Ebuf>(),
+        assert!(layout.align() <= Ebuf::ALIGN,
             "unable to alloc alignment {} > {}",
-            layout.align(), align_of::<Ebuf>()
+            layout.align(), Ebuf::ALIGN
         );
 
         // find best bucket
         let npw2 = npw2(
-            alignup(layout.size(), align_of::<Ebuf>())
-                / align_of::<Ebuf>()
+            alignup(layout.size(), Ebuf::ALIGN)
+                / size_of::<udeptr>()
         );
 
         #[allow(unused_labels)]
@@ -1371,14 +1428,14 @@ impl<C> Equeue<C> {
             let new_slab_back = {
                 // check if we even have enough memory available, we allocate both
                 // an event and maybe some buckets if we don't have enough
-                let slab_front = self.slab_front.load() as usize;
-                let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
+                let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
+                let slab_back = self.slab_back.load() as usize * size_of::<udeptr>();
                 let new_slab_front = max(
-                    (npw2 as usize + 1)*size_of::<MarkedEptr>(),
+                    (npw2 as usize + 1)*size_of::<MarkedEptr<Ebuf>>(),
                     slab_front
                 );
                 let new_slab_back = slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
+                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
                 );
 
                 if new_slab_front > new_slab_back {
@@ -1390,8 +1447,8 @@ impl<C> Equeue<C> {
                 // end of the world, the buckets are a sparse array anyways
                 if new_slab_front > slab_front {
                     if let Err(_) = self.slab_front.cas(
-                        ueptr::try_from(slab_front).unwrap(),
-                        ueptr::try_from(new_slab_front).unwrap()
+                        ueptr::try_from(slab_front / size_of::<udeptr>()).unwrap(),
+                        ueptr::try_from(new_slab_front / size_of::<udeptr>()).unwrap()
                     ) {
                         continue 'retry;
                     }
@@ -1399,8 +1456,8 @@ impl<C> Equeue<C> {
 
                 debug_assert!(new_slab_back < slab_back);
                 if let Err(_) = self.slab_back.cas(
-                    ueptr::try_from(slab_back / align_of::<Ebuf>()).unwrap(),
-                    ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
+                    ueptr::try_from(slab_back / size_of::<udeptr>()).unwrap(),
+                    ueptr::try_from(new_slab_back / size_of::<udeptr>()).unwrap()
                 ) {
                     continue 'retry;
                 }
@@ -1413,14 +1470,14 @@ impl<C> Equeue<C> {
 
                 // check if we even have enough memory available, we allocate both
                 // an event and maybe some buckets if we don't have enough
-                let slab_front = self.slab_front.load() as usize;
-                let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
+                let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
+                let slab_back = self.slab_back.load() as usize * size_of::<udeptr>();
                 let new_slab_front = max(
-                    (npw2 as usize + 1)*size_of::<MarkedEptr>(),
+                    (npw2 as usize + 1)*size_of::<MarkedEptr<Ebuf>>(),
                     slab_front
                 );
                 let new_slab_back = slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2)
+                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
                 );
 
                 if new_slab_front > new_slab_back {
@@ -1430,13 +1487,13 @@ impl<C> Equeue<C> {
                 // actually commit our allocation
                 if new_slab_front > slab_front {
                     self.slab_front.store(
-                        ueptr::try_from(new_slab_front).unwrap()
+                        ueptr::try_from(new_slab_front / size_of::<udeptr>()).unwrap()
                     );
                 }
 
                 debug_assert!(new_slab_back < slab_back);
                 self.slab_back.store(
-                    ueptr::try_from(new_slab_back / align_of::<Ebuf>()).unwrap()
+                    ueptr::try_from(new_slab_back / size_of::<udeptr>()).unwrap()
                 );
 
                 new_slab_back
@@ -1536,8 +1593,7 @@ impl<C> Equeue<C> {
                 }
 
                 // get reference to the atom we are updating
-                let help_eptr = help_op.help_eptr(self);
-                help_atom = help_op.help_atom(self, help_eptr);
+                help_atom = help_op.atom(self);
 
                 // load the old value
                 help_old = match help_atom {
@@ -1548,7 +1604,7 @@ impl<C> Equeue<C> {
                 // try to commit the context
                 let help_ctx_ = help_ctx
                     .set_mark(help_old.gen)
-                    .set_eptr(help_eptr)
+                    .set_eptr(help_atom.as_eptr(self))
                     .inc();
                 if let Err(_) = self.help_ctx.cas(help_ctx, help_ctx_) {
                     continue 'retry;
@@ -1557,7 +1613,7 @@ impl<C> Equeue<C> {
                 help_ctx = help_ctx_;
             } else {
                 // get reference to atom we are updating
-                help_atom = help_op.help_atom(self, help_ctx.eptr);
+                help_atom = help_ctx.eptr.as_ref(self);
                 
                 // we always load the old value from the source
                 help_old = match help_atom {
@@ -1572,7 +1628,7 @@ impl<C> Equeue<C> {
                 .filter(|_| help_old.gen == help_ctx.mark)
             {
                 // find new value
-                let help_new = help_op.help_new(self, help_old);
+                let help_new = help_op.new(self, help_old);
 
                 // perform the actual compare and swap
                 if let Err(help_old_) = atom.cas(help_old, help_new) {
@@ -1583,7 +1639,7 @@ impl<C> Equeue<C> {
                 }
             }
 
-            let op_ = help_op.help_next();
+            let op_ = help_op.next();
             let help_op_ = HelpOp {
                 gen: help_op.gen.wrapping_add(if op_.is_some() { 1 } else { 0 }),
                 op: op_,
@@ -1631,7 +1687,6 @@ impl<C> Equeue<C> {
             let queue_mark = headptr.mark;
 
             // find insertion point
-            let mut back = None;
             let mut sibling = None;
 
             let mut tailptr = headptr;
@@ -1652,7 +1707,6 @@ impl<C> Equeue<C> {
                     }
                 }
 
-                back = Some(tail);
                 let nextptr = tail.next.load();
 
                 // check that the previous next pointer hasn't changed on us, if
@@ -1671,9 +1725,9 @@ impl<C> Equeue<C> {
                 None => {
                     // insert a new slice
                     e.next.store_marked(e.next.load(), tailptr.eptr);
-                    e.next_back.store_marked(e.next_back.load(), back.as_eptr(self));
+                    e.next_back.store_marked(e.next_back.load(), tailsrc.as_eptr(self));
                     e.sibling.store_marked(e.sibling.load(), e.as_eptr(self));
-                    e.sibling_back.store_marked(e.sibling_back.load(), e.as_eptr(self));
+                    e.sibling_back.store_marked(e.sibling_back.load(), e.sibling.as_eptr(self));
                 }
                 Some(sibling) => {
                     // push onto existing slice
@@ -1790,7 +1844,7 @@ impl<C> Equeue<C> {
                         // insert a new slice
                         tailsrc.store_marked(tailptr, e.as_eptr(self));
                         if let Some(next) = tailptr.as_ref(self) {
-                            next.next_back.store_marked(next.next_back.load(), e.as_eptr(self));
+                            next.next_back.store_marked(next.next_back.load(), e.next.as_eptr(self));
                         }
 
                         tailsrc as *const _ == &self.queue as *const _
@@ -1802,9 +1856,9 @@ impl<C> Equeue<C> {
                         // the back-references are correct atomically
                         let sibling_backptr = sibling.sibling_back.load();
                         let sibling_back = sibling_backptr.as_ref(self).unwrap();
-                        sibling.sibling_back.store_marked(sibling_backptr, e.as_eptr(self));
+                        sibling.sibling_back.store_marked(sibling_backptr, e.sibling.as_eptr(self));
                         
-                        sibling_back.sibling.store_marked(sibling_back.sibling.load(), e.as_eptr(self));
+                        sibling_back.store_marked(sibling_back.load(), e.as_eptr(self));
                         e.sibling_back.store_marked(e.sibling_back.load(), sibling_back.as_eptr(self));
 
                         false
@@ -1986,12 +2040,9 @@ impl<C> Equeue<C> {
                     // we can disentangle the event here and reclaim the memory
                     let nextptr = e.next.load();
                     let next = nextptr.as_ref(self);
-                    let next_backptr = e.next_back.load();
-                    let next_back = next_backptr.as_ref(self);
-                    let siblingptr = e.sibling.load();
-                    let sibling = siblingptr.as_ref(self).unwrap();
-                    let sibling_backptr = e.sibling_back.load();
-                    let sibling_back = sibling_backptr.as_ref(self).unwrap();
+                    let next_back = e.next_back.load().as_ref(self);
+                    let sibling = e.sibling.load().as_ref(self).unwrap();
+                    let sibling_back = e.sibling_back.load().as_ref(self).unwrap();
 
                     // we also need to remove the queue if we are the head, we can't
                     // just point to queue here with next_back because eptrs are
@@ -2007,14 +2058,8 @@ impl<C> Equeue<C> {
                             // just remove the slice
 
                             // update next_back's next/queue head first to avoid invalidating traversals
-                            if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, nextptr.eptr);
-                            }
-                            if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, nextptr.eptr);
-                            }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), nextptr.eptr);
+                                next_back.store_marked(next_back.load(), nextptr.eptr);
                             }
                             if let Some(next) = next {
                                 next.next_back.store_marked(next.next_back.load(), next_back.as_eptr(self));
@@ -2031,23 +2076,17 @@ impl<C> Equeue<C> {
                             sibling.next_back.store_marked(sibling.next_back.load(), next_back.as_eptr(self));
 
                             // update next_back's next/queue head first to avoid invalidating traversals
-                            if headptr.as_ptr(self) == e as *const _ {
-                                self.queue.store_marked(headptr, sibling.as_eptr(self));
-                            }
-                            if deheadptr.as_ptr(self) == e as *const _ {
-                                self.dequeue.store_marked(deheadptr, sibling.as_eptr(self));
-                            }
                             if let Some(next_back) = next_back {
-                                next_back.next.store_marked(next_back.next.load(), sibling.as_eptr(self));
+                                next_back.store_marked(next_back.load(), sibling.as_eptr(self));
                             }
                             if let Some(next) = next {
-                                next.next_back.store_marked(next.next_back.load(), sibling.as_eptr(self));
+                                next.next_back.store_marked(next.next_back.load(), sibling.next.as_eptr(self));
                             }
                         }
                     }
 
-                    sibling_back.sibling.store_marked(sibling_backptr, sibling.as_eptr(self));
-                    sibling.sibling_back.store_marked(siblingptr, sibling_back.as_eptr(self));
+                    sibling_back.store_marked(sibling_back.load(), sibling.as_eptr(self));
+                    sibling.sibling_back.store_marked(sibling.sibling_back.load(), sibling_back.as_eptr(self));
 
                     // mark as removed
                     e.next.store_marked_inc(nextptr, Eptr::null());
@@ -2168,8 +2207,10 @@ impl<C> Equeue<C> {
                 );
 
                 // cut our unrolled queue
+                let head = headptr.as_ref(self).unwrap();
+                head.next_back.store_marked(head.next_back.load(), self.dequeue.as_eptr(self));
                 if let Some(tail) = tailptr.as_ref(self) {
-                    tail.next_back.store(MarkedEptr::null());
+                    tail.next_back.store_marked(tail.next_back.load(), self.queue.as_eptr(self));
                 }
                 back.unwrap().next.store_marked_inc(tailptr, Eptr::null());
 
@@ -2641,7 +2682,7 @@ impl<C> Equeue<C> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Id {
     id: ugen,
-    eptr: Eptr,
+    eptr: Eptr<Ebuf>,
 }
 
 impl Id {
@@ -2758,7 +2799,7 @@ unsafe fn event_waker_wake<C: Clock+Signal>(e: *const ()) {
     //       ^      ^-- truncated id of event
     //       '--------- uncompressed pointer to event
 
-    let mask = align_of::<Ebuf>()-1;
+    let mask = Ebuf::ALIGN-1;
     let id_trunc = ((e as usize) & mask) as ugen;
     let e = Ebuf::from_data_mut_ptr(
         ((e as usize) & !mask) as *mut ()
@@ -3385,8 +3426,8 @@ impl<C> Equeue<C> {
     pub fn usage(&self) -> Usage {
         // find slab usage
         let slab_total = self.slab.len();
-        let slab_front = self.slab_front.load() as usize;
-        let slab_back = self.slab_back.load() as usize * align_of::<Ebuf>();
+        let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
+        let slab_back = self.slab_back.load() as usize * size_of::<udeptr>();
         let slab_unused = slab_back - slab_front;
 
         let mut total = 0usize;
@@ -3439,7 +3480,7 @@ impl<C> Equeue<C> {
                 |head| head.sibling.load().as_ref(self)
             ) {
                 free += 1;
-                free_bytes += size_of::<Ebuf>() + (align_of::<Ebuf>() << npw2);
+                free_bytes += size_of::<Ebuf>() + (Ebuf::ALIGN << npw2);
 
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 

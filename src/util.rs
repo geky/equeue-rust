@@ -218,3 +218,7 @@ pub(crate) const fn parse_const_utick(s: &str) -> utick {
 
     v
 }
+
+pub(crate) const fn max_const_usize(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
