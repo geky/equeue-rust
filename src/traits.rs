@@ -6,6 +6,16 @@ use crate::Event;
 use crate::Error;
 use crate::Delta;
 use crate::sys::*;
+use crate::util::*;
+
+
+/// Default frequency for clocks
+const FREQUENCY: utick = {
+    match option_env!("EQUEUE_FREQUENCY") {
+        Some(frequency) => parse_const_utick(frequency),
+        None => 1000,
+    }
+};
 
 
 //// post traits ////
@@ -56,7 +66,10 @@ pub trait TryFromDelta: Sized {
 /// Some way to get the time, for some definition of time
 pub trait Clock: Send + Sync + Debug {
     fn now(&self) -> utick;
-    fn frequency(&self) -> utick;
+
+    fn frequency(&self) -> utick {
+        FREQUENCY
+    }
 }
 
 /// Locking primitive

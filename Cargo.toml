@@ -3,6 +3,8 @@ name = "equeue"
 version = "0.1.0"
 edition = "2021"
 
+autobenches = false
+
 [lib]
 bench = false
 
@@ -19,6 +21,8 @@ opt-level = 0
 inherits = "dev"
 opt-level = "z"
 debug-assertions = false
+lto = true
+panic = "abort"
 
 [features]
 default = ["std", "alloc"]
@@ -40,8 +44,10 @@ udeptr-at-least-u128 = []
 udeptr-at-least-u64 = []
 udeptr-at-least-u32 = []
 
+examples = ["std", "rand", "structopt"]
+
 [dependencies]
-either = "1.6.1"
+either = {version="1.6.1", default-features=false}
 cfg-if = "1.0.0"
 
 # optional integrations
@@ -51,17 +57,18 @@ async-io = {version="1.6.0", optional=true}
 async-std = {version="1.10.0", optional=true}
 tokio = {version="1.15.0", optional=true, features=["time", "rt-multi-thread"]}
 
-# tools for testing/benchmarking, these are here since dev-dependencies
-# doesn't support optional dependencies
+# tools for testing/benchmarking, these are here since dev-dependencies don't
+# support optional dependencies
 loom = {version="0.5.4", optional=true}
 criterion = {version="0.3.5", features=["html_reports"], optional=true}
 
+# example dependencies, these are here since dev-dependenices don't support
+# optional dependencies
+rand = {version="0.8.4", optional=true}
+structopt = {version="0.3.25", optional=true}
+
 [build-dependencies]
 cfg-if = "1.0.0"
-
-[dev-dependencies]
-rand = "0.8.4"
-structopt = "0.3.25"
 
 # test targets
 [[test]]
@@ -72,4 +79,10 @@ required-features = ["loom"]
 [[bench]]
 name = "throughput"
 required-features = ["criterion"]
+harness = false
+
+# cargo bloat doesn't support benches, so we need to pretend this is an example
+[[example]]
+name = "code_size"
+path = "benches/code_size.rs"
 harness = false

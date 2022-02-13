@@ -2,8 +2,7 @@
 .PHONY: all build
 all build:
 	cargo build
-	cargo build --tests
-	cargo build --examples
+	cargo build --tests --benches --examples
 
 .PHONY: build-configs
 build-configs:
@@ -39,14 +38,73 @@ test-configs: build-configs
 	cargo test --tests --features async-std
 	cargo test --tests --features tokio
 
-.PHONY: bench
-bench:
-	mkdir -p target/bench
-	cargo bench --features criterion --benches -- --noplot
+.PHONY: size
+size:
+	$(strip cargo bloat \
+		--no-default-features \
+		--profile small \
+		--example code_size \
+		--filter equeue )
+
+.PHONY: bench-code-size
+bench-code-size:
+	mkdir -p target/bench/code-size
+	$(strip \
+		cargo bloat \
+		--no-default-features \
+		--profile small \
+		--example code_size \
+		--filter equeue \
+		--message-format json \
+		-n 0 \
+		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		> target/bench/code-size/lockless.csv)
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_ALLOC_MODE=lockless \
+		EQUEUE_BREAK_MODE=lockless \
+		cargo bloat \
+		--no-default-features \
+		--profile small \
+		--example code_size \
+		--filter equeue \
+		--message-format json \
+		-n 0 \
+		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		> target/bench/code-size/lockless-alloc-break.csv)
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_ALLOC_MODE=lockless \
+		cargo bloat \
+		--no-default-features \
+		--profile small \
+		--example code_size \
+		--filter equeue \
+		--message-format json \
+		-n 0 \
+		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		> target/bench/code-size/lockless-alloc.csv)
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		cargo bloat \
+		--no-default-features \
+		--profile small \
+		--example code_size \
+		--filter equeue \
+		--message-format json \
+		-n 0 \
+		| jq -r '.functions | (.[0] | keys), (.[] | map(values)) | @csv' \
+		> target/bench/code-size/locking.csv)
+
+.PHONY: bench-throughput
+bench-throughput:
+	mkdir -p target/bench/throughput
+	$(strip \
+		cargo bench --features criterion --benches -- --noplot )
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/lockless.csv )
+		> target/bench/throughput/lockless.csv )
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
 		EQUEUE_ALLOC_MODE=lockless \
@@ -55,7 +113,7 @@ bench:
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/lockless-alloc-break.csv )
+		> target/bench/throughput/lockless-alloc-break.csv )
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
 		EQUEUE_ALLOC_MODE=lockless \
@@ -63,22 +121,36 @@ bench:
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/lockless-alloc.csv )
+		> target/bench/throughput/lockless-alloc.csv )
 	$(strip \
 		EQUEUE_QUEUE_MODE=locking \
 		cargo bench --features criterion --benches -- --noplot )
 	$(strip \
 		awk '(NR == 1) || (FNR > 1)' \
 		$$(find -path './target/criterion/*/new/raw.csv') \
-		> target/bench/locking.csv )
+		> target/bench/throughput/locking.csv )
+
+.PHONY: bench
+bench: bench-code-size bench-throughput
+
+.PHONY: graph-code-size
+graph-code-size:
+	$(strip ./scripts/graph-code-size.py target/bench/code-size.svg \
+		locking=target/bench/code-size/locking.csv \
+		lockless-alloc=target/bench/code-size/lockless-alloc.csv \
+		lockless-alloc-break=target/bench/code-size/lockless-alloc-break.csv \
+		lockless=target/bench/code-size/lockless.csv )
+
+.PHONY: graph-throughput
+graph-throughput:
+	$(strip ./scripts/graph-throughput.py target/bench/throughput.svg \
+		locking=target/bench/throughput/locking.csv \
+		lockless-alloc=target/bench/throughput/lockless-alloc.csv \
+		lockless-alloc-break=target/bench/throughput/lockless-alloc-break.csv \
+		lockless=target/bench/throughput/lockless.csv )
 
 .PHONY: graph
-graph:
-	$(strip ./scripts/graph-throughput.py target/bench/throughput.svg \
-		locking=target/bench/locking.csv \
-		lockless-alloc=target/bench/lockless-alloc.csv \
-		lockless-alloc-break=target/bench/lockless-alloc-break.csv \
-		lockless=target/bench/lockless.csv )
+graph: graph-code-size graph-throughput
 
 .PHONY: docs
 docs:

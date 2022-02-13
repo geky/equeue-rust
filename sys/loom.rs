@@ -23,14 +23,6 @@ use crate::traits::*;
 use crate::util::*;
 use crate::Delta;
 
-/// Default frequency for clocks
-const FREQUENCY: utick = {
-    match option_env!("EQUEUE_FREQUENCY") {
-        Some(frequency) => parse_const_utick(frequency),
-        None => 1000,
-    }
-};
-
 
 // Memory allocation, this is optional
 pub(crate) use std::alloc::alloc;
@@ -246,11 +238,6 @@ impl SysClock {
 impl Clock for SysClock {
     fn now(&self) -> utick {
         EQUEUE_TICK.load(Ordering::SeqCst)
-    }
-
-    #[inline]
-    fn frequency(&self) -> utick {
-        FREQUENCY
     }
 }
 

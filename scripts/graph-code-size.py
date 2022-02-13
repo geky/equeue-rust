@@ -57,32 +57,24 @@ SI2 = [
     (1024**8, 'Yi'),
 ]
 
-def throughput_events(x, pos=None):
-    for scale, si in reversed(SI):
+def throughput_bytes(x, pos=None):
+    for scale, si in reversed(SI2):
         if x >= scale or scale == 1:
-            return '%s %se/s' % (
+            return '%s %sB' % (
                 re.sub(r'\.0*$', '', ('%.3f'%(x/scale))[:3]), si)
 
 def main(graph_path, *csv_paths):
-    # get number of cores through env variable
-    cores = int(os.environ.get('EQUEUE_THROUGHPUT_CORES', 4))
-
-    # find throughputs
-    throughputs = []
+    # find code sizes
+    code_sizes = []
     for csv_path in csv_paths:
         name, csv_path = csv_path.split('=', 1)
-        single_throughputs = co.defaultdict(lambda: [])
+        single_code_size = 0
 
         with open(csv_path) as f:
             for line in csv.DictReader(f):
-                if line['group'] == 'throughput' and line['function'] == 'throughput':
-                    assert line['unit'] == 'ns'
-                    throughput = (float(line['throughput_num'])
-                        / (float(line['sample_measured_value']) / 1000000000))
-                    single_throughputs[int(line['value'])].append(throughput)
+                single_code_size += int(line['size'])
 
-        single_throughputs = {k: sum(v for v in vs) / len(vs) for k, vs in single_throughputs.items()}
-        throughputs.append((name, [(n, throughput) for n, throughput in sorted(single_throughputs.items())]))
+        code_sizes.append((name, single_code_size))
 
     # construct the graph
     matplotlib.rc('font', family='sans-serif', size=11)
@@ -91,30 +83,30 @@ def main(graph_path, *csv_paths):
     matplotlib.rc('ytick', labelsize='small')
 
     gs = gridspec.GridSpec(nrows=1, ncols=1, wspace=0.25, hspace=0.35)
-    fig = plt.figure(figsize=(7, 3.5))
+    fig = plt.figure(figsize=(1.5, 3.5))
 
     ax = fig.add_subplot(gs[0, 0])
-    ax.text(0.5, 1.025, 'Throughput', ha='center', transform=ax.transAxes)
+    ax.text(0.5, 1.025, 'Code size', ha='center', transform=ax.transAxes)
 
     # plot each set of bars
-    width = 1/(len(throughputs)+1)
-    for i, (name, single_throughputs) in enumerate(throughputs):
-        x = np.arange(len(single_throughputs))
+    width = 1/(len(code_sizes)+1)
+    for i, (name, single_code_size) in enumerate(code_sizes):
+        x = np.arange(1)
         ax.bar(
-            x - ((len(throughputs)-1)/2)*width + i*width,
-            [throughput for _, throughput in single_throughputs],
+            x - ((len(code_sizes)-1)/2)*width + i*width,
+            single_code_size,
             width=width,
             label=name,
             color=COLORS[i])
 
     # labels
-    ax.set_xlim(0 - (len(throughputs)/2+1)*width, len(throughputs[0][1])-1 + (len(throughputs)/2+1)*width)
-    ax.set_xticks(np.arange(len(throughputs[0][1])))
-    ax.set_xticklabels(['%s/%s' % (n, cores) for n, _ in throughputs[0][1]])
-    ax.set_xlabel('threads/cores')
+    ax.set_xlim(0 - (len(code_sizes)/2+1)*width, 0 + (len(code_sizes)/2+1)*width)
+    ax.set_xticks([0])
+    ax.set_xticklabels([''])
+    ax.set_xlabel('code')
     ax.set_ylim(0, None)
-    ax.yaxis.set_major_formatter(FuncFormatter(throughput_events))
-    ax.set_ylabel('events/second')
+    ax.yaxis.set_major_formatter(FuncFormatter(throughput_bytes))
+    ax.set_ylabel('bytes')
 
     # legend
     ax.legend(loc='upper left', bbox_to_anchor=(1, 1))

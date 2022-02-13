@@ -32,14 +32,6 @@ use crate::util::*;
 use crate::Error;
 use crate::Delta;
 
-/// Default frequency for clocks
-const FREQUENCY: utick = {
-    match option_env!("EQUEUE_FREQUENCY") {
-        Some(frequency) => parse_const_utick(frequency),
-        None => 1000,
-    }
-};
-
 
 // Memory allocation, this is optional
 #[cfg(feature="alloc")] pub(crate) use core_alloc::alloc::alloc;
@@ -478,11 +470,6 @@ cfg_if! {
                     .as_nanos()
                     / (1_000_000_000 / u128::from(self.frequency())))
                     as utick
-            }
-
-            #[inline]
-            fn frequency(&self) -> utick {
-                FREQUENCY
             }
         }
 
