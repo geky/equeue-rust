@@ -41,7 +41,44 @@ test-configs: build-configs
 
 .PHONY: bench
 bench:
+	mkdir -p target/bench
 	cargo bench --features criterion --benches -- --noplot
+	$(strip \
+		awk '(NR == 1) || (FNR > 1)' \
+		$$(find -path './target/criterion/*/new/raw.csv') \
+		> target/bench/lockless.csv )
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_ALLOC_MODE=lockless \
+		EQUEUE_BREAK_MODE=lockless \
+		cargo bench --features criterion --benches -- --noplot )
+	$(strip \
+		awk '(NR == 1) || (FNR > 1)' \
+		$$(find -path './target/criterion/*/new/raw.csv') \
+		> target/bench/lockless-alloc-break.csv )
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		EQUEUE_ALLOC_MODE=lockless \
+		cargo bench --features criterion --benches -- --noplot )
+	$(strip \
+		awk '(NR == 1) || (FNR > 1)' \
+		$$(find -path './target/criterion/*/new/raw.csv') \
+		> target/bench/lockless-alloc.csv )
+	$(strip \
+		EQUEUE_QUEUE_MODE=locking \
+		cargo bench --features criterion --benches -- --noplot )
+	$(strip \
+		awk '(NR == 1) || (FNR > 1)' \
+		$$(find -path './target/criterion/*/new/raw.csv') \
+		> target/bench/locking.csv )
+
+.PHONY: graph
+graph:
+	$(strip ./scripts/graph-throughput.py target/bench/throughput.svg \
+		locking=target/bench/locking.csv \
+		lockless-alloc=target/bench/lockless-alloc.csv \
+		lockless-alloc-break=target/bench/lockless-alloc-break.csv \
+		lockless=target/bench/lockless.csv )
 
 .PHONY: docs
 docs:

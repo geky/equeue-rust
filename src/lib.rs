@@ -1053,7 +1053,11 @@ impl HelpOp {
             }
             HelpState::UnqueueSiblingNextNextBack(_) => {
                 help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
-                    .set_eptr(self.eptr.as_ref(q).unwrap().sibling.load().as_ref(q).unwrap().next.as_eptr(q))
+                    .set_eptr(
+                        self.eptr.as_ref(q).unwrap().sibling.load().as_ref(q)
+                            .map(|sibling| sibling.next.as_eptr(q))
+                            .unwrap_or(Eptr::null())
+                    )
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingBackSibling(_) => {

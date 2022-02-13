@@ -15,6 +15,11 @@ debug-assertions = true
 inherits = "dev"
 opt-level = 0
 
+[profile.small]
+inherits = "dev"
+opt-level = "z"
+debug-assertions = false
+
 [features]
 default = ["std", "alloc"]
 std = ["alloc"]
