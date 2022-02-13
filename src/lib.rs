@@ -403,48 +403,48 @@ impl<T: Copy, S: AtomicStorage> Atomic<T, S> {
 
 /// Slab-internal pointer, with internalized generation count
 #[repr(transparent)]
-struct Eptr<T>(ueptr, PhantomData<*const T>);
+struct EPtr<T>(ueptr, PhantomData<*const T>);
 
-impl<T> Debug for Eptr<T> {
+impl<T> Debug for EPtr<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
-        f.debug_tuple("Eptr")
+        f.debug_tuple("EPtr")
             .field(&format_args!("{:#x}", self.0))
             .finish()
     }
 }
 
-impl<T> Clone for Eptr<T> {
-    fn clone(&self) -> Eptr<T> {
-        Eptr(self.0, self.1)
+impl<T> Clone for EPtr<T> {
+    fn clone(&self) -> EPtr<T> {
+        EPtr(self.0, self.1)
     }
 }
 
-impl<T> Copy for Eptr<T> {}
+impl<T> Copy for EPtr<T> {}
 
-impl<T> PartialEq for Eptr<T> {
-    fn eq(&self, other: &Eptr<T>) -> bool {
+impl<T> PartialEq for EPtr<T> {
+    fn eq(&self, other: &EPtr<T>) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T> Eq for Eptr<T> {}
+impl<T> Eq for EPtr<T> {}
 
-unsafe impl<T> Send for Eptr<T> {}
-unsafe impl<T> Sync for Eptr<T> {}
+unsafe impl<T> Send for EPtr<T> {}
+unsafe impl<T> Sync for EPtr<T> {}
 
-impl<T> Eptr<T> {
-    const fn null() -> Eptr<T> {
-        Eptr(0, PhantomData)
+impl<T> EPtr<T> {
+    const fn null() -> EPtr<T> {
+        EPtr(0, PhantomData)
     }
 
-    fn from_ref<C>(q: &Equeue<C>, e: &T) -> Eptr<T> {
+    fn from_ref<C>(q: &Equeue<C>, e: &T) -> EPtr<T> {
         if e as *const _ == &q.queue as *const _ as *const _ {
-            Eptr(1, PhantomData)
+            EPtr(1, PhantomData)
         } else if e as *const _ == &q.dequeue as *const _ as *const _ {
-            Eptr(2, PhantomData)
+            EPtr(2, PhantomData)
         } else {
-            Eptr(
+            EPtr(
                 unsafe {
                     ((e as *const _ as *const u8)
                         .offset_from(q.slab.as_ptr())
@@ -477,16 +477,16 @@ impl<T> Eptr<T> {
 /// A marked eptr, used to double-check non-locking parts
 /// of the data structures
 #[repr(C)] // we need a specific order to transmute between marked types
-struct MarkedEptr<T> {
+struct MarkedEPtr<T> {
     gen: ugen,
     mark: ugen,
-    eptr: Eptr<T>,
+    eptr: EPtr<T>,
 }
 
-impl<T> Debug for MarkedEptr<T> {
+impl<T> Debug for MarkedEPtr<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // these really need to be in hex to be readable
-        f.debug_tuple("MarkedEptr")
+        f.debug_tuple("MarkedEPtr")
             .field(&self.gen)
             .field(&self.mark)
             .field(&format_args!("{:#x}", self.eptr.0))
@@ -494,9 +494,9 @@ impl<T> Debug for MarkedEptr<T> {
     }
 }
 
-impl<T> Clone for MarkedEptr<T> {
+impl<T> Clone for MarkedEPtr<T> {
     fn clone(&self) -> Self {
-        MarkedEptr {
+        MarkedEPtr {
             gen: self.gen,
             mark: self.mark,
             eptr: self.eptr,
@@ -504,24 +504,24 @@ impl<T> Clone for MarkedEptr<T> {
     }
 }
 
-impl<T> Copy for MarkedEptr<T> {}
+impl<T> Copy for MarkedEPtr<T> {}
 
-impl<T> PartialEq for MarkedEptr<T> {
-    fn eq(&self, other: &MarkedEptr<T>) -> bool {
+impl<T> PartialEq for MarkedEPtr<T> {
+    fn eq(&self, other: &MarkedEPtr<T>) -> bool {
         self.gen == other.gen
             && self.mark == other.mark
             && self.eptr == other.eptr
     }
 }
 
-impl<T> Eq for MarkedEptr<T> {}
+impl<T> Eq for MarkedEPtr<T> {}
 
-impl<T> MarkedEptr<T> {
-    const fn null() -> MarkedEptr<T> {
-        MarkedEptr {
+impl<T> MarkedEPtr<T> {
+    const fn null() -> MarkedEPtr<T> {
+        MarkedEPtr {
             gen: 0,
             mark: 0,
-            eptr: Eptr::null(),
+            eptr: EPtr::null(),
         }
     }
 
@@ -534,55 +534,55 @@ impl<T> MarkedEptr<T> {
     }
 
     fn inc(self) -> Self {
-        MarkedEptr {
+        MarkedEPtr {
             gen: self.gen.wrapping_add(1),
             mark: self.mark,
             eptr: self.eptr,
         }
     }
 
-    fn set_eptr(self, other: Eptr<T>) -> MarkedEptr<T> {
-        MarkedEptr {
+    fn set_eptr(self, other: EPtr<T>) -> MarkedEPtr<T> {
+        MarkedEPtr {
             gen: self.gen,
             mark: self.mark,
             eptr: other,
         }
     }
 
-    fn cp_eptr(self, other: MarkedEptr<T>) -> MarkedEptr<T> {
-        MarkedEptr {
+    fn cp_eptr(self, other: MarkedEPtr<T>) -> MarkedEPtr<T> {
+        MarkedEPtr {
             gen: self.gen,
             mark: self.mark,
             eptr: other.eptr,
         }
     }
 
-    fn set_mark(self, mark: ugen) -> MarkedEptr<T> {
-        MarkedEptr {
+    fn set_mark(self, mark: ugen) -> MarkedEPtr<T> {
+        MarkedEPtr {
             gen: self.gen,
             mark: mark,
             eptr: self.eptr,
         }
     }
 
-    fn as_marked<U>(self) -> MarkedEptr<U> {
+    fn as_marked<U>(self) -> MarkedEPtr<U> {
         unsafe { transmute_copy(&self) }
     }
 
-    fn as_info(self) -> Info {
+    fn as_info(self) -> EInfo {
         unsafe { transmute_copy(&self) }
     }
 }
 
 // interactions with atomics
-impl<T, S: AtomicStorage> Atomic<MarkedEptr<T>, S> {
-    fn store_marked(&self, old: MarkedEptr<T>, new: Eptr<T>) -> MarkedEptr<T> {
+impl<T, S: AtomicStorage> Atomic<MarkedEPtr<T>, S> {
+    fn store_marked(&self, old: MarkedEPtr<T>, new: EPtr<T>) -> MarkedEPtr<T> {
         let new = old.set_eptr(new);
         self.store(new);
         new
     }
 
-    fn store_marked_inc(&self, old: MarkedEptr<T>, new: Eptr<T>) -> MarkedEptr<T> {
+    fn store_marked_inc(&self, old: MarkedEPtr<T>, new: EPtr<T>) -> MarkedEPtr<T> {
         let new = old.set_eptr(new).inc();
         self.store(new);
         new
@@ -592,7 +592,7 @@ impl<T, S: AtomicStorage> Atomic<MarkedEptr<T>, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked(&self, old: MarkedEptr<T>, new: Eptr<T>) -> Result<MarkedEptr<T>, MarkedEptr<T>> {
+    fn cas_marked(&self, old: MarkedEPtr<T>, new: EPtr<T>) -> Result<MarkedEPtr<T>, MarkedEPtr<T>> {
         let new = old.set_eptr(new);
         self.cas(old, new)
     }
@@ -601,13 +601,13 @@ impl<T, S: AtomicStorage> Atomic<MarkedEptr<T>, S> {
         equeue_queue_mode="lockless",
         equeue_alloc_mode="lockless",
     ))]
-    fn cas_marked_inc(&self, old: MarkedEptr<T>, new: Eptr<T>) -> Result<MarkedEptr<T>, MarkedEptr<T>> {
+    fn cas_marked_inc(&self, old: MarkedEPtr<T>, new: EPtr<T>) -> Result<MarkedEPtr<T>, MarkedEPtr<T>> {
         let new = old.set_eptr(new).inc();
         self.cas(old, new)
     }
 
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Atomic<MarkedEptr<T>, S>> {
-        Eptr::from_ref(q, self)
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> EPtr<Atomic<MarkedEPtr<T>, S>> {
+        EPtr::from_ref(q, self)
     }
 
     fn as_atom<'a>(&'a self) -> &'a Atomic<Marked, S> {
@@ -616,22 +616,22 @@ impl<T, S: AtomicStorage> Atomic<MarkedEptr<T>, S> {
 }
 
 // this is just an alias for a generic marked thing
-type Marked = MarkedEptr<()>;
+type Marked = MarkedEPtr<()>;
 
 
 /// Several event fields are crammed in here to avoid wasting space
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(C)] // we need a specific order to transmute between marked types
-struct Info {
+struct EInfo {
     gen: ugen,
     id: ugen,
     state: u8,
     npw2: u8,
 }
 
-impl Debug for Info {
+impl Debug for EInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Info")
+        f.debug_struct("EInfo")
             .field("gen", &self.gen)
             .field("id", &self.id)
             .field("state", &self.state())
@@ -643,7 +643,7 @@ impl Debug for Info {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum State {
+enum EState {
     Alloced  = 0,
     InQueue  = 1,
     InFlight = 2,
@@ -651,32 +651,32 @@ enum State {
     Canceled = 4,
 }
 
-impl State {
-    fn from_u8(state: u8) -> State {
+impl EState {
+    fn from_u8(state: u8) -> EState {
         match state {
-            0 => State::Alloced,
-            1 => State::InQueue,
-            2 => State::InFlight,
-            3 => State::Nested,
-            4 => State::Canceled,
+            0 => EState::Alloced,
+            1 => EState::InQueue,
+            2 => EState::InFlight,
+            3 => EState::Nested,
+            4 => EState::Canceled,
             _ => unreachable!(),
         }
     }
 
     fn as_u8(&self) -> u8 {
         match self {
-            State::Alloced  => 0,
-            State::InQueue  => 1,
-            State::InFlight => 2,
-            State::Nested   => 3,
-            State::Canceled => 4,
+            EState::Alloced  => 0,
+            EState::InQueue  => 1,
+            EState::InFlight => 2,
+            EState::Nested   => 3,
+            EState::Canceled => 4,
         }
     }
 }
 
-impl Info {
-    fn new(id: ugen, state: State, static_: bool, once: bool, npw2: u8) -> Info {
-        Info {
+impl EInfo {
+    fn new(id: ugen, state: EState, static_: bool, once: bool, npw2: u8) -> EInfo {
+        EInfo {
             gen: 0,
             id: id,
             state: (
@@ -696,12 +696,12 @@ impl Info {
         self.state & 0x40 != 0
     }
 
-    fn state(&self) -> State {
-        State::from_u8(self.state & 0x0f)
+    fn state(&self) -> EState {
+        EState::from_u8(self.state & 0x0f)
     }
 
-    fn inc_id(self) -> Info {
-        Info {
+    fn inc_id(self) -> EInfo {
+        EInfo {
             gen: self.gen,
             id: self.id.wrapping_add(1),
             state: self.state,
@@ -709,8 +709,8 @@ impl Info {
         }
     }
 
-    fn set_static(self, static_: bool) -> Info {
-        Info {
+    fn set_static(self, static_: bool) -> EInfo {
+        EInfo {
             gen: self.gen,
             id: self.id,
             state: if static_ {
@@ -722,8 +722,8 @@ impl Info {
         }
     }
 
-    fn set_once(self, static_: bool) -> Info {
-        Info {
+    fn set_once(self, static_: bool) -> EInfo {
+        EInfo {
             gen: self.gen,
             id: self.id,
             state: if static_ {
@@ -735,8 +735,8 @@ impl Info {
         }
     }
 
-    fn set_state(self, state: State) -> Info {
-        Info {
+    fn set_state(self, state: EState) -> EInfo {
+        EInfo {
             gen: self.gen,
             id: self.id,
             state: (self.state & !0x0f) | state.as_u8(),
@@ -744,13 +744,13 @@ impl Info {
         }
     }
 
-    fn as_marked<U>(self) -> MarkedEptr<U> {
+    fn as_marked<U>(self) -> MarkedEPtr<U> {
         unsafe { transmute_copy(&self) }
     }
 }
 
 // interactions with atomics
-impl<S: AtomicStorage> Atomic<Info, S> {
+impl<S: AtomicStorage> Atomic<EInfo, S> {
     fn as_atom<'a>(&'a self) -> &'a Atomic<Marked, S> {
         unsafe { &*(self as *const _ as *const Atomic<Marked, S>) }
     }
@@ -759,12 +759,12 @@ impl<S: AtomicStorage> Atomic<Info, S> {
 
 /// Internal event header
 #[derive(Debug)]
-struct Ebuf {
-    next: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
-    next_back: Atomic<MarkedEptr<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>, AtomicUdeptr>,
-    sibling: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
-    sibling_back: Atomic<MarkedEptr<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>, AtomicUdeptr>,
-    info: Atomic<Info, AtomicUdeptr>,
+struct EBuf {
+    next: Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>,
+    next_back: Atomic<MarkedEPtr<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>, AtomicUdeptr>,
+    sibling: Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>,
+    sibling_back: Atomic<MarkedEPtr<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>, AtomicUdeptr>,
+    info: Atomic<EInfo, AtomicUdeptr>,
 
     cb: Option<fn(*mut u8)>,
     drop: Option<fn(*mut u8)>,
@@ -774,10 +774,10 @@ struct Ebuf {
     q: *const Equeue<()>,
 }
 
-impl Ebuf {
+impl EBuf {
     const ALIGN: usize = {
         let align = max_const_usize(
-            align_of::<Ebuf>(),
+            align_of::<EBuf>(),
             size_of::<udeptr>(),
         );
         assert!(align >= align_of::<*const ()>());
@@ -785,8 +785,8 @@ impl Ebuf {
         align
     };
 
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Ebuf> {
-        Eptr::from_ref(q, self)
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> EPtr<EBuf> {
+        EPtr::from_ref(q, self)
     }
 
     // info access
@@ -795,16 +795,16 @@ impl Ebuf {
     }
 
     fn size(&self) -> usize {
-        Ebuf::ALIGN << self.npw2()
+        EBuf::ALIGN << self.npw2()
     }
 
     // access to the trailing buffer
     fn data_ptr<T>(&self) -> *const T {
-        unsafe { (self as *const Ebuf).add(1) as *const T }
+        unsafe { (self as *const EBuf).add(1) as *const T }
     }
 
     fn data_mut_ptr<T>(&mut self) -> *mut T {
-        unsafe { (self as *mut Ebuf).add(1) as *mut T }
+        unsafe { (self as *mut EBuf).add(1) as *mut T }
     }
 
     unsafe fn data_ref<'a, T>(&'a self) -> &'a T {
@@ -815,50 +815,50 @@ impl Ebuf {
         &mut *self.data_mut_ptr()
     }
 
-    unsafe fn from_data_mut_ptr<'a, T: ?Sized + 'a>(ptr: *mut T) -> Option<&'a mut Ebuf> {
+    unsafe fn from_data_mut_ptr<'a, T: ?Sized + 'a>(ptr: *mut T) -> Option<&'a mut EBuf> {
         ptr.as_mut()
-            .map(|ref_| Ebuf::from_data_mut(ref_))
+            .map(|ref_| EBuf::from_data_mut(ref_))
     }
 
-    unsafe fn from_data_mut<'a, T: ?Sized>(ref_: &'a mut T) -> &'a mut Ebuf {
-        &mut *(ref_ as *mut _ as *mut Ebuf).sub(1)
+    unsafe fn from_data_mut<'a, T: ?Sized>(ref_: &'a mut T) -> &'a mut EBuf {
+        &mut *(ref_ as *mut _ as *mut EBuf).sub(1)
     }
 
-    // we can "claim" an Ebuf once we remove it from shared structures,
+    // we can "claim" an EBuf once we remove it from shared structures,
     // the claim is unsafe, but afterwards we can leverage Rust's type
-    // system to know whether or not we have exclusive access to the Ebuf
-    unsafe fn claim<'a>(&'a self) -> &'a mut Ebuf {
-        &mut *(self as *const Ebuf as *mut Ebuf)
+    // system to know whether or not we have exclusive access to the EBuf
+    unsafe fn claim<'a>(&'a self) -> &'a mut EBuf {
+        &mut *(self as *const EBuf as *mut EBuf)
     }
 }
 
-// some convenience extensions to Option<&Ebuf>
-trait AsEptr {
+// some convenience extensions to Option<&EBuf>
+trait AsEPtr {
     type Target;
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target>;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> EPtr<Self::Target>;
 }
 
-impl AsEptr for Option<&Ebuf> {
-    type Target = Ebuf;
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target> {
+impl AsEPtr for Option<&EBuf> {
+    type Target = EBuf;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> EPtr<Self::Target> {
         match self {
             Some(e) => e.as_eptr(q),
-            None => Eptr::null(),
+            None => EPtr::null(),
         }
     }
 }
 
-impl<T> AsEptr for Option<&Atomic<MarkedEptr<T>, AtomicUdeptr>> {
-    type Target = Atomic<MarkedEptr<T>, AtomicUdeptr>;
-    fn as_eptr<C>(&self, q: &Equeue<C>) -> Eptr<Self::Target> {
+impl<T> AsEPtr for Option<&Atomic<MarkedEPtr<T>, AtomicUdeptr>> {
+    type Target = Atomic<MarkedEPtr<T>, AtomicUdeptr>;
+    fn as_eptr<C>(&self, q: &Equeue<C>) -> EPtr<Self::Target> {
         match self {
             Some(e) => e.as_eptr(q),
-            None => Eptr::null(),
+            None => EPtr::null(),
         }
     }
 }
 
-/// State machine for mutually synchronized operations
+/// EState machine for mutually synchronized operations
 #[cfg(equeue_queue_mode="lockless")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u8)]
@@ -951,7 +951,7 @@ impl HelpState {
 struct HelpOp {
     gen: ugen,
     state: u8,
-    eptr: Eptr<Ebuf>,
+    eptr: EPtr<EBuf>,
 }
 
 #[cfg(equeue_queue_mode="lockless")]
@@ -972,7 +972,7 @@ impl HelpOp {
         HelpOp {
             gen: 0,
             state: 0,
-            eptr: Eptr::null(),
+            eptr: EPtr::null(),
         }
     }
 
@@ -984,8 +984,8 @@ impl HelpOp {
         HelpState::from_u8(self.state & 0x1f)
     }
 
-    fn estate(&self) -> State {
-        State::from_u8(self.state >> 5)
+    fn estate(&self) -> EState {
+        EState::from_u8(self.state >> 5)
     }
 
     fn set_state(self, state: HelpState) -> HelpOp {
@@ -996,7 +996,7 @@ impl HelpOp {
         }
     }
 
-    fn set_estate(self, estate: State) -> HelpOp {
+    fn set_estate(self, estate: EState) -> HelpOp {
         HelpOp {
             gen: self.gen,
             state: (self.state & !0xe0) | (estate.as_u8() << 5),
@@ -1004,7 +1004,7 @@ impl HelpOp {
         }
     }
 
-    fn set_eptr(self, eptr: Eptr<Ebuf>) -> HelpOp {
+    fn set_eptr(self, eptr: EPtr<EBuf>) -> HelpOp {
         HelpOp {
             gen: self.gen,
             state: self.state,
@@ -1124,72 +1124,72 @@ impl HelpOp {
         match self.state() {
             HelpState::Done => unreachable!(),
             HelpState::EnqueueSliceNextBackNext => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .set_eptr(self.eptr)
                     .as_marked().inc()
             }
             HelpState::EnqueueSliceNextNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .set_eptr(self.eptr.as_ref(q).unwrap().next.as_eptr(q))
                     .as_marked().inc()
             }
             HelpState::EnqueueSiblingSiblingSiblingBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .set_eptr(self.eptr.as_ref(q).unwrap().sibling.as_eptr(q))
                     .as_marked().inc()
             }
             HelpState::EnqueueSiblingSiblingBackSibling => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .set_eptr(self.eptr)
                     .as_marked().inc()
             }
             HelpState::UnqueueSliceNextBackNext => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSliceNextNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingNext => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next_back.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingNextBackNext => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingNextNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .set_eptr(
                         self.eptr.as_ref(q).unwrap().sibling.load().as_ref(q)
                             .map(|sibling| sibling.next.as_eptr(q))
-                            .unwrap_or(Eptr::null())
+                            .unwrap_or(EPtr::null())
                     )
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingBackSibling => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueSiblingSiblingBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .cp_eptr(self.eptr.as_ref(q).unwrap().sibling_back.load())
                     .as_marked().inc()
             }
             HelpState::UnqueueNext => {
-                help_old.as_marked::<Ebuf>()
-                    .set_eptr(Eptr::null())
+                help_old.as_marked::<EBuf>()
+                    .set_eptr(EPtr::null())
                     .as_marked().inc()
             }
             // The only reason we need a redundant mark here for queue and dequeue
@@ -1202,30 +1202,30 @@ impl HelpOp {
             // doesn't work with this FSM scheme.
             //
             HelpState::DequeueDequeue => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(q.queue.load())
                     .as_marked().inc()
             }
             HelpState::DequeueQueue => {
-                help_old.as_marked::<Ebuf>()
+                help_old.as_marked::<EBuf>()
                     .set_mark(help_old.mark.wrapping_add(1))
                     .cp_eptr(self.eptr.as_ref(q).unwrap().next.load())
                     .as_marked().inc()
             }
             HelpState::DequeueNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .set_eptr(q.dequeue.as_eptr(q))
                     .as_marked().inc()
             }
             HelpState::DequeueBackNextNextBack => {
-                help_old.as_marked::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                help_old.as_marked::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
                     .set_eptr(q.queue.as_eptr(q))
                     .as_marked().inc()
             }
             HelpState::DequeueBackNext => {
-                help_old.as_marked::<Ebuf>()
-                    .set_eptr(Eptr::null())
+                help_old.as_marked::<EBuf>()
+                    .set_eptr(EPtr::null())
                     .as_marked().inc()
             }
             HelpState::UpdateState => {
@@ -1292,13 +1292,13 @@ pub struct Equeue<
     #[cfg(feature="alloc")] alloced: bool,
 
     // queue management
-    queue: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
-    dequeue: Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
+    queue: Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>,
+    dequeue: Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>,
     break_: Atomic<u8, AtomicUeptr>,
     precision: u8,
 
     #[cfg(equeue_queue_mode="lockless")] help_op: Atomic<HelpOp, AtomicUdeptr>,
-    #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic<MarkedEptr<Atomic<Marked, AtomicUdeptr>>, AtomicUdeptr>,
+    #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic<MarkedEPtr<Atomic<Marked, AtomicUdeptr>>, AtomicUdeptr>,
 
     // other things
     clock: C,
@@ -1373,8 +1373,8 @@ impl<C> Equeue<C> {
         let (buffer, alloced) = match config.buffer {
             #[cfg(feature="alloc")]
             Some(Left(size)) => {
-                let size = aligndown(size, Ebuf::ALIGN);
-                let layout = Layout::from_size_align(size, Ebuf::ALIGN).unwrap();
+                let size = aligndown(size, EBuf::ALIGN);
+                let layout = Layout::from_size_align(size, EBuf::ALIGN).unwrap();
                 let buffer = unsafe { alloc(layout) };
                 assert!(!buffer.is_null());
 
@@ -1391,8 +1391,8 @@ impl<C> Equeue<C> {
 
         // align buffer
         let range = buffer.as_ptr_range();
-        let start = alignup(range.start as usize, Ebuf::ALIGN) - range.start as usize;
-        let end = aligndown(range.end as usize, Ebuf::ALIGN) - range.start as usize;
+        let start = alignup(range.start as usize, EBuf::ALIGN) - range.start as usize;
+        let end = aligndown(range.end as usize, EBuf::ALIGN) - range.start as usize;
         let buffer = buffer.get_mut(start..end).unwrap();
 
         // go ahead and zero our buffer, this makes it easier to manage bucket
@@ -1407,13 +1407,13 @@ impl<C> Equeue<C> {
             slab_front: Atomic::new(3),
             slab_back: Atomic::new(ueptr::try_from(buffer.len() / size_of::<udeptr>()).unwrap()),
 
-            queue: Atomic::new(MarkedEptr::null()),
-            dequeue: Atomic::new(MarkedEptr::null()),
+            queue: Atomic::new(MarkedEPtr::null()),
+            dequeue: Atomic::new(MarkedEPtr::null()),
             break_: Atomic::new(0),
             precision: config.precision,
 
             #[cfg(equeue_queue_mode="lockless")] help_op: Atomic::new(HelpOp::done()),
-            #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic::new(MarkedEptr::null()),
+            #[cfg(equeue_queue_mode="lockless")] help_ctx: Atomic::new(MarkedEPtr::null()),
 
             clock: config.clock
                 .map_left(|f| f())
@@ -1451,7 +1451,7 @@ impl<C> Drop for Equeue<C> {
         // it's up to dealloc_ to make sure drop is cleared after called
         let mut i = self.slab_back.load() as usize * size_of::<udeptr>();
         while let Some(e) = self.slab.get(i) {
-            let e = unsafe { &*(e as *const _ as *const Ebuf) };
+            let e = unsafe { &*(e as *const _ as *const EBuf) };
             let e = unsafe { e.claim() };
 
             if let Some(drop) = e.drop {
@@ -1462,47 +1462,47 @@ impl<C> Drop for Equeue<C> {
             // just some extra precautions against poorly written wakers
             e.info.store(e.info.load().inc_id());
 
-            i = i.saturating_add(size_of::<Ebuf>() + e.size());
+            i = i.saturating_add(size_of::<EBuf>() + e.size());
         }
 
         // free allocated buffer?
         #[cfg(feature="alloc")]
         if self.alloced {
-            let layout = Layout::from_size_align(self.slab.len(), Ebuf::ALIGN).unwrap();
+            let layout = Layout::from_size_align(self.slab.len(), EBuf::ALIGN).unwrap();
             unsafe { dealloc(self.slab.as_ptr() as *mut u8, layout) };
         }
     }
 }
 
 impl<C> Equeue<C> {
-    fn contains(&self, e: &Ebuf) -> bool {
+    fn contains(&self, e: &EBuf) -> bool {
         self.slab.as_ptr_range()
             .contains(&(e.deref() as *const _ as *const u8))
     }
 
-    fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>] {
+    fn buckets<'a>(&'a self) -> &'a [Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>] {
         let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
         unsafe {
             slice::from_raw_parts(
-                self.slab.as_ptr() as *const Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>,
-                slab_front / size_of::<Atomic<MarkedEptr<Ebuf>, AtomicUdeptr>>()
+                self.slab.as_ptr() as *const Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>,
+                slab_front / size_of::<Atomic<MarkedEPtr<EBuf>, AtomicUdeptr>>()
             )
         }
     }
 
     // Memory management
     #[must_use]
-    fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut Ebuf, Error> {
-        // this looks arbitrary, but Ebuf should have a pretty reasonable
+    fn alloc_<'a>(&'a self, layout: Layout) -> Result<&'a mut EBuf, Error> {
+        // this looks arbitrary, but EBuf should have a pretty reasonable
         // alignment since it contains both function pointers and AtomicUdeptrs
-        assert!(layout.align() <= Ebuf::ALIGN,
+        assert!(layout.align() <= EBuf::ALIGN,
             "unable to alloc alignment {} > {}",
-            layout.align(), Ebuf::ALIGN
+            layout.align(), EBuf::ALIGN
         );
 
         // find best bucket
         let npw2 = npw2(
-            alignup(layout.size(), Ebuf::ALIGN)
+            alignup(layout.size(), EBuf::ALIGN)
                 / size_of::<udeptr>()
         );
 
@@ -1556,11 +1556,11 @@ impl<C> Equeue<C> {
                 let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
                 let slab_back = self.slab_back.load() as usize * size_of::<udeptr>();
                 let new_slab_front = max(
-                    (npw2 as usize + 1)*size_of::<MarkedEptr<Ebuf>>(),
+                    (npw2 as usize + 1)*size_of::<MarkedEPtr<EBuf>>(),
                     slab_front
                 );
                 let new_slab_back = slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
+                    size_of::<EBuf>() + (EBuf::ALIGN << npw2)
                 );
 
                 if new_slab_front > new_slab_back {
@@ -1598,11 +1598,11 @@ impl<C> Equeue<C> {
                 let slab_front = self.slab_front.load() as usize * size_of::<udeptr>();
                 let slab_back = self.slab_back.load() as usize * size_of::<udeptr>();
                 let new_slab_front = max(
-                    (npw2 as usize + 1)*size_of::<MarkedEptr<Ebuf>>(),
+                    (npw2 as usize + 1)*size_of::<MarkedEPtr<EBuf>>(),
                     slab_front
                 );
                 let new_slab_back = slab_back.saturating_sub(
-                    size_of::<Ebuf>() + (Ebuf::ALIGN << npw2)
+                    size_of::<EBuf>() + (EBuf::ALIGN << npw2)
                 );
 
                 if new_slab_front > new_slab_back {
@@ -1626,13 +1626,13 @@ impl<C> Equeue<C> {
 
             unsafe {
                 let e = &self.slab[new_slab_back]
-                    as *const u8 as *const Ebuf as *mut Ebuf;
-                e.write(Ebuf {
-                    next: Atomic::new(MarkedEptr::null()),
-                    next_back: Atomic::new(MarkedEptr::null()),
-                    sibling: Atomic::new(MarkedEptr::null()),
-                    sibling_back: Atomic::new(MarkedEptr::null()),
-                    info: Atomic::new(Info::new(0, State::InFlight, false, false, npw2)),
+                    as *const u8 as *const EBuf as *mut EBuf;
+                e.write(EBuf {
+                    next: Atomic::new(MarkedEPtr::null()),
+                    next_back: Atomic::new(MarkedEPtr::null()),
+                    sibling: Atomic::new(MarkedEPtr::null()),
+                    sibling_back: Atomic::new(MarkedEPtr::null()),
+                    info: Atomic::new(EInfo::new(0, EState::InFlight, false, false, npw2)),
 
                     cb: None,
                     drop: None,
@@ -1646,7 +1646,7 @@ impl<C> Equeue<C> {
         }
     }
 
-    fn dealloc_(&self, e: &mut Ebuf) {
+    fn dealloc_(&self, e: &mut EBuf) {
         debug_assert!(self.contains(e));
 
         // make sure to run destructors if assigned, and clear destructors
@@ -1658,8 +1658,8 @@ impl<C> Equeue<C> {
 
         // give our event a new id
         self.update_state_inc_(e, |info| {
-            debug_assert_ne!(info.state(), State::InQueue);
-            Some(State::InFlight)
+            debug_assert_ne!(info.state(), EState::InQueue);
+            Some(EState::InFlight)
         });
 
         // we can load buckets here because it can never shrink
@@ -1723,7 +1723,7 @@ impl<C> Equeue<C> {
                 // load the old value
                 help_old = match help_atom {
                     Some(atom) => atom.load(),
-                    None => MarkedEptr::null(),
+                    None => MarkedEPtr::null(),
                 };
 
                 // try to commit the context
@@ -1743,7 +1743,7 @@ impl<C> Equeue<C> {
                 // we always load the old value from the source
                 help_old = match help_atom {
                     Some(atom) => atom.load(),
-                    None => MarkedEptr::null(),
+                    None => MarkedEPtr::null(),
                 };
             }
 
@@ -1776,8 +1776,8 @@ impl<C> Equeue<C> {
         &self,
         help_op: HelpOp,
         state: HelpState,
-        e: &'a Ebuf,
-        estate: State
+        e: &'a EBuf,
+        estate: EState
     ) -> Result<HelpOp, HelpOp> {
         // help_ should always put help_op into a none state
         debug_assert!(help_op.is_done());
@@ -1798,10 +1798,10 @@ impl<C> Equeue<C> {
     #[must_use]
     fn enqueue_<'a>(
         &self,
-        e: &'a mut Ebuf,
+        e: &'a mut EBuf,
         now: Tick,
         target: Tick
-    ) -> Result<bool, &'a mut Ebuf> {
+    ) -> Result<bool, &'a mut EBuf> {
         let mut e = e;
         debug_assert!(e.cb.is_some());
         e.target = target;
@@ -1855,8 +1855,8 @@ impl<C> Equeue<C> {
                 }
                 Some(sibling) => {
                     // push onto existing slice
-                    e.next.store_marked(e.next.load(), Eptr::null());
-                    e.next_back.store_marked(e.next_back.load(), Eptr::null());
+                    e.next.store_marked(e.next.load(), EPtr::null());
+                    e.next_back.store_marked(e.next_back.load(), EPtr::null());
                     e.sibling.store_marked(e.sibling.load(), sibling.as_eptr(self));
                 }
             }
@@ -1872,10 +1872,10 @@ impl<C> Equeue<C> {
                 // only place we lock before re-enqueueing periodic events
                 let info = e.info.load();
                 match info.state() {
-                    State::Alloced => {},
-                    State::InQueue => break 'retry Ok(false),
-                    State::InFlight => {},
-                    State::Nested => {
+                    EState::Alloced => {},
+                    EState::InQueue => break 'retry Ok(false),
+                    EState::InFlight => {},
+                    EState::Nested => {
                         // nested can only be marked for immediate execuction, but
                         // we can end up here if we are marked nested while trying
                         // to enqueue a periodic/delayed event
@@ -1886,7 +1886,7 @@ impl<C> Equeue<C> {
                             continue 'retry;
                         }
                     }
-                    State::Canceled => break 'retry Err(e),
+                    EState::Canceled => break 'retry Err(e),
                 }
 
                 // did someone already change our tailsrc? queue iteration? restart
@@ -1904,7 +1904,7 @@ impl<C> Equeue<C> {
                             help_op,
                             HelpState::EnqueueSliceNextBackNext,
                             e,
-                            State::InQueue
+                            EState::InQueue
                         ) {
                             continue;
                         }
@@ -1919,7 +1919,7 @@ impl<C> Equeue<C> {
                             help_op,
                             HelpState::EnqueueSiblingSiblingSiblingBack,
                             e,
-                            State::InQueue
+                            EState::InQueue
                         ) {
                             continue;
                         }
@@ -1940,10 +1940,10 @@ impl<C> Equeue<C> {
                 // only place we lock before re-enqueueing periodic events
                 let info = e.info.load();
                 match info.state() {
-                    State::Alloced => {},
-                    State::InQueue => break 'retry Ok(false),
-                    State::InFlight => {},
-                    State::Nested => {
+                    EState::Alloced => {},
+                    EState::InQueue => break 'retry Ok(false),
+                    EState::InFlight => {},
+                    EState::Nested => {
                         // nested can only be marked for immediate execuction, but
                         // we can end up here if we are marked nested while trying
                         // to enqueue a periodic/delayed event
@@ -1954,7 +1954,7 @@ impl<C> Equeue<C> {
                             continue 'retry;
                         }
                     }
-                    State::Canceled => break 'retry Err(e),
+                    EState::Canceled => break 'retry Err(e),
                 }
 
                 // did someone already change our tailsrc? dequeue iteration? restart
@@ -1992,7 +1992,7 @@ impl<C> Equeue<C> {
                 };
 
                 // mark as pending here, enabling removals
-                e.info.store(info.set_state(State::InQueue));
+                e.info.store(info.set_state(EState::InQueue));
                 break 'retry Ok(change)
             }
         }
@@ -2001,9 +2001,9 @@ impl<C> Equeue<C> {
     #[must_use]
     fn unqueue_<'a>(
         &'a self,
-        e: Either<(&'a Ebuf, ugen), ugen>,
-        state: State
-    ) -> (bool, Option<&'a mut Ebuf>) {
+        e: Either<(&'a EBuf, ugen), ugen>,
+        state: EState
+    ) -> (bool, Option<&'a mut EBuf>) {
         #[cfg(equeue_queue_mode="lockless")]
         loop {
             let help_op = self.help_();
@@ -2041,7 +2041,7 @@ impl<C> Equeue<C> {
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
             match info.state() {
-                State::InQueue => {
+                EState::InQueue => {
                     // we can disentangle the event here and reclaim the memory
                     let nextptr = e.next.load();
                     let next = nextptr.as_ref(self);
@@ -2096,7 +2096,7 @@ impl<C> Equeue<C> {
                     // note we are responsible for the memory now
                     break (true, Some(unsafe { e.claim() }))
                 }
-                State::Alloced => {
+                EState::Alloced => {
                     // alloced is a weird one, if we end up here, we just need
                     // to claim the event, and since we ensure no ids coexist
                     // mutable references to events at the type-level, we can
@@ -2112,7 +2112,7 @@ impl<C> Equeue<C> {
 
                     break (true, Some(unsafe { e.claim() }))
                 }
-                State::InFlight | State::Nested => {
+                EState::InFlight | EState::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
                     if let Err(_) = self.request_help_(
@@ -2126,7 +2126,7 @@ impl<C> Equeue<C> {
 
                     break (info.static_(), None)
                 }
-                State::Canceled => {
+                EState::Canceled => {
                     break (false, None)
                 }
             }
@@ -2167,7 +2167,7 @@ impl<C> Equeue<C> {
             // a bit different logic here, we can cancel periodic events, but
             // we can't reclaim the memory if it's in the middle of executing
             match info.state() {
-                State::InQueue => {
+                EState::InQueue => {
                     // we can disentangle the event here and reclaim the memory
                     let nextptr = e.next.load();
                     let next = nextptr.as_ref(self);
@@ -2220,14 +2220,14 @@ impl<C> Equeue<C> {
                     sibling.sibling_back.store_marked(sibling.sibling_back.load(), sibling_back.as_eptr(self));
 
                     // mark as removed
-                    e.next.store_marked_inc(nextptr, Eptr::null());
+                    e.next.store_marked_inc(nextptr, EPtr::null());
                     // mark as not-pending
                     e.info.store(e.info.load().set_state(state));
                     
                     // note we are responsible for the memory now
                     (true, Some(unsafe { e.claim() }))
                 }
-                State::Alloced => {
+                EState::Alloced => {
                     // alloced is a weird one, if we end up here, we just need
                     // to claim the event, and since we ensure no ids coexist
                     // mutable references to events at the type-level, we can
@@ -2235,13 +2235,13 @@ impl<C> Equeue<C> {
                     e.info.store(e.info.load().set_state(state));
                     (true, Some(unsafe { e.claim() }))
                 }
-                State::InFlight | State::Nested => {
+                EState::InFlight | EState::Nested => {
                     // if we're periodic/static and currently executing best we
                     // can do is mark the event so it isn't re-enqueued
                     e.info.store(e.info.load().set_state(state));
                     (info.static_(), None)
                 }
-                State::Canceled => {
+                EState::Canceled => {
                     (false, None)
                 }
             }
@@ -2252,7 +2252,7 @@ impl<C> Equeue<C> {
     fn dequeue_<'a>(
         &'a self,
         now: Tick
-    ) -> impl Iterator<Item=&'a mut Ebuf> + 'a {
+    ) -> impl Iterator<Item=&'a mut EBuf> + 'a {
         let dequeue_mark = 'retry: loop {
             // dispatch already in progress? let's try to help out
             let deheadptr = self.dequeue.load();
@@ -2309,7 +2309,7 @@ impl<C> Equeue<C> {
                     help_op,
                     HelpState::DequeueDequeue,
                     back.unwrap(),
-                    State::InQueue,
+                    EState::InQueue,
                 ) {
                     continue;
                 }
@@ -2344,7 +2344,7 @@ impl<C> Equeue<C> {
                 if let Some(tail) = tailptr.as_ref(self) {
                     tail.next_back.store_marked(tail.next_back.load(), self.queue.as_eptr(self));
                 }
-                back.unwrap().next.store_marked_inc(tailptr, Eptr::null());
+                back.unwrap().next.store_marked_inc(tailptr, EPtr::null());
 
                 break 'retry deheadptr.mark.wrapping_add(1);
             }
@@ -2352,13 +2352,13 @@ impl<C> Equeue<C> {
 
         // unqueue from the dequeue list an event at a time
         Right(iter::from_fn(move || {
-            self.unqueue_(Right(dequeue_mark), State::InFlight).1
+            self.unqueue_(Right(dequeue_mark), EState::InFlight).1
         }))
     }
 
-    fn update_state_<F>(&self, e: &Ebuf, mut f: F) -> Info
+    fn update_state_<F>(&self, e: &EBuf, mut f: F) -> EInfo
     where
-        F: FnMut(Info) -> Option<State>
+        F: FnMut(EInfo) -> Option<EState>
     {
         #[cfg(equeue_queue_mode="lockless")]
         loop {
@@ -2390,9 +2390,9 @@ impl<C> Equeue<C> {
         }
     }
 
-    fn update_state_inc_<F>(&self, e: &Ebuf, mut f: F) -> Info
+    fn update_state_inc_<F>(&self, e: &EBuf, mut f: F) -> EInfo
     where
-        F: FnMut(Info) -> Option<State>
+        F: FnMut(EInfo) -> Option<EState>
     {
         #[cfg(equeue_queue_mode="lockless")]
         loop {
@@ -2484,11 +2484,11 @@ impl<C: Clock> Equeue<C> {
         // note that periodic events are always pending, we load period
         // first since it is not necessarily atomic
         match info.state() {
-            State::Alloced  => None,
-            State::InQueue  => Some(target - self.now()),
-            State::InFlight => period,
-            State::Nested   => Some(Delta::zero()),
-            State::Canceled => None,
+            EState::Alloced  => None,
+            EState::InQueue  => Some(target - self.now()),
+            EState::InFlight => period,
+            EState::Nested   => Some(Delta::zero()),
+            EState::Canceled => None,
         }
     }
 
@@ -2511,11 +2511,11 @@ impl<C> Equeue<C> {
         };
 
         let info = e.info.load();
-        if info.id != id.id || info.state() == State::Canceled {
+        if info.id != id.id || info.state() == EState::Canceled {
             return false;
         }
 
-        let (canceled, e) = self.unqueue_(Left((e, id.id)), State::Canceled);
+        let (canceled, e) = self.unqueue_(Left((e, id.id)), EState::Canceled);
 
         if let Some(e) = e {
             // make sure to clean up memory
@@ -2528,7 +2528,7 @@ impl<C> Equeue<C> {
 
 impl<C: Clock+Signal> Equeue<C> {
     // Central post function
-    fn post_(&self, e: &mut Ebuf, delta: Delta) {
+    fn post_(&self, e: &mut EBuf, delta: Delta) {
         // calculate target
         let now = self.now();
         let target = now.imprecise_add(delta, self.precision);
@@ -2567,8 +2567,8 @@ impl<C: Clock+Signal> Equeue<C> {
                 match info.state() {
                     // still the same event?
                     _ if info.id != id.id             => None,
-                    State::Alloced                    => Some(State::InFlight),
-                    State::InFlight if info.static_() => Some(State::Nested),
+                    EState::Alloced                    => Some(EState::InFlight),
+                    EState::InFlight if info.static_() => Some(EState::Nested),
                     _                                 => None,
                 }
             });
@@ -2578,7 +2578,7 @@ impl<C: Clock+Signal> Equeue<C> {
                 _ if info.id != id.id => {
                     return false;
                 }
-                State::Alloced => {
+                EState::Alloced => {
                     // if we're alloced we can just enqueue, make sure to mark
                     // and claim the event first
                     let e = unsafe { e.claim() };
@@ -2598,23 +2598,23 @@ impl<C: Clock+Signal> Equeue<C> {
                         }
                     }
                 }
-                State::InQueue if now < e.target => {
+                EState::InQueue if now < e.target => {
                     // we're pending, but in the future, we want to move this
                     // to execute immediately, try to unqueue and continue the
                     // loop to reenqueue
-                    let _ = self.unqueue_(Left((e, id.id)), State::InFlight);
+                    let _ = self.unqueue_(Left((e, id.id)), EState::InFlight);
                     continue;
                 }
-                State::InFlight if info.static_() => {
+                EState::InFlight if info.static_() => {
                     // someone else is dispatching, just make sure we mark that
                     // we are interested in the event being repended
                     return true;
                 }
-                State::InQueue | State::Nested => {
+                EState::InQueue | EState::Nested => {
                     // do nothing, the event is already pending
                     return true;
                 }
-                State::InFlight | State::Canceled => {
+                EState::InFlight | EState::Canceled => {
                     // do nothing, the event is canceled
                     return false;
                 }
@@ -2689,19 +2689,19 @@ impl<C: Clock> Equeue<C> {
                 match
                     self.update_state_(e, |info| {
                         match info.state() {
-                            State::InFlight => Some(State::Alloced),
-                            State::Nested   => None,
-                            State::Canceled => None,
+                            EState::InFlight => Some(EState::Alloced),
+                            EState::Nested   => None,
+                            EState::Canceled => None,
                             _ => unreachable!(),
                         }
                     }).state()
                 {
-                    State::InFlight => None,
-                    State::Nested => {
+                    EState::InFlight => None,
+                    EState::Nested => {
                         let now = self.now();
                         self.enqueue_(e, now, now).err()
                     }
-                    State::Canceled => Some(e),
+                    EState::Canceled => Some(e),
                     _ => unreachable!(),
                 }
             } else {
@@ -2805,7 +2805,7 @@ impl<C> Equeue<C> {
     }
 
     pub unsafe fn dealloc_raw(&self, e: *mut u8) {
-        let e = Ebuf::from_data_mut_ptr(e).unwrap();
+        let e = EBuf::from_data_mut_ptr(e).unwrap();
         debug_assert!(self.contains(e));
         self.dealloc_(e);
     }
@@ -2816,7 +2816,7 @@ impl<C> Equeue<C> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Id {
     id: ugen,
-    eptr: Eptr<Ebuf>,
+    eptr: EPtr<EBuf>,
 }
 
 impl Id {
@@ -2824,18 +2824,18 @@ impl Id {
         // Ids can not be zero because that's where our buckets go in the slab
         Id {
             id: 0,
-            eptr: Eptr::null(),
+            eptr: EPtr::null(),
         }
     }
 
-    fn new<C>(q: &Equeue<C>, id: ugen, e: &mut Ebuf) -> Id {
+    fn new<C>(q: &Equeue<C>, id: ugen, e: &mut EBuf) -> Id {
         Id {
             id: id,
             eptr: e.as_eptr(q),
         }
     }
 
-    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a Ebuf> {
+    fn as_ref<'a, C>(&self, q: &'a Equeue<C>) -> Option<&'a EBuf> {
         self.eptr.as_ref(q)
     }
 }
@@ -2933,9 +2933,9 @@ unsafe fn event_waker_wake<C: Clock+Signal>(e: *const ()) {
     //       ^      ^-- truncated id of event
     //       '--------- uncompressed pointer to event
 
-    let mask = Ebuf::ALIGN-1;
+    let mask = EBuf::ALIGN-1;
     let id_trunc = ((e as usize) & mask) as ugen;
-    let e = Ebuf::from_data_mut_ptr(
+    let e = EBuf::from_data_mut_ptr(
         ((e as usize) & !mask) as *mut ()
     ).unwrap();
 
@@ -2978,7 +2978,7 @@ pub struct Event<
 }
 
 impl<'a, T, C> Event<'a, T, C> {
-    fn new(q: &'a Equeue<C>, e: &'a mut Ebuf) -> Event<'a, T, C> {
+    fn new(q: &'a Equeue<C>, e: &'a mut EBuf) -> Event<'a, T, C> {
         Event {
             q: q,
             t: unsafe { e.data_mut() },
@@ -2987,8 +2987,8 @@ impl<'a, T, C> Event<'a, T, C> {
 }
 
 impl<'a, T: ?Sized, C> Event<'a, T, C> {
-    fn ebuf<'b>(&'b mut self) -> &'b mut Ebuf {
-        unsafe { Ebuf::from_data_mut(self.t) }
+    fn ebuf<'b>(&'b mut self) -> &'b mut EBuf {
+        unsafe { EBuf::from_data_mut(self.t) }
     }
 }
 
@@ -3038,7 +3038,7 @@ impl<C> Equeue<C> {
             // explicitly dropped and never called, we manage this by clearing
             // our destructor when called
             let t = unsafe { (e as *mut T).read()};
-            unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap().drop = None;
+            unsafe { EBuf::from_data_mut_ptr(e) }.unwrap().drop = None;
             t.post_once();
         }
 
@@ -3061,7 +3061,7 @@ impl<C> Equeue<C> {
 
         // cb/drop thunks
         fn cb_thunk<'a, T: PostStatic<Event<'a, T, C>> + 'a, C: 'a>(e: *mut u8) {
-            let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
+            let e = unsafe { EBuf::from_data_mut_ptr(e) }.unwrap();
             let e = Event::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e);
             T::post_static(e);
         }
@@ -3086,7 +3086,7 @@ impl<C: Clock+Signal> Equeue<C> {
         e.q = self as *const Equeue<C> as *const Equeue<()>;
 
         fn cb_thunk<T: Future<Output=()>, C: Clock+Signal>(e: *mut u8) {
-            let e = unsafe { Ebuf::from_data_mut_ptr(e) }.unwrap();
+            let e = unsafe { EBuf::from_data_mut_ptr(e) }.unwrap();
             debug_assert!(e.info.load().static_());
             let mut e = Event::<T, C>::new(unsafe { (e.q as *const Equeue<C>).as_ref() }.unwrap(), e);
 
@@ -3157,7 +3157,7 @@ impl<'a, T: ?Sized, C: Clock+Signal> Event<'a, T, C> {
 
         // mark as no longer in use, allowing external pends
         let info = e.info.load();
-        e.info.store(info.set_state(State::Alloced));
+        e.info.store(info.set_state(EState::Alloced));
 
         let id = Id::new(q, info.id, e);
         forget(self);
@@ -3567,10 +3567,10 @@ impl<C> Equeue<C> {
         let mut total = 0usize;
         let mut i = slab_back;
         while let Some(e) = self.slab.get(i) {
-            let e = unsafe { &*(e as *const _ as *const Ebuf) };
+            let e = unsafe { &*(e as *const _ as *const EBuf) };
 
             total += 1;
-            i = i.saturating_add(size_of::<Ebuf>() + e.size());
+            i = i.saturating_add(size_of::<EBuf>() + e.size());
         }
 
         // find pending usage
@@ -3588,7 +3588,7 @@ impl<C> Equeue<C> {
                     .filter(|&sibling| sibling as *const _ != head as *const _)
             ) {
                 posted += 1;
-                posted_bytes += size_of::<Ebuf>() + sibling.size();
+                posted_bytes += size_of::<EBuf>() + sibling.size();
 
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
@@ -3614,7 +3614,7 @@ impl<C> Equeue<C> {
                 |head| head.sibling.load().as_ref(self)
             ) {
                 free += 1;
-                free_bytes += size_of::<Ebuf>() + (Ebuf::ALIGN << npw2);
+                free_bytes += size_of::<EBuf>() + (EBuf::ALIGN << npw2);
 
                 // this is all completely unsynchronized, so we have to set some
                 // hard limits to prevent getting stuck in an infinite loop, 
@@ -3653,7 +3653,7 @@ impl<C> Equeue<C> {
 
     pub fn bucket_usage(&self, buckets: &mut [usize]) {
         // this is just a guess
-        let total = self.slab.len() / size_of::<Ebuf>();
+        let total = self.slab.len() / size_of::<EBuf>();
 
         for (bucket, head) in buckets.iter_mut()
             .zip(self.buckets())
@@ -3678,7 +3678,7 @@ impl<C> Equeue<C> {
 
     pub fn slice_usage(&self, slices: &mut [usize]) {
         // this is just a guess
-        let total = self.slab.len() / size_of::<Ebuf>();
+        let total = self.slab.len() / size_of::<EBuf>();
 
         for (slice, head) in slices.iter_mut()
             .zip(
