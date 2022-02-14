@@ -886,8 +886,7 @@ enum HelpState {
     DequeueBackNextNextBack          = 17, // <'   | |
     DequeueBackNext                  = 18, // <'---|-+
                                            //      | |
-    UpdateState                      = 19, // <----'-+
-    UpdateStateInc                   = 20, // -------'
+    UpdateState                      = 19, // <----'-'
 }
 
 #[cfg(equeue_queue_mode="lockless")]
@@ -914,7 +913,6 @@ impl HelpState {
             17 => HelpState::DequeueBackNextNextBack,
             18 => HelpState::DequeueBackNext,
             19 => HelpState::UpdateState,
-            20 => HelpState::UpdateStateInc,
             _  => unreachable!(),
         }
     }
@@ -941,7 +939,6 @@ impl HelpState {
             HelpState::DequeueBackNextNextBack          => 17,
             HelpState::DequeueBackNext                  => 18,
             HelpState::UpdateState                      => 19,
-            HelpState::UpdateStateInc                   => 20,
         }
     }
 }
@@ -1110,9 +1107,6 @@ impl HelpOp {
             HelpState::UpdateState => {
                 Some(self.eptr.as_ref(q).unwrap().info.as_atom())
             }
-            HelpState::UpdateStateInc => {
-                Some(self.eptr.as_ref(q).unwrap().info.as_atom())
-            }
         }
     }
 
@@ -1233,14 +1227,6 @@ impl HelpOp {
                     .set_state(self.estate())
                     .as_marked().inc()
             }
-            HelpState::UpdateStateInc => {
-                help_old.as_info()
-                    .inc_id()
-                    .set_static(false)
-                    .set_once(false)
-                    .set_state(self.estate())
-                    .as_marked().inc()
-            }
         }
     }
 
@@ -1269,8 +1255,7 @@ impl HelpOp {
             HelpState::DequeueBackNextNextBack          => HelpState::DequeueBackNext,                  // <'   | |
             HelpState::DequeueBackNext                  => HelpState::Done,                             // <'---|-+
                                                                                                         //      | |
-            HelpState::UpdateState                      => HelpState::Done,                             // <----'-+
-            HelpState::UpdateStateInc                   => HelpState::Done,                             // -------'
+            HelpState::UpdateState                      => HelpState::Done,                             // <----'-'
         };
 
         if state_ == HelpState::Done { *self } else { self.inc() }
@@ -1656,11 +1641,17 @@ impl<C> Equeue<C> {
         }
         e.drop = None;
 
-        // give our event a new id
-        self.update_state_inc_(e, |info| {
-            debug_assert_ne!(info.state(), EState::InQueue);
-            Some(EState::InFlight)
-        });
+        // give our event a new id, we don't need to go through the helper
+        // fsm for this one because we must already be canceled or exclusively
+        // owned at this point
+        let info = e.info.load();
+        debug_assert_ne!(info.state(), EState::InQueue);
+        e.info.store(
+            info.inc_id()
+                .set_state(EState::InFlight)
+                .set_static(false)
+                .set_once(false)
+        );
 
         // we can load buckets here because it can never shrink
         let bucket = &self.buckets()[e.npw2() as usize];
@@ -2390,45 +2381,6 @@ impl<C> Equeue<C> {
         }
     }
 
-    fn update_state_inc_<F>(&self, e: &EBuf, mut f: F) -> EInfo
-    where
-        F: FnMut(EInfo) -> Option<EState>
-    {
-        #[cfg(equeue_queue_mode="lockless")]
-        loop {
-            let help_op = self.help_();
-
-            let info = e.info.load();
-            if let Some(state_) = f(info) {
-                if let Err(_) = self.request_help_(
-                    help_op,
-                    HelpState::UpdateStateInc,
-                    e,
-                    state_
-                ) {
-                    continue;
-                }
-            }
-
-            break info;
-        }
-        #[cfg(equeue_queue_mode="locking")]
-        {
-            let guard = self.lock.lock();
-
-            let info = e.info.load();
-            if let Some(state_) = f(info) {
-                e.info.store(
-                    info.inc_id()
-                        .set_static(false)
-                        .set_once(false)
-                        .set_state(state_)
-                )
-            }
-            info
-        }
-    }
-
     fn update_break_<F>(&self, mut f: F) -> u8
     where
         F: FnMut(u8) -> Option<u8>
@@ -2566,10 +2518,10 @@ impl<C: Clock+Signal> Equeue<C> {
             let info = self.update_state_(e, |info| {
                 match info.state() {
                     // still the same event?
-                    _ if info.id != id.id             => None,
+                    _ if info.id != id.id              => None,
                     EState::Alloced                    => Some(EState::InFlight),
                     EState::InFlight if info.static_() => Some(EState::Nested),
-                    _                                 => None,
+                    _                                  => None,
                 }
             });
 
@@ -2683,29 +2635,28 @@ impl<C: Clock> Equeue<C> {
                     period,
                     self.precision
                 )).err()
-            } else if info.static_() {
-                // if static, try to mark as no-longer pending, but
-                // note we could be canceled or recursively pended
-                match
-                    self.update_state_(e, |info| {
-                        match info.state() {
-                            EState::InFlight => Some(EState::Alloced),
-                            EState::Nested   => None,
-                            EState::Canceled => None,
-                            _ => unreachable!(),
-                        }
-                    }).state()
-                {
-                    EState::InFlight => None,
-                    EState::Nested => {
+            } else {
+                // try to mark as no-longer in-queue, but note we could be
+                // canceled or recursively pended if we are static
+                let info = self.update_state_(e, |info| {
+                    match (info.state(), info.static_()) {
+                        (EState::InFlight, true)  => Some(EState::Alloced),
+                        (EState::InFlight, false) => Some(EState::Canceled),
+                        (EState::Nested,   true)  => None,
+                        (EState::Canceled, _)     => None,
+                        _ => unreachable!(),
+                    }
+                });
+                match (info.state(), info.static_()) {
+                    (EState::InFlight, true)  => None,
+                    (EState::InFlight, false) => Some(e),
+                    (EState::Nested,   true)  => {
                         let now = self.now();
                         self.enqueue_(e, now, now).err()
                     }
-                    EState::Canceled => Some(e),
+                    (EState::Canceled, _)     => Some(e),
                     _ => unreachable!(),
                 }
-            } else {
-                Some(e)
             };
 
             // release memory?
