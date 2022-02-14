@@ -274,9 +274,9 @@ fn bench(c: &mut Criterion) {
         // make this massive so we don't have to worry about ooms
         let q = Equeue::with_size(1024*1024*1024);
         group.bench_function("post", |b| b.iter_with_sys_lock_sampling(
-            || q.alloc(|| {}).unwrap(),
-            |e| {
-                e.post_handle()
+            || (),
+            |_| {
+                q.call_handle(|| {}).unwrap()
             },
         ));
     }
