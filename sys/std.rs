@@ -1,4 +1,8 @@
 
+// sys/std.rs provides clock integration with std, or just core in no_std
+// environments.
+//
+
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::fmt::Debug;
@@ -74,7 +78,6 @@ cfg_if! {
 
 
 // Atomic primitives
-
 pub(crate) use core::sync::atomic::Ordering;
 
 cfg_if! {

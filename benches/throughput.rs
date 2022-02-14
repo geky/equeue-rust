@@ -15,7 +15,7 @@ use criterion::BenchmarkId;
 
 use equeue::Equeue;
 
-fn bench_throughput(c: &mut Criterion) {
+fn bench(c: &mut Criterion) {
     // environment variables
     #[allow(non_snake_case)]
     let EQUEUE_THROUGHPUT_COUNT = env::var("EQUEUE_THROUGHPUT_COUNT")
@@ -98,5 +98,5 @@ fn bench_throughput(c: &mut Criterion) {
     dispatch_thread.join().unwrap();
 }
 
-criterion_group!(benches, bench_throughput);
+criterion_group!(benches, bench);
 criterion_main!(benches);

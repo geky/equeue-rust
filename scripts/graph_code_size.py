@@ -33,15 +33,23 @@ COLORS = [
 
 # SI prefixes
 SI = [
-    (1000**0, ''),
-    (1000**1, 'K'),
-    (1000**2, 'M'),
-    (1000**3, 'G'),
-    (1000**4, 'T'),
-    (1000**5, 'P'),
-    (1000**6, 'E'),
-    (1000**7, 'Z'),
-    (1000**8, 'Y'),
+    (1000**-8, 'y'),
+    (1000**-7, 'z'),
+    (1000**-6, 'a'),
+    (1000**-5, 'f'),
+    (1000**-4, 'p'),
+    (1000**-3, 'n'),
+    (1000**-2, 'µ'),
+    (1000**-1, 'm'),
+    (1000**0,  ''),
+    (1000**1,  'K'),
+    (1000**2,  'M'),
+    (1000**3,  'G'),
+    (1000**4,  'T'),
+    (1000**5,  'P'),
+    (1000**6,  'E'),
+    (1000**7,  'Z'),
+    (1000**8,  'Y'),
 ]
 
 # SI base2 prefixes
@@ -57,9 +65,9 @@ SI2 = [
     (1024**8, 'Yi'),
 ]
 
-def throughput_bytes(x, pos=None):
+def bytes(x, pos=None):
     for scale, si in reversed(SI2):
-        if x >= scale or scale == 1:
+        if x >= scale or (x == 0 and scale == 1):
             return '%s %sB' % (
                 re.sub(r'\.0*$', '', ('%.3f'%(x/scale))[:3]), si)
 
@@ -105,7 +113,7 @@ def main(graph_path, *csv_paths):
     ax.set_xticklabels([''])
     ax.set_xlabel('code')
     ax.set_ylim(0, None)
-    ax.yaxis.set_major_formatter(FuncFormatter(throughput_bytes))
+    ax.yaxis.set_major_formatter(FuncFormatter(bytes))
     ax.set_ylabel('bytes')
 
     # legend

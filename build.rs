@@ -12,6 +12,8 @@ fn main() {
             cfg_if! {
                 if #[cfg(feature="loom")] {
                     PathBuf::from("sys/loom.rs")
+                } else if #[cfg(feature="emu")] {
+                    PathBuf::from("sys/emu.rs")
                 } else {
                     PathBuf::from("sys/std.rs")
                 }

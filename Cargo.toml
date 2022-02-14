@@ -45,6 +45,8 @@ udeptr-at-least-u64 = []
 udeptr-at-least-u32 = []
 
 examples = ["std", "rand", "structopt"]
+emu = []
+measure-locks = ["emu"]
 
 [dependencies]
 either = {version="1.6.1", default-features=false}
@@ -81,8 +83,19 @@ name = "throughput"
 required-features = ["criterion"]
 harness = false
 
+[[bench]]
+name = "ops"
+required-features = ["criterion", "emu"]
+harness = false
+
+[[bench]]
+name = "locks"
+required-features = ["criterion", "emu", "measure-locks"]
+harness = false
+
 # cargo bloat doesn't support benches, so we need to pretend this is an example
 [[example]]
 name = "code_size"
 path = "benches/code_size.rs"
 harness = false
+

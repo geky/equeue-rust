@@ -1,8 +1,9 @@
 
-// sys/loom.rs provides integration with loom's exhuastive concurrency testing
+// sys/emu.rs provides a similar integration with std/core as sys/std.rs, but
+// with a fixed time that can only be moved by an explicit call to
+// `SysClock::set_now`.
 //
-// Note that for this to work all operations must be deterministic. For this
-// reason we fix time to be manually controlled.
+// This is useful for testing, or running in systems where time is not available
 //
 
 use core::marker::PhantomData;
@@ -21,18 +22,21 @@ use core::fmt;
 
 use cfg_if::cfg_if;
 
-use std::collections::HashMap;
-use loom::sync::Mutex;
-use loom::sync::MutexGuard;
+#[cfg(feature="alloc")] extern crate alloc as core_alloc;
+
+#[cfg(feature="std")] use std::time::Instant;
+#[cfg(feature="std")] use std::sync::Mutex;
+#[cfg(feature="std")] use std::sync::MutexGuard;
 
 use crate::traits::*;
 use crate::util::*;
+use crate::Error;
 use crate::Delta;
 
 
 // Memory allocation, this is optional
-pub(crate) use std::alloc::alloc;
-pub(crate) use std::alloc::dealloc;
+#[cfg(feature="alloc")] pub(crate) use core_alloc::alloc::alloc;
+#[cfg(feature="alloc")] pub(crate) use core_alloc::alloc::dealloc;
 
 
 // Time primitives
@@ -42,41 +46,41 @@ cfg_if! {
         #[allow(non_camel_case_types)] pub type itick = i128;
         pub type NonZeroUtick = core::num::NonZeroU128;
         pub type NonZeroItick = core::num::NonZeroI128;
-        type AtomicUtick = loom::sync::atomic::AtomicU128;
+        type AtomicUtick = core::sync::atomic::AtomicU128;
 
     } else if #[cfg(equeue_utick_width="64")] {
         #[allow(non_camel_case_types)] pub type utick = u64;
         #[allow(non_camel_case_types)] pub type itick = i64;
         pub type NonZeroUtick = core::num::NonZeroU64;
         pub type NonZeroItick = core::num::NonZeroI64;
-        type AtomicUtick = loom::sync::atomic::AtomicU64;
+        type AtomicUtick = core::sync::atomic::AtomicU64;
 
     } else if #[cfg(equeue_utick_width="32")] {
         #[allow(non_camel_case_types)] pub type utick = u32;
         #[allow(non_camel_case_types)] pub type itick = i32;
         pub type NonZeroUtick = core::num::NonZeroU32;
         pub type NonZeroItick = core::num::NonZeroI32;
-        type AtomicUtick = loom::sync::atomic::AtomicU32;
+        type AtomicUtick = core::sync::atomic::AtomicU32;
 
     } else if #[cfg(equeue_utick_width="16")] {
         #[allow(non_camel_case_types)] pub type utick = u16;
         #[allow(non_camel_case_types)] pub type itick = i16;
         pub type NonZeroUtick = core::num::NonZeroU16;
         pub type NonZeroItick = core::num::NonZeroI16;
-        type AtomicUtick = loom::sync::atomic::AtomicU16;
+        type AtomicUtick = core::sync::atomic::AtomicU16;
 
     } else if #[cfg(equeue_utick_width="8")] {
         #[allow(non_camel_case_types)] pub type utick = u8;
         #[allow(non_camel_case_types)] pub type itick = i8;
         pub type NonZeroUtick = core::num::NonZeroU8;
         pub type NonZeroItick = core::num::NonZeroI8;
-        type AtomicUtick = loom::sync::atomic::AtomicU8;
+        type AtomicUtick = core::sync::atomic::AtomicU8;
     }
 }
 
 
 // Atomic primitives
-pub(crate) use loom::sync::atomic::Ordering;
+pub(crate) use core::sync::atomic::Ordering;
 
 cfg_if! {
     if #[cfg(any(
@@ -86,12 +90,12 @@ cfg_if! {
         // The atomic double-eptr unit used in equeue
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u128;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i128;
-        pub(crate) type AtomicUdeptr = loom::sync::atomic::AtomicU128;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU128;
 
         // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u64;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i64;
-        pub(crate) type AtomicUeptr = loom::sync::atomic::AtomicU64;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU64;
 
         // Integer that fits a pointer generation count, should be 1/4 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ugen = u32;
@@ -104,12 +108,12 @@ cfg_if! {
         // The atomic double-eptr unit used in equeue
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u64;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i64;
-        pub(crate) type AtomicUdeptr = loom::sync::atomic::AtomicU64;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU64;
 
         // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u32;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i32;
-        pub(crate) type AtomicUeptr = loom::sync::atomic::AtomicU32;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU32;
 
         // Integer that fits a pointer generation count, should be 1/4 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ugen = u16;
@@ -122,12 +126,12 @@ cfg_if! {
         // The atomic double-eptr unit used in equeue
         #[allow(non_camel_case_types)] pub(crate) type udeptr = u32;
         #[allow(non_camel_case_types)] pub(crate) type ideptr = i32;
-        pub(crate) type AtomicUdeptr = loom::sync::atomic::AtomicU32;
+        pub(crate) type AtomicUdeptr = core::sync::atomic::AtomicU32;
 
         // Integer that fits an in-slab equeue pointer, should be 1/2 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ueptr = u16;
         #[allow(non_camel_case_types)] pub(crate) type ieptr = i16;
-        pub(crate) type AtomicUeptr = loom::sync::atomic::AtomicU16;
+        pub(crate) type AtomicUeptr = core::sync::atomic::AtomicU16;
 
         // Integer that fits a pointer generation count, should be 1/4 of a udeptr
         #[allow(non_camel_case_types)] pub(crate) type ugen = u8;
@@ -143,7 +147,50 @@ cfg_if! {
     equeue_break_mode="locking",
 ))]
 cfg_if! {
-    if #[cfg(feature="std")] {
+    if #[cfg(all(feature="std", feature="measure-locks"))] {
+        use core::sync::atomic::AtomicBool;
+        static EQUEUE_LOCKED: AtomicBool = AtomicBool::new(false);
+
+        // this is public just to get access to SysLock::is_locked
+        #[derive(Debug)]
+        pub struct SysLock(Mutex<()>);
+
+        #[derive(Debug)]
+        pub struct SysLockGuard<'a>(MutexGuard<'a, ()>);
+
+        impl SysLock {
+            pub(crate) fn new() -> Self {
+                SysLock(Mutex::new(()))
+            }
+
+            pub fn is_locked() -> bool {
+                EQUEUE_LOCKED.load(Ordering::SeqCst)
+            }
+        }
+
+        impl Lock for SysLock {
+            // unfortunately we can't define types with lifetimes
+            // in traits, the best we can do is unsafely strip the
+            // lifetime and leave it up to the caller to drop the
+            // types in the correct order
+            type Guard = SysLockGuard<'static>;
+
+            fn lock(&self) -> Self::Guard {
+                let guard = SysLockGuard(self.0.lock().unwrap());
+                // note that we actually can't contend here, we have the lock!
+                EQUEUE_LOCKED.store(true, Ordering::SeqCst);
+                // strip lifetime
+                unsafe { transmute::<SysLockGuard<'_>, _>(guard) }
+            }
+        }
+
+        impl Drop for SysLockGuard<'_> {
+            fn drop(&mut self) {
+                // note that we actually can't contend here, we have the lock!
+                EQUEUE_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+    } else if #[cfg(feature="std")] {
         #[derive(Debug)]
         pub(crate) struct SysLock(Mutex<()>);
 
@@ -217,12 +264,11 @@ cfg_if! {
 
 
 // Time/semaphore primitive
+// TODO should this satisfy Sema and AsyncSema eventually?
 #[derive(Debug)]
 pub struct SysClock();
 
-loom::lazy_static! {
-    static ref EQUEUE_TICK: AtomicUtick = AtomicUtick::new(0);
-}
+static EQUEUE_TICK: AtomicUtick = AtomicUtick::new(0);
 
 impl SysClock {
     pub fn new() -> Self {
